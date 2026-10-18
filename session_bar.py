@@ -115,6 +115,30 @@ def output_rate(previous_usage, previous_at, usage, at):
     return None
 
 
+def session_metrics(snapshot):
+    turn = snapshot.get('turn', {})
+    start = turn.get('started_at')
+    rate = snapshot.get('output_rate') or {}
+    valid_rate = bool(start and rate.get('start', 0) >= start)
+    return {'tokens': snapshot.get('usage', {}).get('total_token_usage', {}).get('total_tokens', snapshot.get('tokens_used')),
+            'started_at': start, 'tps': rate.get('value') if valid_rate else None,
+            'rate_at': rate.get('end') if valid_rate else None}
+
+
+def metrics_text(row, now=None):
+    now = time.time() if now is None else now
+    rate = row.get('tps')
+    if row.get('rate_at') is None or not 0 <= now-row['rate_at'] <= 30:
+        rate = None
+    speed = f'{rate:.1f}' if rate is not None else '—'
+    elapsed = duration(now-row['started_at']) if row.get('started_at') else '—'
+    return f"{speed} t/s   ·   {compact(row.get('tokens'))} TOK   ·   {elapsed}"
+
+
+def retain_recent(previous, error):
+    return {**previous, 'rows': previous.get('rows', []), 'error': error, 'stale': True}
+
+
 def duration(seconds):
     seconds = max(0, int(seconds))
     hours, rest = divmod(seconds, 3600)
@@ -199,6 +223,25 @@ class SessionStore:
             return {tid: (row['status'] if (row := db.execute(
                 'SELECT status FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1',
                 (tid,)).fetchone()) else None) for tid in roots}
+
+    def warm_recent(self):
+        # Names are useful immediately, while live status is still being read.
+        rows = []
+        for row in self.sessions()[:10]:
+            rows.append({**row, 'state': 'Unknown', 'state_icon': '◌', 'color': '#87929d'})
+        return {'rows': rows, 'busy_count': None, 'loaded_at': 0, 'stale': True}
+
+    def enrich_recent(self, rows):
+        enriched = []
+        for row in rows:
+            row = dict(row)
+            if row['state'] == 'Busy':
+                try:
+                    row.update(session_metrics(self.read(row['id'])))
+                except (OSError, sqlite3.Error, ValueError):
+                    pass  # A missing rollout must not hide the other chats.
+            enriched.append(row)
+        return enriched
 
     def read_tokens(self, path):
         """Read only a bounded tail and subsequent appended bytes; never full logs."""
@@ -389,7 +432,11 @@ class DesktopTools(Rpc):
         payload = self.tool_payload(self.call('tools/call', {'name': 'list_threads', 'arguments': {'limit': 50},
             '_meta': {'codexThreadId': default_thread()}}))
         ids = list({r['id'] for r in payload.get('pinnedThreads', []) + payload.get('threads', []) if r.get('id')})
-        return recent_threads(payload, store.recent_turns(ids))
+        turns = store.recent_turns(ids)
+        all_rows = recent_threads(payload, turns, limit=len(turns))
+        rows = recent_threads(payload, turns)
+        return {'rows': store.enrich_recent(rows), 'busy_count': sum(r['state'] == 'Busy' for r in all_rows),
+                'loaded_at': time.time(), 'stale': False}
 
     def navigate(self, tid):
         self.close()  # Discover the current desktop pipe after app restarts.
@@ -700,6 +747,20 @@ def write_json_atomic(path, value):
         return False
 
 
+def load_recent_cache():
+    path = RUNTIME / 'recent-cache.json'
+    try:
+        if path.stat().st_size > 65536:
+            return {}
+        value = json.loads(path.read_text(encoding='utf-8'))
+        if value.get('schema') == 1 and isinstance(value.get('rows'), list) and len(value['rows']) <= 10:
+            if all(isinstance(r, dict) and all(k in r for k in ('id', 'label', 'state', 'state_icon', 'color')) for r in value['rows']):
+                return {**value, 'stale': True}
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    return {}
+
+
 def run_gui(args):
     from PyQt6.QtCore import Qt, QTimer, QPoint, QObject, pyqtSignal, QByteArray
     from PyQt6.QtGui import QFont, QFontDatabase, QIcon, QPixmap, QPainter
@@ -837,20 +898,29 @@ def run_gui(args):
 
     def recent_worker():
         client, store = recent_client, SessionStore()
+        previous = load_recent_cache()
         try:
-            while not stop.is_set():
-                recent_wake.wait(2 if recent_visible.is_set() else None)
-                recent_wake.clear()
-                if stop.is_set():
-                    break
-                if not recent_visible.is_set():
-                    continue
+            if not previous.get('rows'):
                 try:
-                    rows = client.recent(store)
-                    bridge.recents.emit({'rows': rows, 'loaded_at': time.time()})
+                    previous = store.warm_recent()
+                    bridge.recents.emit(previous)
+                except (OSError, sqlite3.Error):
+                    pass
+            while not stop.is_set():
+                scan_started = time.monotonic()
+                try:
+                    previous = client.recent(store)
+                    bridge.recents.emit(previous)
+                    write_json_atomic(RUNTIME / 'recent-cache.json', {**previous, 'schema': 1})
                 except Exception as exc:
                     client.close()
-                    bridge.recents.emit({'rows': [], 'error': str(exc)[:200]})
+                    previous = retain_recent(previous, str(exc)[:200])
+                    bridge.recents.emit(previous)
+                interval = 1.5 if recent_visible.is_set() else 3
+                if previous.get('error'):
+                    interval = max(interval, 5)
+                recent_wake.wait(max(.2, interval-(time.monotonic()-scan_started)))
+                recent_wake.clear()
         finally:
             client.close()
 
@@ -991,7 +1061,8 @@ def run_gui(args):
             self.last_rename = None
             self.last_icon_action = None
             self.last_navigation = None
-            self.recent_result = {}
+            self.recent_result = {} if args.test_ui else load_recent_cache()
+            self.last_recent_open_ms = None
             self.recent_signature = None
             self.popup_kind = None
             self.follow_latency = None
@@ -1288,24 +1359,35 @@ def run_gui(args):
         def tick(self):
             turn = self.snapshot.get("turn", {})
             code = turn.get("status")
-            labels = {"inProgress": "● Working", "completed": "✓ Done", "interrupted": "Ⅱ Paused", "failed": "! Error"}
+            labels = {"inProgress": "● Busy", "completed": "✓ Done", "interrupted": "Ⅱ Paused", "failed": "! Error"}
             self.status.setText(labels.get(code, code or "Loading"))
+            count = self.recent_result.get('busy_count')
+            stale = bool(self.recent_result.get('stale')) or time.time()-self.recent_result.get('loaded_at', 0) > 10
+            if count is not None:
+                self.status.setText(f"{'●' if count else '○'} Busy ({count})" + ('*' if stale else ''))
+            elif code == 'inProgress':
+                self.status.setText('● Busy (…)')
+            self.status.setToolTip(f"Busy local chats: {count if count is not None else 'checking'}\n"
+                                  f"Current chat: {labels.get(code, code or 'Loading')}\n"
+                                  + ('* Last known count; background refresh pending' if stale else 'Live desktop scan'))
             if binding["auto"] and not self.tracker_ready:
                 self.status.setText("Waiting")
             if self.data_error:
                 self.status.setText("! Unavailable")
-            self.status.setStyleSheet("color:#f5a34b" if code == "inProgress" else "color:#7cd7ae" if code == "completed" else "color:#e9bd77")
+            self.status.setStyleSheet("color:#f5a34b" if count or (count is None and code == 'inProgress') else "color:#a8b3bf")
             start = turn.get("started_at")
             end = turn.get("completed_at")
             self.elapsed.setText(duration((end or time.time()) - start) if start else "—")
             rate = self.snapshot.get('output_rate')
-            if rate and start and rate['start'] >= start:
+            if rate and start and rate['start'] >= start and 0 <= time.time()-rate['end'] <= 30:
                 self.tps.setText(f"{rate['value']:.1f} t/s")
                 self.tps.setToolTip(f"Observed output TPS: {rate['output_tokens']:,} output tokens / {rate['end']-rate['start']:.2f}s.\n"
                                     "Based on the latest saved usage samples, including tool/network wait; not instantaneous model decode speed.")
             else:
                 self.tps.setText("— t/s")
-                self.tps.setToolTip("Output TPS: waiting for two usage samples in this turn")
+                self.tps.setToolTip("Output TPS: no recent sample, or waiting for two samples in this turn")
+            if self.popup_kind == 'recent' and self.popup and self.popup.isVisible():
+                self.render_recent(self.recent_result)
             limits = self.snapshot.get("limits", {})
             windows = limit_windows(limits)
             error = self.snapshot.get("limits_error", "")
@@ -1352,11 +1434,19 @@ def run_gui(args):
             self.icon.setEnabled(True)
 
         def show_recent(self):
+            opened = time.perf_counter()
+            self.details.hide()
+            if self.popup and self.popup_kind == 'recent':
+                if self.popup.isVisible():
+                    self.popup.close()
+                else:
+                    self.finish_recent_open(opened)
+                return
             if self.popup and self.popup.isVisible():
                 self.popup.close()
-                if self.popup_kind == 'recent':
-                    return
-            self.details.hide()
+            if self.popup:
+                self.popup.deleteLater()
+                self.popup = None
             popup = RecentPopup(self, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
             popup.setObjectName('recentPicker')
             popup.setStyleSheet('''
@@ -1386,70 +1476,93 @@ def run_gui(args):
             self.recent_layout.setContentsMargins(0, 0, 0, 0)
             self.recent_layout.setSpacing(4)
             layout.addWidget(self.recent_area)
-            self.recent_note = QLabel('Latest 10 · Busy first · Updates every 2s')
+            self.recent_note = QLabel('Preloaded · Busy first')
             self.recent_note.setStyleSheet('color:#8f9da9;font-size:11px;')
             self.recent_note.setWordWrap(True)
             layout.addWidget(self.recent_note)
             self.popup, self.popup_kind = popup, 'recent'
             self.recent_signature = None
-            cached = self.recent_result if time.time()-self.recent_result.get('loaded_at', 0) < 3 else {}
-            self.render_recent(cached)
-            self.place_popup(popup)
-            popup.show()
+            self.finish_recent_open(opened)
+
+        def finish_recent_open(self, opened):
+            self.render_recent(self.recent_result)
+            self.place_popup(self.popup)
+            self.popup.show()
             recent_visible.set()
             recent_wake.set()
+            self.last_recent_open_ms = round((time.perf_counter()-opened)*1000, 1)
+            self.write_diagnostic()
 
         def update_recent(self, result):
             self.recent_result = result
-            if self.popup_kind == 'recent' and self.popup and self.popup.isVisible():
-                self.render_recent(result)
+            self.tick()
+            self.write_diagnostic()
 
         def render_recent(self, result):
             rows = result.get('rows', [])
-            signature = (tuple((r['id'], r['label'], r['state']) for r in rows), result.get('error'),
-                         bool(result.get('loaded_at')), selected[0])
-            if signature == self.recent_signature:
-                return
-            self.recent_signature = signature
-            while self.recent_layout.count():
-                item = self.recent_layout.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
-            self.recent_buttons = []
-            for row in rows:
-                button = QPushButton(self.recent_area)
-                button.setProperty('threadId', row['id'])
-                button.setFixedHeight(38)
-                button.setCursor(Qt.CursorShape.PointingHandCursor)
-                if row['id'] == selected[0]:
-                    button.setStyleSheet('QPushButton{background:#293d36;border:1px solid #527b69;} QPushButton:hover{background:#354b42;}')
-                elif row['state'] == 'Busy':
-                    button.setStyleSheet('QPushButton{background:#342c23;} QPushButton:hover{background:#483a2a;}')
-                line = QHBoxLayout(button)
-                line.setContentsMargins(10, 0, 10, 0)
-                label = QLabel(row['label'])
-                label.setFont(QFont('Segoe UI', 10))
+            signature = tuple(r['id'] for r in rows)
+            if signature != self.recent_signature:
+                self.recent_signature = signature
+                while self.recent_layout.count():
+                    item = self.recent_layout.takeAt(0)
+                    if item.widget():
+                        item.widget().hide()
+                        item.widget().deleteLater()
+                self.recent_buttons, self.recent_widgets = [], []
+                for row in rows:
+                    button = QPushButton(self.recent_area)
+                    button.setProperty('threadId', row['id'])
+                    button.setCursor(Qt.CursorShape.PointingHandCursor)
+                    card = QVBoxLayout(button)
+                    card.setContentsMargins(10, 5, 10, 5)
+                    card.setSpacing(2)
+                    line = QHBoxLayout()
+                    line.setContentsMargins(0, 0, 0, 0)
+                    label = QLabel()
+                    label.setFont(QFont('Segoe UI', 10))
+                    status = QLabel()
+                    status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    status.setFixedWidth(92)
+                    detail = QLabel()
+                    detail.setStyleSheet('color:#a8b8c4;font-size:11px;')
+                    for widget in (label, status, detail):
+                        widget.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+                    line.addWidget(label, 1)
+                    line.addWidget(status)
+                    card.addLayout(line)
+                    card.addWidget(detail)
+                    button.clicked.connect(lambda unused=False, tid=row['id']: self.open_thread(tid))
+                    self.recent_layout.addWidget(button)
+                    self.recent_buttons.append(button)
+                    self.recent_widgets.append((button, label, status, detail))
+                if not rows:
+                    message = QLabel('Loading recent chats…')
+                    message.setMinimumHeight(38)
+                    self.recent_layout.addWidget(message)
+                    self.recent_empty = message
+            for row, (button, label, status, detail) in zip(rows, self.recent_widgets):
+                busy = row['state'] == 'Busy'
+                button.setFixedHeight(58 if busy else 38)
+                appearance = (row['id'] == selected[0], busy)
+                if button.property('appearance') != appearance:
+                    button.setProperty('appearance', appearance)
+                    background, border = ('#293d36', '#527b69') if appearance[0] else ('#342c23', 'transparent') if busy else ('transparent', 'transparent')
+                    button.setStyleSheet(f'QPushButton{{background:{background};border:1px solid {border};}} QPushButton:hover{{background:#35434a;border-color:#52636e;}} QPushButton:focus{{border-color:#6aa891;}}')
                 label.setText(label.fontMetrics().elidedText(row['label'], Qt.TextElideMode.ElideRight, self.popup.width()-160))
-                status = QLabel(row['state_icon']+' '+row['state'])
-                status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                status.setFixedWidth(92)
+                status.setText(row['state_icon']+' '+row['state'])
                 status.setStyleSheet('color:'+row['color']+';font-weight:600;')
-                for widget in (label, status):
-                    widget.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-                line.addWidget(label, 1)
-                line.addWidget(status)
-                button.setToolTip(row['label']+'\n'+row['state']+' · Click to open in Codex')
+                detail.setVisible(busy)
+                detail.setText(metrics_text(row) if busy else '')
+                button.setToolTip(row['label']+'\n'+row['state']+' · Click to open in Codex\n'
+                                  + (metrics_text(row)+'\nOutput TPS uses saved samples, including tool/network wait; — means no recent sample.' if busy else ''))
                 button.setAccessibleName(row['label']+' · '+row['state'])
-                button.clicked.connect(lambda unused=False, tid=row['id']: self.open_thread(tid))
-                self.recent_layout.addWidget(button)
-                self.recent_buttons.append(button)
             if not rows:
-                message = QLabel('Could not load recent chats' if result.get('error') else
-                                 'No recent local chats' if result.get('loaded_at') else 'Loading recent chats…')
-                message.setMinimumHeight(38)
-                self.recent_layout.addWidget(message)
-            self.recent_note.setText(('Load failed: '+result['error']) if result.get('error') else
-                                     'Latest 10 · Busy first · Updates every 2s')
+                self.recent_empty.setText('Could not load recent chats' if result.get('error') else
+                                          'No recent local chats' if result.get('loaded_at') else 'Loading recent chats…')
+            count = result.get('busy_count')
+            cached = result.get('stale') or time.time()-result.get('loaded_at', 0) > 10
+            self.recent_note.setText('Cached · Refresh pending' if cached else f'Preloaded · {count if count is not None else "—"} busy · Live every 1.5s')
+            self.recent_note.setToolTip(result.get('error', '') or 'Latest 10 local chats · Busy first · TPS / session tokens / current turn elapsed')
             self.popup.layout().activate()
             self.popup.adjustSize()
             self.place_popup(self.popup)
@@ -1483,6 +1596,9 @@ def run_gui(args):
             if self.popup and self.popup.isVisible():
                 self.popup.close()
                 return
+            if self.popup:
+                self.popup.deleteLater()
+                self.popup = None
             self.details.hide()
             popup = QFrame(self, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
             popup.setObjectName("iconPicker")
@@ -1624,6 +1740,12 @@ def run_gui(args):
                     "last_rename": self.last_rename, "auto_thread": binding["auto"],
                     "last_icon_action": self.last_icon_action,
                     "last_navigation": self.last_navigation,
+                    "recent_cache": {"rows": len(self.recent_result.get('rows', [])),
+                                     "busy_count": self.recent_result.get('busy_count'),
+                                     "loaded_at": self.recent_result.get('loaded_at'),
+                                     "stale": self.recent_result.get('stale'),
+                                     "error": self.recent_result.get('error', ''),
+                                     "open_ms": self.last_recent_open_ms},
                     "active_view": self.view, "follow_latency": self.follow_latency,
                     "host_window": self.host_hwnd, "host_hidden": self.host_hidden,
                     "host_offset": self.host_offset, "host_rect": self.host_rect,
@@ -1745,12 +1867,35 @@ def run_gui(args):
                                 'kind': 'codex', 'status': 'active' if i in (2, 7) else 'idle',
                                 'updatedAt': 100-i} for i in range(10)]}
             rows = recent_threads(fake, {f'recent-{i}': 'completed' for i in range(10)})
-            bar.update_recent({'rows': rows, 'loaded_at': time.time()})
+            for row in rows:
+                if row['state'] == 'Busy':
+                    row.update({'tokens': 27190000, 'tps': 42.3, 'rate_at': time.time(), 'started_at': time.time()-754})
+            bar.update_recent({'rows': rows, 'busy_count': 5, 'loaded_at': time.time()})
             app.processEvents()
             assert len(bar.recent_buttons) == 10
             assert bar.recent_buttons[0].property('threadId') == 'recent-2'
             assert bar.recent_buttons[1].property('threadId') == 'recent-7'
             assert all(button.isVisible() for button in bar.recent_buttons)
+            assert bar.status.text() == '● Busy (5)'
+            first_button = bar.recent_buttons[0]
+            first_popup = bar.popup
+            assert '42.3 t/s' in bar.recent_widgets[0][3].text()
+            rows[0]['tps'] = 48.1
+            bar.update_recent({'rows': rows, 'busy_count': 5, 'loaded_at': time.time()})
+            assert bar.recent_buttons[0] is first_button
+            assert '48.1 t/s' in bar.recent_widgets[0][3].text()
+            # A cached list older than the former 3s cutoff opens immediately;
+            # refresh failure also preserves the same clickable rows.
+            bar.update_recent(retain_recent({**bar.recent_result, 'loaded_at': time.time()-90}, 'temporary offline'))
+            bar.popup.close()
+            QTest.mouseClick(bar.title, Qt.MouseButton.LeftButton)
+            assert bar.popup is first_popup and bar.recent_buttons[0] is first_button
+            assert bar.last_recent_open_ms < 150
+            assert 'Cached' in bar.recent_note.text()
+            preloaded_open_ms = bar.last_recent_open_ms
+            bar.update_recent({'rows': rows, 'busy_count': 5, 'loaded_at': time.time()})
+            app.processEvents()
+            bar.grab().save(str(RUNTIME / 'ui-verification.png'))
             bar.popup.grab().save(str(RUNTIME / 'recent-chats-verification.png'))
             target = bar.recent_buttons[-1].property('threadId')
             QTest.mouseClick(bar.recent_buttons[-1], Qt.MouseButton.LeftButton)
@@ -1778,6 +1923,7 @@ def run_gui(args):
                               "host_move_hide_restore": True, "drag_offset_preserved": True, "tps": True,
                               "session_follow": True, "late_snapshot_rejected": True,
                               "recent_click_drag": True, "recent_rows": 10, "navigation_queued": True,
+                              "cached_reopen_ms": preloaded_open_ms, "metrics_update_reuses_rows": True,
                               "screenshot": str(RUNTIME / "ui-verification.png")}))
             bar.close()
         def report_checks():

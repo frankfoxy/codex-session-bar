@@ -9,6 +9,58 @@ import session_bar as sb
 
 
 class DataTests(unittest.TestCase):
+    def test_recent_cache_load_is_bounded_and_marks_stale(self):
+        runtime = (sb.RUNTIME / 'cache-fixture').resolve()
+        self.assertTrue(runtime.is_relative_to(sb.TMP_ROOT))
+        runtime.mkdir(exist_ok=True)
+        path = runtime / 'recent-cache.json'
+        row = {'id': 'fixture', 'label': 'Fixture', 'state': 'Busy', 'state_icon': '●', 'color': '#fb923c'}
+        path.write_text(json.dumps({'schema': 1, 'rows': [row], 'busy_count': 4, 'loaded_at': 123}), encoding='utf-8')
+        with patch.object(sb, 'RUNTIME', runtime):
+            self.assertTrue(sb.load_recent_cache()['stale'])
+            self.assertEqual(sb.load_recent_cache()['busy_count'], 4)
+            path.write_text('x'*65537, encoding='utf-8')
+            self.assertEqual(sb.load_recent_cache(), {})
+
+    def test_metrics_use_current_turn_and_expire_old_tps(self):
+        snapshot = {'turn': {'started_at': 100}, 'usage': {'total_token_usage': {'total_tokens': 27190000}},
+                    'output_rate': {'start': 110, 'end': 120, 'value': 42.3}}
+        row = sb.session_metrics(snapshot)
+        self.assertEqual(sb.metrics_text(row, now=125), '42.3 t/s   ·   27.2M TOK   ·   00:25')
+        self.assertTrue(sb.metrics_text(row, now=151).startswith('— t/s'))
+        snapshot['turn']['started_at'] = 115
+        self.assertIsNone(sb.session_metrics(snapshot)['tps'])
+        self.assertIsNone(sb.session_metrics({})['tokens'])
+
+    def test_refresh_failure_retains_rows_count_and_age(self):
+        old = {'rows': [{'id': 'one'}], 'busy_count': 5, 'loaded_at': 123}
+        stale = sb.retain_recent(old, 'offline')
+        self.assertEqual(stale['rows'], old['rows'])
+        self.assertEqual(stale['busy_count'], 5)
+        self.assertEqual(stale['loaded_at'], 123)
+        self.assertTrue(stale['stale'])
+        self.assertNotIn('error', old)
+
+    def test_busy_count_includes_chats_outside_the_ten_rows(self):
+        rows = [{'id': str(i), 'kind': 'codex', 'status': 'active', 'updatedAt': 100-i, 'title': str(i)} for i in range(12)]
+        store = MagicMock()
+        store.recent_turns.return_value = {str(i): 'inProgress' for i in range(12)}
+        store.enrich_recent.side_effect = lambda rows: rows
+        response = {'content': [{'type': 'text', 'text': json.dumps({'threads': rows})}]}
+        with patch.object(sb.DesktopTools, 'call', return_value=response):
+            result = sb.DesktopTools().recent(store)
+        self.assertEqual(len(result['rows']), 10)
+        self.assertEqual(result['busy_count'], 12)
+
+    def test_one_missing_busy_rollout_does_not_hide_others(self):
+        store = sb.SessionStore()
+        rows = [{'id': 'bad', 'state': 'Busy'}, {'id': 'ok', 'state': 'Busy'}, {'id': 'done', 'state': 'Done'}]
+        with patch.object(store, 'read', side_effect=[FileNotFoundError(), {'tokens_used': 1234}]):
+            enriched = store.enrich_recent(rows)
+        self.assertEqual(len(enriched), 3)
+        self.assertNotIn('tokens', enriched[0])
+        self.assertEqual(enriched[1]['tokens'], 1234)
+
     def test_default_thread_uses_local_configuration(self):
         with patch.dict(sb.os.environ, {'CODEX_THREAD_ID': ''}), patch.object(sb, 'load_settings', return_value={}):
             with patch.object(sb.SessionStore, 'sessions', return_value=[{'id': 'recent-local'}]):
