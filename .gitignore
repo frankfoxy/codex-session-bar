@@ -1,0 +1,10 @@
+settings.json
+__pycache__/
+tmp/
+.venv/
+*.py[cod]
+*.log
+*.jsonl
+*.sqlite*
+.env
+.env.*
