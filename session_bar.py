@@ -936,6 +936,7 @@ def run_gui(args):
         rename_failed = pyqtSignal(str, str)
         active_changed = pyqtSignal(dict)
         recents = pyqtSignal(dict)
+        account_changed = pyqtSignal(dict)
         navigated = pyqtSignal(str)
         navigation_failed = pyqtSignal(str, str)
 
@@ -983,6 +984,7 @@ def run_gui(args):
             except Exception as exc:
                 account[0] = {**previous, "limits_error": str(exc)[:160]}
                 retry = 15
+            bridge.account_changed.emit(account[0])
             data_wake.set()
             quota_wake.wait(retry)
             quota_wake.clear()
@@ -1202,6 +1204,7 @@ def run_gui(args):
             self.expanded = False
             self.drag_delta = None
             self.snapshot = {}
+            self.account_result = {}
             self.data_error = ""
             self.last_rename = None
             self.last_icon_action = None
@@ -1358,6 +1361,7 @@ def run_gui(args):
             bridge.rename_failed.connect(self.rename_error)
             bridge.active_changed.connect(self.active_changed)
             bridge.recents.connect(self.update_recent)
+            bridge.account_changed.connect(self.update_account)
             bridge.navigated.connect(self.navigation_done)
             bridge.navigation_failed.connect(self.navigation_error)
             self.host_clock = QTimer(self)
@@ -1478,9 +1482,17 @@ def run_gui(args):
                 self.status.setText("Loading")
                 self.write_settings()
             else:
-                self.title.setText("Waiting for chat")
-                self.status.setText("Waiting")
+                self.title.setText("Recent chats")
+                self.title.setToolTip("Click to open recent chats\nNo chat page selected")
                 self.note.setText(view.get("message") or "No chat page selected")
+            self.tick()
+            self.write_diagnostic()
+
+        def update_account(self, result):
+            # Quota belongs to the account and must render on the home page,
+            # before any chat identity or session snapshot becomes available.
+            self.account_result = result
+            self.tick()
             self.write_diagnostic()
 
         def update_data(self, data):
@@ -1542,8 +1554,9 @@ def run_gui(args):
             self.status.setToolTip(f"Busy local chats: {count if count is not None else 'checking'}\n"
                                   f"Current chat: {labels.get(code, code or 'Loading')}\n"
                                   + ('* Last known count; background refresh pending' if stale else 'Live desktop scan'))
-            if binding["auto"] and not self.tracker_ready:
-                self.status.setText("Waiting")
+            overview = binding["auto"] and not self.tracker_ready
+            if overview and count is None:
+                self.status.setText("Connecting…")
             if self.data_error:
                 self.status.setText("! Unavailable")
             self.status.setStyleSheet("color:#f5a34b" if count or (count is None and code == 'inProgress') else "color:#a8b3bf")
@@ -1558,13 +1571,22 @@ def run_gui(args):
             else:
                 self.tps.setText("— t/s")
                 self.tps.setToolTip("Output TPS: no recent sample, or waiting for two samples in this turn")
+            if overview:
+                totals = recent_totals(self.recent_result)
+                self.tokens.setText(compact(totals['tokens']))
+                self.tokens.setToolTip("Combined session tokens of scanned Busy chats; — = unavailable")
+                self.tps.setText(f"{totals['tps']:.1f} t/s" if totals['tps'] is not None else "— t/s")
+                self.tps.setToolTip("Combined fresh output TPS of scanned Busy chats; partial coverage is possible")
+                self.status.setToolTip(f"Busy local chats: {count if count is not None else 'checking'}\n"
+                                       "Open a recent chat to follow its individual usage")
             if self.popup_kind == 'recent' and self.popup and self.popup.isVisible():
                 self.render_recent(self.recent_result)
-            limits = self.snapshot.get("limits", {})
+            quota = self.account_result or self.snapshot
+            limits = quota.get("limits", {})
             windows = limit_windows(limits)
-            error = self.snapshot.get("limits_error", "")
+            error = quota.get("limits_error", "")
             if windows:
-                stale = bool(error) or time.time() - self.snapshot.get("limits_at", 0) > 180
+                stale = bool(error) or time.time() - quota.get("limits_at", 0) > 180
                 self.quota.set_windows(windows, stale)
                 text = "\n".join(f"{w['bucket']} · {w['label']}: {w['remaining']:g}% left · {reset_text(w['reset'])}" for w in windows)
                 if stale:
@@ -1974,10 +1996,13 @@ def run_gui(args):
 
         def write_diagnostic(self):
             d = self.snapshot
+            quota = self.account_result or d
             safe = {"pid": os.getpid(), "thread": selected[0], "status": d.get("turn", {}).get("status"),
                     "tokens": d.get("usage", {}).get("total_token_usage", {}).get("total_tokens", d.get("tokens_used")),
-                    "token_timestamp": d.get("token_at"), "quota": limit_windows(d.get("limits", {})),
-                    "quota_error": d.get("limits_error", ""), "updated_at": time.time(),
+                    "token_timestamp": d.get("token_at"), "quota": limit_windows(quota.get("limits", {})),
+                    "quota_error": quota.get("limits_error", ""), "updated_at": time.time(),
+                    "overview": binding["auto"] and not self.tracker_ready,
+                    "display_title": self.title.text(), "display_status": self.status.text(),
                     "topmost": self.topmost, "user_hidden": self.user_hidden,
                     "tray_available": bool(self.tray), "geometry": self.geometry().getRect(),
                     "last_rename": self.last_rename, "auto_thread": binding["auto"],
@@ -2048,6 +2073,31 @@ def run_gui(args):
                              "limits_at": time.time(), "sessions": [],
                              "output_rate": {"value": 42.3, "start": time.time()-20, "end": time.time()-10,
                                              "output_tokens": 423}}
+            # Cold start on Codex home: global data must not wait for a chat.
+            binding['auto'] = True
+            bar.active_changed({'available': False, 'source': 'home', 'message': 'No chat page selected'})
+            bar.update_account({'limits': demo_data['limits'], 'limits_at': time.time()})
+            bar.update_recent({'rows': [{'id': 'startup-busy', 'label': 'Busy chat', 'state': 'Busy',
+                                       'state_icon': '●', 'color': '#f5a34b',
+                                       'tokens': 12000000, 'tps': 21.5, 'rate_at': time.time()}],
+                               'busy_count': 1, 'loaded_at': time.time()})
+            app.processEvents()
+            assert not bar.snapshot and not bar.icon.isEnabled()
+            assert bar.title.text() == 'Recent chats'
+            assert bar.status.text() == '● Busy (1)'
+            assert bar.tokens.text() == '12.0M' and bar.tps.text() == '21.5 t/s'
+            assert bar.quota.cells[0][3].text() == '97%'
+            QTest.mouseClick(bar.title, Qt.MouseButton.LeftButton)
+            assert bar.popup.isVisible() and len(bar.recent_buttons) == 1
+            bar.popup.close()
+            # Entering a chat clears aggregate metrics, but preserves quota.
+            bar.active_changed({'available': True, 'thread': selected[0], 'source': 'test'})
+            assert bar.quota.cells[0][3].text() == '97%'
+            bar.update_data(dict(demo_data))
+            assert bar.tokens.text() == '24.8M' and bar.tps.text() == '42.3 t/s'
+            bar.set_auto_thread(False)
+            bar.recent_result = {}
+            bar.account_result = {}
             bar.update_data(dict(demo_data))
             app.processEvents()
             compact_height = bar.height()
@@ -2292,6 +2342,7 @@ def run_gui(args):
                               "random_icon_queued": True, "titlebar_demo_sanitized": True,
                               "hide_restore": True, "emoji_search": True,
                               "default_collection": 90,
+                              "startup_home_quota_and_recent": True,
                               "icon_open_ms": icon_open_ms,
                               "screenshot": str(RUNTIME / "ui-verification.png")}))
             bar.quit_bar()

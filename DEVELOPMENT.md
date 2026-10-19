@@ -17,6 +17,8 @@ The control worker warms and reuses its own adapter. Missing desktop pipes and t
 
 Quota, control actions, recent scans and current-view tracking have separate workers. The recent scanner uses its own adapter, approximately every 3 seconds while closed and 1.5 seconds while open. Reopening a cached picker reuses its widgets. An open picker preserves its displayed IDs and order, including rows that leave the latest top ten; updates merge by ID. Reopening applies the latest Busy-first order. An initially empty menu can populate when its first result arrives.
 
+On the Codex home page, show a Recent chats entry, the scanned Busy count and aggregate Busy usage. Account quota has its own GUI signal and renders before any chat is selected. Keep icon changes disabled until an actual visible chat is identified; never substitute a background chat for the home page. Entering or leaving a chat preserves the independent account quota.
+
 Busy totals cover all scanned Busy local root chats, including those outside the ten visible rows. Sum available cumulative tokens and fresh TPS samples; expose partial coverage in tooltips. A missing rollout affects only that chat's metrics.
 
 The bar watches the host window every 80 ms. A separate read-only titlebar observer supplies safe blank bounds. Too little space falls back below the menu. Current-view detection runs incrementally every 0.1 seconds and wakes data reads; session data normally refreshes every 0.5 seconds.
