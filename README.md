@@ -34,7 +34,7 @@
 
 点击悬浮条左端图标，即可展开完整选择面板，修改当前会话的图标。
 
-![标题栏上的悬浮条与完整 Emoji 面板，最左边骰子按钮可随机选择](preview-titlebar-icons.png)
+![标题栏上的悬浮条与完整 Emoji 面板，最左边骰子按钮可随机选择](preview-titlebar-icons.png?v=default-set)
 
 **首屏是“默认集合”**：保留原来的 90 个常用图标及排列顺序。下拉选择 **All emoji** 可浏览 Unicode Emoji 18.0 全集的 3,972 个图标与组件，也可选择其他分类。支持英文名称或 Emoji 搜索，包含肤色、国旗和组合 Emoji。
 

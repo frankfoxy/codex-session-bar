@@ -4,11 +4,42 @@ from pathlib import Path
 import unittest
 from unittest.mock import MagicMock, patch
 import time
+from types import SimpleNamespace
 
 import session_bar as sb
 
 
 class DataTests(unittest.TestCase):
+    def test_titlebar_ignores_nested_browser_controls_with_misreported_coordinates(self):
+        class Children:
+            def __init__(self, children):
+                self.children, self.Length = children, len(children)
+            def GetElement(self, index):
+                return self.children[index]
+        def node(kind, rect, children=()):
+            result = MagicMock()
+            result.CurrentControlType = kind
+            result.CurrentBoundingRectangle = SimpleNamespace(left=rect[0]+100, top=rect[1]+100,
+                                                               right=rect[2]+100, bottom=rect[3]+100)
+            result.FindAll.return_value = Children(children)
+            return result
+        # The app's main document contains its legitimate menu, followed by
+        # an embedded webpage whose buttons incorrectly look like header UI.
+        browser_button = node(50000, (842, 9, 870, 38))
+        browser = node(50030, (0, 0, 1482, 1000), [browser_button])
+        main_document = node(50030, (0, 0, 1482, 1000), [
+            node(50000, (6, 4, 102, 32)), node(50010, (108, 6, 317, 30)), browser])
+        root = node(50032, (0, 0, 1482, 1000), [main_document])
+        tracker = sb.CurrentPageTracker.__new__(sb.CurrentPageTracker)
+        tracker.ui, tracker.api = MagicMock(), MagicMock()
+        tracker.ui.ElementFromHandle.return_value = root
+        with patch.object(sb, 'host_window_state', return_value={'visible': True, 'rect': (100, 100, 1582, 1100)}), patch.object(sb.ctypes.windll.user32, 'GetDpiForWindow', return_value=96):
+            result = tracker.read_titlebar(1)
+        self.assertEqual(result['slot'], [325, 2, 1334, 42])
+        browser.FindAll.assert_not_called()
+        self.assertNotIn((842, 9, 870, 38), result['controls'])
+        self.assertEqual(sb.dock_position((100, 100, 1582, 1100), (587, 40), [(0, 0, 1920, 1200)], result['slot'])[2], 'titlebar-blank')
+
     def test_complete_emoji_catalog_search_and_sequences(self):
         self.assertGreater(len(sb.EMOJI_ENTRIES), 3900)
         for emoji in ('🚀', '🇨🇳', '👩🏽\u200d💻', '1️⃣', '🏳️\u200d🌈'):

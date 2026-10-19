@@ -705,7 +705,7 @@ class CurrentPageTracker:
         menu_found = False
         condition = self.ui.CreateTrueCondition()
 
-        def visit(element, depth):
+        def visit(element, depth, documents=0):
             nonlocal visited, menu_found
             if depth > 22 or visited >= 160:
                 return
@@ -714,13 +714,17 @@ class CurrentPageTracker:
                 return
             visited += 1
             kind = element.CurrentControlType
+            if kind == 50030:  # Main document owns the header; nested webviews do not.
+                if documents:
+                    return
+                documents += 1
             if kind in (50000, 50005, 50010, 50011, 50020) and rect.bottom <= top+44*scale:
                 controls.append(tuple(round(v/scale) for v in
                                       (rect.left-left, rect.top-top, rect.right-left, rect.bottom-top)))
                 menu_found = menu_found or kind in (50010, 50011)
             children = element.FindAll(self.api.TreeScope_Children, condition)
             for index in range(min(children.Length, 60)):
-                visit(children.GetElement(index), depth+1)
+                visit(children.GetElement(index), depth+1, documents)
 
         visit(self.ui.ElementFromHandle(hwnd), 0)
         if not menu_found:
