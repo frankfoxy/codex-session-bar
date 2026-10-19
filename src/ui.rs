@@ -279,6 +279,7 @@ struct App {
     width: i32,
     height: i32,
     popup_size: [i32; 2],
+    popup_layout: Option<([i32; 4], u32)>,
     dpi: f32,
     last_draw: Instant,
     last_diag: Instant,
@@ -359,6 +360,7 @@ impl App {
             edit_font: HFONT::default(),
             child_brush: CreateSolidBrush(COLORREF(0x25211c)),
             popup_kind: None,
+            popup_layout: None,
             rows: Vec::new(),
             hits: Vec::new(),
             popup_hits: Vec::new(),
@@ -1073,6 +1075,37 @@ impl App {
         self.popup_kind = None;
         self.hover = None;
     }
+    unsafe fn owns_popup_window(&self, hwnd: HWND) -> bool {
+        if hwnd.is_invalid() {
+            return false;
+        }
+        if hwnd == self.popup || IsChild(self.popup, hwnd).as_bool() {
+            return true;
+        }
+        [self.combo, self.selector].iter().any(|&combo| {
+            let mut info = COMBOBOXINFO {
+                cbSize: size_of::<COMBOBOXINFO>() as u32,
+                ..Default::default()
+            };
+            !combo.is_invalid()
+                && GetComboBoxInfo(combo, &mut info).is_ok()
+                && (hwnd == info.hwndList || IsChild(info.hwndList, hwnd).as_bool())
+        })
+    }
+    fn choose_fixed_chat(&self, index: isize) -> bool {
+        let Some(row) = index
+            .checked_sub(1)
+            .filter(|&i| i >= 0)
+            .and_then(|i| self.rows.get(i as usize))
+        else {
+            return false;
+        };
+        let mut live = self.state.lock().unwrap();
+        live.fixed_thread = row.id.clone();
+        live.auto_thread = false;
+        live.snapshot = None;
+        true
+    }
     unsafe fn popup(&mut self, kind: Popup) -> Result<()> {
         if self.popup_kind == Some(kind) && IsWindowVisible(self.popup).as_bool() {
             self.close_popup();
@@ -1086,6 +1119,8 @@ impl App {
         self.edit = HWND::default();
         self.combo = HWND::default();
         self.selector = HWND::default();
+        // A newly created child needs one layout even if the panel bounds match.
+        self.popup_layout = None;
         self.popup_kind = Some(kind);
         self.hover = None;
         let live = self.snapshot();
@@ -1185,7 +1220,15 @@ impl App {
                     LPARAM(wide(&row.label).as_ptr() as isize),
                 );
             }
-            let _ = SendMessageW(self.selector, CB_SETCURSEL, WPARAM(0), LPARAM(0));
+            let selected = if live.auto_thread {
+                0
+            } else {
+                self.rows
+                    .iter()
+                    .position(|row| row.id == live.fixed_thread)
+                    .map_or(0, |index| index + 1)
+            };
+            let _ = SendMessageW(self.selector, CB_SETCURSEL, WPARAM(selected), LPARAM(0));
         }
         let previous_font = self.edit_font;
         self.edit_font = CreateFontW(
@@ -1227,7 +1270,15 @@ impl App {
         }
         Ok(())
     }
-    unsafe fn place_popup(&self) {
+    unsafe fn place_popup(&mut self) {
+        // Token/TPS text can change the bar's width and anchor while the user
+        // is choosing. Let native combo tracking finish before moving its panel.
+        if [self.combo, self.selector].iter().any(|&combo| {
+            !combo.is_invalid()
+                && SendMessageW(combo, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0 != 0
+        }) {
+            return;
+        }
         let Some(bar) = host::bounds(self.bar.0 as isize) else {
             return;
         };
@@ -1251,6 +1302,14 @@ impl App {
         } else {
             (bar[3] + 6).min((bounds.bottom - h).max(bounds.top))
         };
+        let layout = ([x, y, w, h], scale.to_bits());
+        // Moving/resizing a native combo box closes its open drop-down, even
+        // when the requested bounds are unchanged. Timer refreshes must not
+        // disturb an interaction already in progress.
+        if self.popup_layout == Some(layout) {
+            return;
+        }
+        self.popup_layout = Some(layout);
         let _ = SetWindowPos(self.popup, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
         Self::round_window(self.popup, w, h, (18. * scale) as i32);
         // Child controls stay in physical pixels, matching the parent DPI.
@@ -1520,23 +1579,20 @@ unsafe extern "system" fn wndproc(
                 let code = ((wparam.0 >> 16) & 0xffff) as u32;
                 if (id == 100 && code == EN_CHANGE) || (id == 101 && code == CBN_SELCHANGE) {
                     app.update_filter();
-                } else if id == 102 && code == CBN_SELCHANGE {
+                } else if id == 102 && code == CBN_SELENDOK {
                     let index = SendMessageW(app.selector, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
-                    if index > 0 {
-                        if let Some(row) = app.rows.get(index as usize - 1) {
-                            let mut live = app.state.lock().unwrap();
-                            live.fixed_thread = row.id.clone();
-                            live.auto_thread = false;
-                            live.snapshot = None;
-                            drop(live);
-                            app.settings();
-                        }
+                    if app.choose_fixed_chat(index) {
+                        app.settings();
                     }
                 }
                 Some(LRESULT(0))
             }
             WM_ACTIVATE if !is_bar && (wparam.0 & 0xffff) == WA_INACTIVE as usize => {
-                app.close_popup();
+                // Native drop-down lists are separate windows owned by their
+                // combo, so activating one is still interaction in this panel.
+                if !app.owns_popup_window(HWND(lparam.0 as *mut _)) {
+                    app.close_popup();
+                }
                 Some(LRESULT(0))
             }
             WM_CLOSE if is_bar => {
@@ -1843,6 +1899,56 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         )?;
         app.rows = rows.clone();
         app.popup(Popup::Details)?;
+        // Exercise the real native combo with the fixture window kept hidden.
+        // Repeating the live timer's placement call must leave it expanded.
+        let _ = SendMessageW(app.selector, CB_SHOWDROPDOWN, WPARAM(1), LPARAM(0));
+        assert_ne!(
+            SendMessageW(app.selector, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0,
+            0
+        );
+        for _ in 0..100 {
+            app.place_popup();
+        }
+        assert_ne!(
+            SendMessageW(app.selector, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0,
+            0,
+            "Timer placement closed the fixed-chat dropdown"
+        );
+        let mut info = COMBOBOXINFO {
+            cbSize: size_of::<COMBOBOXINFO>() as u32,
+            ..Default::default()
+        };
+        GetComboBoxInfo(app.selector, &mut info)?;
+        assert!(app.owns_popup_window(info.hwndList));
+        assert!(!app.owns_popup_window(app.bar));
+        let panel_before = host::bounds(app.popup.0 as isize).unwrap();
+        let bar_before = host::bounds(app.bar.0 as isize).unwrap();
+        let _ = SetWindowPos(
+            app.bar,
+            HWND_TOPMOST,
+            bar_before[0] + 120,
+            bar_before[1],
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        app.place_popup();
+        assert_eq!(
+            host::bounds(app.popup.0 as isize),
+            Some(panel_before),
+            "Changing bar metrics moved a panel during dropdown tracking"
+        );
+        let _ = SendMessageW(app.selector, CB_SHOWDROPDOWN, WPARAM(0), LPARAM(0));
+        app.place_popup();
+        assert_ne!(host::bounds(app.popup.0 as isize), Some(panel_before));
+        let _ = SendMessageW(app.selector, CB_SETCURSEL, WPARAM(2), LPARAM(0));
+        let index = SendMessageW(app.selector, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+        let before = app.snapshot();
+        assert!(app.choose_fixed_chat(index));
+        assert_eq!(app.snapshot().fixed_thread, rows[1].id);
+        assert!(!app.snapshot().auto_thread);
+        assert!(!app.choose_fixed_chat(0));
+        *state.lock().unwrap() = before;
         capture(
             &app,
             Some(Popup::Details),
@@ -1850,6 +1956,17 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             310,
             &paths.runtime.join("rust-details-verification.png"),
         )?;
+        app.popup(Popup::Icons)?;
+        let _ = SendMessageW(app.combo, CB_SHOWDROPDOWN, WPARAM(1), LPARAM(0));
+        for _ in 0..100 {
+            app.place_popup();
+        }
+        assert_ne!(
+            SendMessageW(app.combo, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0,
+            0,
+            "Timer placement closed the emoji category dropdown"
+        );
+        let _ = SendMessageW(app.combo, CB_SHOWDROPDOWN, WPARAM(0), LPARAM(0));
         assert_eq!(app.catalog.rename("👩🏽‍💻 中文标题", "🚀"), "🚀 中文标题");
         assert_eq!(app.catalog.filter("rocket", "All emoji").len(), 1);
         let hits = app.render(None, w as f32, 34.);
@@ -1869,7 +1986,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert!(app.hidden);
         app.hidden = false;
         app.diagnostic();
-        paths.write("rust-ui-test.json",&json!({"ui":"pass","runtime":"rust","emoji_count":app.catalog.entries.len(),"default_collection":90,"recent_rows":10,"startup_home_quota":true,"open_list_order_fixed":true,"random_icon_bound":true,"drag_grip_separate":true,"font_chinese":app.painter.chinese,"renderer":"DirectWrite + software Direct2D"}));
+        paths.write("rust-ui-test.json",&json!({"ui":"pass","runtime":"rust","emoji_count":app.catalog.entries.len(),"default_collection":90,"recent_rows":10,"startup_home_quota":true,"open_list_order_fixed":true,"random_icon_bound":true,"drag_grip_separate":true,"fixed_chat_dropdown_survives_100_refreshes":true,"emoji_dropdown_survives_100_refreshes":true,"fixed_chat_selection":true,"font_chinese":app.painter.chinese,"renderer":"DirectWrite + software Direct2D"}));
         println!(
             "{}",
             json!({"ui":"pass","emoji":app.catalog.entries.len(),"font":app.painter.chinese,"screenshots":paths.runtime.to_string_lossy()})
