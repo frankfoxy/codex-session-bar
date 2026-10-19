@@ -22,7 +22,13 @@ pub unsafe fn visible_windows() -> Vec<isize> {
         let mut title = [0u16; 256];
         let length = GetWindowTextW(hwnd, &mut title);
         let caption = String::from_utf16_lossy(&title[..length as usize]).to_lowercase();
-        if !caption.contains("codex") && !caption.contains("chatgpt") {
+        let owned = GetWindow(hwnd, GW_OWNER).is_ok_and(|h| !h.is_invalid());
+        if !main_window_candidate(
+            &caption,
+            owned,
+            GetWindowLongW(hwnd, GWL_STYLE) as u32,
+            GetWindowLongW(hwnd, GWL_EXSTYLE) as u32,
+        ) {
             return true.into();
         }
         let mut pid = 0;
@@ -52,6 +58,16 @@ pub unsafe fn visible_windows() -> Vec<isize> {
     let foreground = GetForegroundWindow().0 as isize;
     windows.sort_by_key(|h| *h != foreground);
     windows
+}
+fn main_window_candidate(caption: &str, owned: bool, style: u32, extended: u32) -> bool {
+    let title = caption.trim();
+    !owned
+        && style & WS_CHILD.0 == 0
+        && extended & WS_EX_TOOLWINDOW.0 == 0
+        && (title == "codex"
+            || title == "chatgpt"
+            || title.ends_with(" - codex")
+            || title.ends_with(" - chatgpt"))
 }
 pub unsafe fn bounds(hwnd: isize) -> Option<[i32; 4]> {
     let h = HWND(hwnd as *mut _);
@@ -322,6 +338,21 @@ pub fn inspect(paths: &Paths) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_follow_main_window() {
+        let main = WS_OVERLAPPEDWINDOW.0;
+        assert!(main_window_candidate("codex", false, main, 0));
+        assert!(main_window_candidate("chatgpt", false, main, 0));
+        assert!(!main_window_candidate("about chatgpt", false, main, 0));
+        assert!(!main_window_candidate("codex", true, main, 0));
+        assert!(!main_window_candidate(
+            "codex",
+            false,
+            main,
+            WS_EX_TOOLWINDOW.0
+        ));
+        assert!(!main_window_candidate("codex", false, WS_CHILD.0, 0));
+    }
     #[test]
     fn blank_slot_avoids_menus() {
         assert_eq!(
