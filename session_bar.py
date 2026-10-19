@@ -212,6 +212,24 @@ def readonly_db(name):
     return conn
 
 
+def stable_recent_rows(previous, incoming):
+    """Keep open-menu targets in place, including rows absent from a new top 10."""
+    latest = {row['id']: row for row in incoming}
+    return [dict(latest.get(row['id'], row)) for row in previous] if previous else [dict(row) for row in incoming]
+
+
+class ControlQueue(queue.Queue):
+    """Only the latest pending navigation matters; preserve bound icon writes."""
+    def _put(self, item):
+        if item[0] == 'navigate':
+            pending = [command for command in self.queue if command[0] != 'navigate']
+            removed = len(self.queue)-len(pending)
+            self.queue.clear()
+            self.queue.extend(pending)
+            self.unfinished_tasks -= removed
+        super()._put(item)
+
+
 class SessionStore:
     def __init__(self):
         self.cache = {}
@@ -222,6 +240,13 @@ class SessionStore:
                 "SELECT id, coalesce(nullif(name,''),title) AS label, cwd "
                 "FROM threads WHERE archived=0 AND agent_path IS NULL "
                 "ORDER BY updated_at DESC LIMIT 40")]
+
+    def read_label(self, tid):
+        with readonly_db('state_5.sqlite') as db:
+            row = db.execute("SELECT coalesce(nullif(name,''),title) AS label FROM threads WHERE id=?", (tid,)).fetchone()
+        if row is None:
+            raise ValueError('Chat not found; choose another chat')
+        return row['label']
 
     def read(self, tid):
         with readonly_db("state_5.sqlite") as db:
@@ -382,6 +407,8 @@ class Rpc:
             if response.get("id") not in (request_id, -1):
                 continue
             if "error" in response:
+                if response.get('id') == -1:
+                    raise ConnectionError('Codex connection closed')
                 raise RuntimeError(response["error"].get("message", "Codex API error"))
             return response.get("result", {})
         self.close()
@@ -425,17 +452,27 @@ class DesktopTools(Rpc):
                 raise RuntimeError("Cannot identify Codex desktop connection; restart the bar from Codex")
             env["CODEX_APP_TOOLS_PIPE_PATH"] = endpoints[0]
         adapter = max(adapters, key=lambda p: p.stat().st_mtime)
+        self.desktop_pipe = env['CODEX_APP_TOOLS_PIPE_PATH']
         self.open_process([node, str(adapter)], "desktop-tools-stderr.log", env)
         self.call("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
                                  "clientInfo": {"name": "codex-session-bar", "version": "0.1.1"}})
         self.proc.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
         self.proc.stdin.flush()
 
+    def control_call(self, params):
+        # Keep a warm adapter, but rediscover its pipe after a desktop restart.
+        if getattr(self, 'desktop_pipe', None) and not os.path.exists(self.desktop_pipe):
+            self.close()
+        for attempt in range(2):
+            try:
+                return self.call('tools/call', params)
+            except (ConnectionError, OSError, TimeoutError):
+                self.close()
+                if attempt:
+                    raise
+
     def rename(self, tid, name):
-        # The bar outlives desktop restarts; reconnect to the current app pipe
-        # for each explicit icon change rather than retaining a dead adapter.
-        self.close()
-        result = self.call("tools/call", {"name": "set_thread_title",
+        result = self.control_call({"name": "set_thread_title",
             "arguments": {"threadId": tid, "title": name},
             "_meta": {"codexThreadId": default_thread() or tid}})
         return self.verify_rename(result, tid, name)
@@ -469,8 +506,7 @@ class DesktopTools(Rpc):
                 'loaded_at': time.time(), 'stale': False}
 
     def navigate(self, tid):
-        self.close()  # Discover the current desktop pipe after app restarts.
-        payload = self.tool_payload(self.call('tools/call', {'name': 'navigate_to_codex_page',
+        payload = self.tool_payload(self.control_call({'name': 'navigate_to_codex_page',
             'arguments': {'threadId': tid}, '_meta': {'codexThreadId': default_thread() or tid}}))
         if payload.get('navigated') is not True:
             raise RuntimeError('Codex did not confirm navigation')
@@ -825,14 +861,14 @@ def run_gui(args):
         data = pyqtSignal(dict)
         error = pyqtSignal(str)
         renamed = pyqtSignal(str, str)
-        rename_failed = pyqtSignal(str)
+        rename_failed = pyqtSignal(str, str)
         active_changed = pyqtSignal(dict)
         recents = pyqtSignal(dict)
         navigated = pyqtSignal(str)
         navigation_failed = pyqtSignal(str, str)
 
     bridge = Bridge()
-    commands = queue.Queue()
+    commands = ControlQueue()
     stop = threading.Event()
     data_wake = threading.Event()
     quota_wake = threading.Event()
@@ -902,6 +938,10 @@ def run_gui(args):
 
     def control_worker():
         store = SessionStore()
+        try:
+            desktop.start()
+        except Exception:
+            desktop.close()  # Explicit actions retry when the desktop becomes ready.
         while not stop.is_set():
             try:
                 command = commands.get(timeout=.5)
@@ -910,7 +950,7 @@ def run_gui(args):
             try:
                 if command[0] == "icon":
                     tid, icon = command[1:]
-                    current = store.read(tid)["label"]
+                    current = store.read_label(tid)
                     name = with_icon(current, icon)
                     desktop.rename(tid, name)
                     bridge.renamed.emit(tid, name)
@@ -924,7 +964,7 @@ def run_gui(args):
                 if command[0] == 'navigate':
                     bridge.navigation_failed.emit(command[1], str(exc)[:220])
                 else:
-                    bridge.rename_failed.emit(str(exc)[:220])
+                    bridge.rename_failed.emit(command[1] if len(command) > 1 else '', str(exc)[:220])
 
     def recent_worker():
         client, store = recent_client, SessionStore()
@@ -1094,6 +1134,7 @@ def run_gui(args):
             self.recent_result = {} if args.test_ui else load_recent_cache()
             self.last_recent_open_ms = None
             self.recent_signature = None
+            self.recent_open_rows = None
             self.popup_kind = None
             self.follow_latency = None
             self.tracker_ready = False
@@ -1447,11 +1488,11 @@ def run_gui(args):
             self.icon.setEnabled(bool(self.snapshot) and (not binding["auto"] or self.tracker_ready))
             self.write_diagnostic()
 
-        def rename_error(self, error):
-            self.last_rename = {"thread": selected[0], "desktop_confirmed": False, "error": error}
-            self.last_icon_action = {"phase": "failed", "thread": selected[0], "at": time.time(), "error": error}
+        def rename_error(self, tid, error):
+            self.last_rename = {"thread": tid, "desktop_confirmed": False, "error": error}
+            self.last_icon_action = {"phase": "failed", "thread": tid, "at": time.time(), "error": error}
             self.note.setText("Icon sync failed: " + error)
-            self.icon.setEnabled(True)
+            self.icon.setEnabled(bool(self.snapshot) and (not binding['auto'] or self.tracker_ready))
             self.icon.setToolTip("Icon sync failed: " + error)
             if not self.expanded:
                 self.toggle_details()
@@ -1519,6 +1560,7 @@ def run_gui(args):
             self.finish_recent_open(opened)
 
         def finish_recent_open(self, opened):
+            self.recent_open_rows = None
             self.render_recent(self.recent_result)
             self.place_popup(self.popup)
             self.popup.show()
@@ -1534,6 +1576,8 @@ def run_gui(args):
 
         def render_recent(self, result):
             rows = result.get('rows', [])
+            self.recent_open_rows = stable_recent_rows(self.recent_open_rows, rows)
+            rows = self.recent_open_rows
             signature = tuple(r['id'] for r in rows)
             if signature != self.recent_signature:
                 self.recent_signature = signature
@@ -1609,7 +1653,7 @@ def run_gui(args):
                 "* = partial data; — = unavailable. Tokens are usage counts, not a currency charge.")
             cached = result.get('stale') or time.time()-result.get('loaded_at', 0) > 10
             self.recent_note.setText('Cached · Refresh pending' if cached else f'Preloaded · {count if count is not None else "—"} busy · Live every 1.5s')
-            self.recent_note.setToolTip(result.get('error', '') or 'Latest 10 local chats · Busy first · TPS / session tokens / current turn elapsed')
+            self.recent_note.setToolTip(result.get('error', '') or 'Order stays fixed while open; reopen for latest Busy-first order.\nTPS / session tokens / current turn elapsed')
             self.popup.layout().activate()
             self.popup.adjustSize()
             self.place_popup(self.popup)
@@ -1623,11 +1667,15 @@ def run_gui(args):
             self.write_diagnostic()
 
         def navigation_done(self, tid):
+            if (self.last_navigation or {}).get('thread') != tid:
+                return
             self.last_navigation = {'thread': tid, 'phase': 'opened', 'at': time.time()}
             recent_wake.set()
             self.write_diagnostic()
 
         def navigation_error(self, tid, error):
+            if (self.last_navigation or {}).get('thread') != tid:
+                return
             self.last_navigation = {'thread': tid, 'phase': 'failed', 'error': error, 'at': time.time()}
             self.note.setText('Could not open chat: '+error)
             if not self.details.isVisible():
@@ -1642,6 +1690,13 @@ def run_gui(args):
                 return
             if self.popup and self.popup.isVisible():
                 self.popup.close()
+                return
+            if self.popup and self.popup_kind == 'icons':
+                self.popup_thread = selected[0]
+                self.place_popup(self.popup)
+                self.popup.show()
+                self.last_icon_action = {"phase": "picker_open", "thread": selected[0], "at": time.time()}
+                self.write_diagnostic()
                 return
             if self.popup:
                 self.popup.deleteLater()
@@ -1830,7 +1885,7 @@ def run_gui(args):
         bar.set_auto_thread(False)
         from PyQt6.QtTest import QTest
         def checks():
-            bar.update_data({"id": selected[0], "label": "🧪 查找 Codex 的 Mods 功能", "model": "gpt-6.1-sol",
+            bar.update_data({"id": selected[0], "label": "🧪 Demo workspace", "model": "gpt-6.1-sol",
                              "turn": {"status": "inProgress", "started_at": time.time() - 1738},
                              "usage": {"total_token_usage": {"total_tokens": 24840000,
                                        "input_tokens": 24000000, "output_tokens": 840000, "cached_input_tokens": 21000000},
@@ -1886,6 +1941,10 @@ def run_gui(args):
             assert bar.popup.isVisible()
             assert len(bar.popup.findChildren(QPushButton)) == 91
             bar.popup.grab().save(str(RUNTIME / "icon-picker-verification.png"))
+            icon_popup = bar.popup
+            bar.popup.close()
+            bar.show_icons()
+            assert bar.popup is icon_popup and bar.popup.isVisible()
             bar.popup.close()
             before = bar.pos()
             QTest.mousePress(bar.grip, Qt.MouseButton.LeftButton, pos=QPoint(6, 8))
@@ -1910,14 +1969,14 @@ def run_gui(args):
             QTest.mouseClick(bar.title, Qt.MouseButton.LeftButton)
             assert bar.popup_kind == 'recent' and bar.popup.isVisible()
             assert bar.host_offset == offset_before
-            fake = {'threads': [{'id': f'recent-{i}', 'title': f'{"🧪" if i%2 else "💬"} Session {i} 会话',
+            fake = {'threads': [{'id': f'recent-{i}', 'title': f'{"🧪" if i%2 else "💬"} Session {i}',
                                 'kind': 'codex', 'status': 'active' if i in (2, 7) else 'idle',
                                 'updatedAt': 100-i} for i in range(10)]}
             rows = recent_threads(fake, {f'recent-{i}': 'completed' for i in range(10)})
             for row in rows:
                 if row['state'] == 'Busy':
                     row.update({'tokens': 27190000, 'tps': 42.3, 'rate_at': time.time(), 'started_at': time.time()-754})
-            rows[0]['label'] = '🧪 A long session name 会话 with detailed project context'
+            rows[0]['label'] = '🧪 API integration and performance checks'
             busy_metrics = [r for r in rows if r['state'] == 'Busy'] + [
                 {'id': f'hidden-{i}', 'tokens': 1000000, 'tps': 10, 'rate_at': time.time()} for i in range(3)]
             def recent_fixture():
@@ -1943,6 +2002,22 @@ def run_gui(args):
             bar.update_recent(recent_fixture())
             assert bar.recent_buttons[0] is first_button
             assert '48.1 t/s' in bar.recent_widgets[0][3].text()
+            # Refresh may reorder or evict a top-ten row while a pointer is
+            # over it. Keep the exact button target and update its live data.
+            reordered = [dict(r) for r in reversed(rows)]
+            reordered = [r for r in reordered if r['id'] != rows[1]['id']]
+            reordered[0]['label'] = 'Updated title'
+            bar.update_recent({**recent_fixture(), 'rows': reordered})
+            assert bar.recent_buttons[0] is first_button
+            assert bar.recent_buttons[0].property('threadId') == rows[0]['id']
+            assert bar.recent_buttons[1].property('threadId') == rows[1]['id']
+            bar.popup.close()
+            bar.show_recent()
+            assert bar.recent_buttons[0].property('threadId') == reordered[0]['id']
+            bar.popup.close()
+            bar.update_recent(recent_fixture())
+            bar.show_recent()
+            first_button = bar.recent_buttons[0]
             # A cached list older than the former 3s cutoff opens immediately;
             # refresh failure also preserves the same clickable rows.
             bar.update_recent(retain_recent({**bar.recent_result, 'loaded_at': time.time()-90}, 'temporary offline'))
@@ -1984,6 +2059,7 @@ def run_gui(args):
                               "recent_click_drag": True, "recent_rows": 10, "navigation_queued": True,
                               "cached_reopen_ms": preloaded_open_ms, "metrics_update_reuses_rows": True,
                               "inline_recent_metrics": True, "all_busy_summary": True,
+                              "open_list_order_fixed": True, "icon_picker_reused": True,
                               "screenshot": str(RUNTIME / "ui-verification.png")}))
             bar.close()
         def report_checks():

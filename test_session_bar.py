@@ -9,6 +9,58 @@ import session_bar as sb
 
 
 class DataTests(unittest.TestCase):
+    def test_open_list_keeps_targets_while_refreshing_values(self):
+        previous = [{'id': 'one', 'state': 'Busy'}, {'id': 'two', 'state': 'Done'}]
+        incoming = [{'id': 'new', 'state': 'Busy'}, {'id': 'one', 'state': 'Done', 'tokens': 12}]
+        fixed = sb.stable_recent_rows(previous, incoming)
+        self.assertEqual([r['id'] for r in fixed], ['one', 'two'])
+        self.assertEqual(fixed[0]['tokens'], 12)
+        self.assertEqual(fixed[0]['state'], 'Done')
+        self.assertEqual(previous[0]['state'], 'Busy')
+        self.assertEqual(sb.stable_recent_rows(None, incoming), incoming)
+        self.assertEqual(sb.stable_recent_rows([], incoming), incoming)
+
+    def test_pending_navigation_coalesces_without_dropping_icon_target(self):
+        commands = sb.ControlQueue()
+        for item in [('navigate', 'old'), ('icon', 'original', '🧪'), ('navigate', 'new'), ('refresh',), ('navigate', 'last')]:
+            commands.put(item)
+        self.assertEqual([commands.get_nowait() for _ in range(commands.qsize())],
+                         [('icon', 'original', '🧪'), ('refresh',), ('navigate', 'last')])
+        self.assertEqual(commands.unfinished_tasks, 3)
+
+    def test_control_connection_reused_and_transport_retried_once(self):
+        desktop = sb.DesktopTools()
+        with patch.object(desktop, 'call', return_value={}) as call, patch.object(desktop, 'close') as close:
+            desktop.control_call({'name': 'first'})
+            desktop.control_call({'name': 'second'})
+            self.assertEqual(call.call_count, 2)
+            close.assert_not_called()
+        with patch.object(desktop, 'call', side_effect=[ConnectionError('closed'), {'ok': True}]) as call, patch.object(desktop, 'close') as close:
+            self.assertEqual(desktop.control_call({}), {'ok': True})
+            self.assertEqual(call.call_count, 2)
+            close.assert_called_once()
+        for error in [RuntimeError('permission denied'), ConnectionError('offline')]:
+            with patch.object(desktop, 'call', side_effect=error) as call, patch.object(desktop, 'close'):
+                with self.assertRaises(type(error)):
+                    desktop.control_call({})
+                self.assertEqual(call.call_count, 1 if isinstance(error, RuntimeError) else 2)
+
+    def test_dead_desktop_pipe_reconnects(self):
+        desktop = sb.DesktopTools()
+        desktop.desktop_pipe = 'old-pipe'
+        with patch.object(sb.os.path, 'exists', return_value=False), patch.object(desktop, 'close') as close, patch.object(desktop, 'call', return_value={}):
+            desktop.control_call({})
+            close.assert_called_once()
+
+    def test_icon_title_lookup_does_not_read_usage_history(self):
+        store = sb.SessionStore()
+        database = MagicMock()
+        database.__enter__.return_value.execute.return_value.fetchone.return_value = {'label': 'Current title'}
+        with patch.object(sb, 'readonly_db', return_value=database) as db, patch.object(store, 'read_tokens') as tokens:
+            self.assertEqual(store.read_label('original'), 'Current title')
+            db.assert_called_once_with('state_5.sqlite')
+            tokens.assert_not_called()
+
     def test_recent_cache_load_is_bounded_and_marks_stale(self):
         runtime = (sb.RUNTIME / 'cache-fixture').resolve()
         self.assertTrue(runtime.is_relative_to(sb.TMP_ROOT))
