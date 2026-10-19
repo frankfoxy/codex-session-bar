@@ -56,6 +56,66 @@ fn color(rgb: u32) -> D2D1_COLOR_F {
         a: 1.,
     }
 }
+// The original tray pictogram: a rounded session bar with two short text strokes.
+// Rasterize at the tray's native size with supersampling, retaining transparent edges.
+fn tray_pixels(size: usize) -> Vec<u32> {
+    let mut pixels = vec![0; size * size];
+    for y in 0..size {
+        for x in 0..size {
+            let mut coverage = 0u32;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let px = (x as f32 + (sx as f32 + 0.5) / 4.) * 24. / size as f32;
+                    let py = (y as f32 + (sy as f32 + 0.5) / 4.) * 24. / size as f32;
+                    let qx = (px - 12.).abs() - 7.;
+                    let qy = (py - 12.).abs() - 3.;
+                    let outline =
+                        (qx.max(0.).hypot(qy.max(0.)) + qx.max(qy).min(0.) - 3.).abs() <= 0.85;
+                    let text = (px - px.clamp(6., 9.)).hypot(py - 12.) <= 0.85
+                        || (px - px.clamp(12., 18.)).hypot(py - 12.) <= 0.85;
+                    coverage += u32::from(outline || text);
+                }
+            }
+            let a = coverage * 255 / 16;
+            pixels[y * size + x] =
+                (a << 24) | ((0xb7 * a / 255) << 16) | ((0xc2 * a / 255) << 8) | (0xcf * a / 255);
+        }
+    }
+    pixels
+}
+unsafe fn create_tray_icon() -> Result<HICON> {
+    let size = GetSystemMetrics(SM_CXSMICON).max(16) as usize;
+    let pixels = tray_pixels(size);
+    let bitmap = CreateBitmap(
+        size as i32,
+        size as i32,
+        1,
+        32,
+        Some(pixels.as_ptr().cast()),
+    );
+    let mask_bytes = vec![0u8; size * size.div_ceil(16) * 2];
+    let mask = CreateBitmap(
+        size as i32,
+        size as i32,
+        1,
+        1,
+        Some(mask_bytes.as_ptr().cast()),
+    );
+    if bitmap.is_invalid() || mask.is_invalid() {
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteObject(mask);
+        anyhow::bail!("Cannot create Session Bar tray bitmap");
+    }
+    let icon = CreateIconIndirect(&ICONINFO {
+        fIcon: BOOL(1),
+        hbmMask: mask,
+        hbmColor: bitmap,
+        ..Default::default()
+    });
+    let _ = DeleteObject(bitmap);
+    let _ = DeleteObject(mask);
+    Ok(icon?)
+}
 #[derive(Clone, Debug, PartialEq)]
 enum Hit {
     Icon,
@@ -266,6 +326,7 @@ struct App {
     combo: HWND,
     edit_font: HFONT,
     child_brush: HBRUSH,
+    tray_icon: HICON,
     popup_kind: Option<Popup>,
     rows: Vec<Row>,
     hits: Vec<Area>,
@@ -363,6 +424,7 @@ impl App {
             combo: HWND::default(),
             edit_font: HFONT::default(),
             child_brush: CreateSolidBrush(COLORREF(0x25211c)),
+            tray_icon: create_tray_icon()?,
             popup_kind: None,
             popup_layout: None,
             rows: Vec::new(),
@@ -1251,7 +1313,7 @@ impl App {
             uID: 1,
             uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
             uCallbackMessage: TRAY_MESSAGE,
-            hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+            hIcon: self.tray_icon,
             ..Default::default()
         };
         let tip = wide("Codex Session Bar · Rust");
@@ -2026,6 +2088,8 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
                 let _ = DestroyWindow(app.popup);
                 let _ = DestroyWindow(app.bar);
                 let _ = DeleteObject(app.edit_font);
+                let _ = DeleteObject(app.child_brush);
+                let _ = DestroyIcon(app.tray_icon);
                 let _ = CloseHandle(app.event);
             }
         });
@@ -2098,6 +2162,23 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             stop,
             true,
         )?;
+        let mut icon_info = ICONINFO::default();
+        GetIconInfo(app.tray_icon, &mut icon_info)?;
+        assert!(!icon_info.hbmColor.is_invalid());
+        let _ = DeleteObject(icon_info.hbmColor);
+        let _ = DeleteObject(icon_info.hbmMask);
+        let pixels = tray_pixels(48);
+        let preview = image::RgbaImage::from_fn(48, 48, |x, y| {
+            let pixel = pixels[(y * 48 + x) as usize];
+            let a = pixel >> 24;
+            image::Rgba([
+                (((pixel >> 16) & 255) + 35 * (255 - a) / 255) as u8,
+                (((pixel >> 8) & 255) + 39 * (255 - a) / 255) as u8,
+                ((pixel & 255) + 43 * (255 - a) / 255) as u8,
+                255,
+            ])
+        });
+        preview.save(paths.runtime.join("rust-tray-icon.png"))?;
         let quota = data::Quota {
             bucket: "codex".into(),
             label: "7d".into(),
@@ -2297,6 +2378,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         let _ = DestroyWindow(app.bar);
         let _ = DeleteObject(app.edit_font);
         let _ = DeleteObject(app.child_brush);
+        let _ = DestroyIcon(app.tray_icon);
         Ok(())
     }
 }
