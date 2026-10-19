@@ -41,6 +41,30 @@ class DataTests(unittest.TestCase):
         self.assertTrue(stale['stale'])
         self.assertNotIn('error', old)
 
+    def test_recent_totals_include_hidden_busy_and_expire_each_rate(self):
+        result = {'busy_count': 3, 'rows': [{'id': 'one', 'state': 'Busy', 'tokens': 10}],
+                  'busy_metrics': [
+                      {'id': 'one', 'tokens': 100, 'tps': 42.3, 'rate_at': 120},
+                      {'id': 'hidden', 'tokens': 200, 'tps': 10.5, 'rate_at': 119},
+                      {'id': 'waiting', 'tokens': 300, 'tps': 99, 'rate_at': 80}]}
+        totals = sb.recent_totals(result, now=125)
+        self.assertEqual(totals['tokens'], 600)
+        self.assertAlmostEqual(totals['tps'], 52.8)
+        self.assertEqual(totals['token_sources'], 3)
+        self.assertEqual(totals['rate_sources'], 2)
+        self.assertIsNone(sb.recent_totals(result, now=151)['tps'])
+
+    def test_recent_totals_preserve_unknowns_and_support_old_cache(self):
+        self.assertIsNone(sb.recent_totals({})['tokens'])
+        self.assertIsNone(sb.recent_totals({'busy_count': 1, 'busy_metrics': [{'id': 'missing'}]})['tps'])
+        empty = sb.recent_totals({'busy_count': 0})
+        self.assertEqual((empty['tokens'], empty['tps']), (0, 0))
+        old = {'busy_count': 2, 'rows': [{'id': 'busy', 'state': 'Busy', 'tokens': 100},
+                                       {'id': 'done', 'state': 'Done', 'tokens': 500}]}
+        totals = sb.recent_totals(old)
+        self.assertEqual(totals['tokens'], 100)
+        self.assertEqual(totals['token_sources'], 1)
+
     def test_busy_count_includes_chats_outside_the_ten_rows(self):
         rows = [{'id': str(i), 'kind': 'codex', 'status': 'active', 'updatedAt': 100-i, 'title': str(i)} for i in range(12)]
         store = MagicMock()
@@ -51,6 +75,8 @@ class DataTests(unittest.TestCase):
             result = sb.DesktopTools().recent(store)
         self.assertEqual(len(result['rows']), 10)
         self.assertEqual(result['busy_count'], 12)
+        self.assertEqual(len(result['busy_metrics']), 12)
+        self.assertEqual({r['id'] for r in result['busy_metrics']}, {str(i) for i in range(12)})
 
     def test_one_missing_busy_rollout_does_not_hide_others(self):
         store = sb.SessionStore()

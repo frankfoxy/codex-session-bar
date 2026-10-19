@@ -125,11 +125,38 @@ def session_metrics(snapshot):
             'rate_at': rate.get('end') if valid_rate else None}
 
 
+def current_tps(row, now):
+    rate, at = row.get('tps'), row.get('rate_at')
+    if type(rate) not in (int, float) or type(at) not in (int, float):
+        return None
+    return rate if 0 <= rate < float('inf') and 0 <= now-at <= 30 else None
+
+
+def recent_totals(result, now=None):
+    """Sum all scanned Busy roots, including ones outside the ten visible rows."""
+    now = time.time() if now is None else now
+    rows = result.get('busy_metrics')
+    if rows is None:
+        rows = [r for r in result.get('rows', []) if r.get('state') == 'Busy']
+    rows = {r['id']: r for r in rows if isinstance(r, dict) and r.get('id')}.values()
+    tokens, rates = [], []
+    for row in rows:
+        value = row.get('tokens')
+        if type(value) in (int, float) and 0 <= value < float('inf'):
+            tokens.append(value)
+        rate = current_tps(row, now)
+        if rate is not None:
+            rates.append(rate)
+    count = result.get('busy_count')
+    empty = count == 0
+    return {'tokens': sum(tokens) if tokens or empty else None,
+            'tps': sum(rates) if rates or empty else None,
+            'token_sources': len(tokens), 'rate_sources': len(rates), 'busy_count': count}
+
+
 def metrics_text(row, now=None):
     now = time.time() if now is None else now
-    rate = row.get('tps')
-    if row.get('rate_at') is None or not 0 <= now-row['rate_at'] <= 30:
-        rate = None
+    rate = current_tps(row, now)
     speed = f'{rate:.1f}' if rate is not None else '—'
     elapsed = duration(now-row['started_at']) if row.get('started_at') else '—'
     return f"{speed} t/s   ·   {compact(row.get('tokens'))} TOK   ·   {elapsed}"
@@ -435,7 +462,10 @@ class DesktopTools(Rpc):
         turns = store.recent_turns(ids)
         all_rows = recent_threads(payload, turns, limit=len(turns))
         rows = recent_threads(payload, turns)
-        return {'rows': store.enrich_recent(rows), 'busy_count': sum(r['state'] == 'Busy' for r in all_rows),
+        busy = store.enrich_recent([r for r in all_rows if r['state'] == 'Busy'])
+        by_id = {r['id']: r for r in busy}
+        metrics = [{key: r.get(key) for key in ('id', 'tokens', 'tps', 'rate_at')} for r in busy]
+        return {'rows': [by_id.get(r['id'], r) for r in rows], 'busy_count': len(busy), 'busy_metrics': metrics,
                 'loaded_at': time.time(), 'stale': False}
 
     def navigate(self, tid):
@@ -768,7 +798,7 @@ def run_gui(args):
     from PyQt6.QtSvgWidgets import QSvgWidget
     from PyQt6.QtNetwork import QLocalServer, QLocalSocket
     from PyQt6.QtWidgets import (QApplication, QWidget, QFrame, QLabel, QPushButton,
-                                QVBoxLayout, QHBoxLayout, QGridLayout, QComboBox, QCheckBox)
+                                QVBoxLayout, QHBoxLayout, QGridLayout, QComboBox, QCheckBox, QSizePolicy)
 
     app = QApplication(sys.argv[:1])
     # The offscreen Windows Qt plugin needs explicit fonts; native Windows also
@@ -1466,6 +1496,10 @@ def run_gui(args):
             title.setStyleSheet('font-weight:600;font-size:13px;')
             heading.addWidget(title)
             heading.addStretch()
+            self.recent_summary = QLabel()
+            self.recent_summary.setStyleSheet('color:#c3d5e7;font-size:12px;')
+            heading.addWidget(self.recent_summary)
+            heading.addStretch()
             refresh = QPushButton('Refresh')
             refresh.setFixedSize(66, 26)
             refresh.clicked.connect(lambda: recent_wake.set())
@@ -1513,24 +1547,25 @@ def run_gui(args):
                     button = QPushButton(self.recent_area)
                     button.setProperty('threadId', row['id'])
                     button.setCursor(Qt.CursorShape.PointingHandCursor)
-                    card = QVBoxLayout(button)
+                    card = QHBoxLayout(button)
                     card.setContentsMargins(10, 5, 10, 5)
-                    card.setSpacing(2)
-                    line = QHBoxLayout()
-                    line.setContentsMargins(0, 0, 0, 0)
+                    card.setSpacing(10)
                     label = QLabel()
                     label.setFont(QFont('Segoe UI', 10))
+                    label.setMinimumWidth(0)
+                    label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
                     status = QLabel()
                     status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                    status.setFixedWidth(92)
+                    status.setFixedWidth(68)
                     detail = QLabel()
                     detail.setStyleSheet('color:#a8b8c4;font-size:11px;')
+                    detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    detail.setFixedWidth(228)
                     for widget in (label, status, detail):
                         widget.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-                    line.addWidget(label, 1)
-                    line.addWidget(status)
-                    card.addLayout(line)
+                    card.addWidget(label, 1)
                     card.addWidget(detail)
+                    card.addWidget(status)
                     button.clicked.connect(lambda unused=False, tid=row['id']: self.open_thread(tid))
                     self.recent_layout.addWidget(button)
                     self.recent_buttons.append(button)
@@ -1542,13 +1577,14 @@ def run_gui(args):
                     self.recent_empty = message
             for row, (button, label, status, detail) in zip(rows, self.recent_widgets):
                 busy = row['state'] == 'Busy'
-                button.setFixedHeight(58 if busy else 38)
+                button.setFixedHeight(38)
                 appearance = (row['id'] == selected[0], busy)
                 if button.property('appearance') != appearance:
                     button.setProperty('appearance', appearance)
                     background, border = ('#293d36', '#527b69') if appearance[0] else ('#342c23', 'transparent') if busy else ('transparent', 'transparent')
                     button.setStyleSheet(f'QPushButton{{background:{background};border:1px solid {border};}} QPushButton:hover{{background:#35434a;border-color:#52636e;}} QPushButton:focus{{border-color:#6aa891;}}')
-                label.setText(label.fontMetrics().elidedText(row['label'], Qt.TextElideMode.ElideRight, self.popup.width()-160))
+                title_width = self.popup.width()-24-20-68-10-(detail.width()+10 if busy else 0)
+                label.setText(label.fontMetrics().elidedText(row['label'], Qt.TextElideMode.ElideRight, max(0, title_width)))
                 status.setText(row['state_icon']+' '+row['state'])
                 status.setStyleSheet('color:'+row['color']+';font-weight:600;')
                 detail.setVisible(busy)
@@ -1560,6 +1596,17 @@ def run_gui(args):
                 self.recent_empty.setText('Could not load recent chats' if result.get('error') else
                                           'No recent local chats' if result.get('loaded_at') else 'Loading recent chats…')
             count = result.get('busy_count')
+            totals = recent_totals(result)
+            rate_partial = totals['tps'] is not None and totals['rate_sources'] != count
+            token_partial = totals['tokens'] is not None and totals['token_sources'] != count
+            rate = f"{totals['tps']:.1f}" if totals['tps'] is not None else '—'
+            self.recent_summary.setText(f"Total {rate}{'*' if rate_partial else ''} t/s  ·  "
+                                        f"{compact(totals['tokens'])}{'*' if token_partial else ''} TOK")
+            self.recent_summary.setToolTip(
+                f"All {count if count is not None else 'unconfirmed'} Busy local chats, including those outside this list.\n"
+                f"Output TPS: sum of recent saved samples ({totals['rate_sources']} available).\n"
+                f"Tokens: sum of cumulative session usage ({totals['token_sources']} available).\n"
+                "* = partial data; — = unavailable. Tokens are usage counts, not a currency charge.")
             cached = result.get('stale') or time.time()-result.get('loaded_at', 0) > 10
             self.recent_note.setText('Cached · Refresh pending' if cached else f'Preloaded · {count if count is not None else "—"} busy · Live every 1.5s')
             self.recent_note.setToolTip(result.get('error', '') or 'Latest 10 local chats · Busy first · TPS / session tokens / current turn elapsed')
@@ -1870,7 +1917,12 @@ def run_gui(args):
             for row in rows:
                 if row['state'] == 'Busy':
                     row.update({'tokens': 27190000, 'tps': 42.3, 'rate_at': time.time(), 'started_at': time.time()-754})
-            bar.update_recent({'rows': rows, 'busy_count': 5, 'loaded_at': time.time()})
+            rows[0]['label'] = '🧪 A long session name 会话 with detailed project context'
+            busy_metrics = [r for r in rows if r['state'] == 'Busy'] + [
+                {'id': f'hidden-{i}', 'tokens': 1000000, 'tps': 10, 'rate_at': time.time()} for i in range(3)]
+            def recent_fixture():
+                return {'rows': rows, 'busy_count': 5, 'busy_metrics': busy_metrics, 'loaded_at': time.time()}
+            bar.update_recent(recent_fixture())
             app.processEvents()
             assert len(bar.recent_buttons) == 10
             assert bar.recent_buttons[0].property('threadId') == 'recent-2'
@@ -1880,8 +1932,15 @@ def run_gui(args):
             first_button = bar.recent_buttons[0]
             first_popup = bar.popup
             assert '42.3 t/s' in bar.recent_widgets[0][3].text()
+            assert bar.recent_summary.text() == 'Total 114.6 t/s  ·  57.4M TOK'
+            for button, label, status, detail in bar.recent_widgets[:2]:
+                assert button.height() == 38
+                assert abs(label.geometry().center().y()-detail.geometry().center().y()) <= 1
+                assert detail.geometry().right() < status.geometry().left()
+                assert label.geometry().right() < detail.geometry().left()
+            assert '…' in bar.recent_widgets[0][1].text()
             rows[0]['tps'] = 48.1
-            bar.update_recent({'rows': rows, 'busy_count': 5, 'loaded_at': time.time()})
+            bar.update_recent(recent_fixture())
             assert bar.recent_buttons[0] is first_button
             assert '48.1 t/s' in bar.recent_widgets[0][3].text()
             # A cached list older than the former 3s cutoff opens immediately;
@@ -1893,7 +1952,7 @@ def run_gui(args):
             assert bar.last_recent_open_ms < 150
             assert 'Cached' in bar.recent_note.text()
             preloaded_open_ms = bar.last_recent_open_ms
-            bar.update_recent({'rows': rows, 'busy_count': 5, 'loaded_at': time.time()})
+            bar.update_recent(recent_fixture())
             app.processEvents()
             bar.grab().save(str(RUNTIME / 'ui-verification.png'))
             bar.popup.grab().save(str(RUNTIME / 'recent-chats-verification.png'))
@@ -1924,6 +1983,7 @@ def run_gui(args):
                               "session_follow": True, "late_snapshot_rejected": True,
                               "recent_click_drag": True, "recent_rows": 10, "navigation_queued": True,
                               "cached_reopen_ms": preloaded_open_ms, "metrics_update_reuses_rows": True,
+                              "inline_recent_metrics": True, "all_busy_summary": True,
                               "screenshot": str(RUNTIME / "ui-verification.png")}))
             bar.close()
         def report_checks():
