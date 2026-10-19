@@ -9,6 +9,15 @@ import session_bar as sb
 
 
 class DataTests(unittest.TestCase):
+    def test_random_icon_uses_picker_and_excludes_current(self):
+        with patch.object(sb.random, 'choice', side_effect=lambda choices: choices[0]) as choice:
+            result = sb.random_icon('🔴')
+            self.assertIn(result, sb.ICONS)
+            self.assertNotEqual(result, '🔴')
+            self.assertEqual(set(choice.call_args.args[0]), sb.ICONS-{'🔴'})
+            sb.random_icon('◈')
+            self.assertEqual(set(choice.call_args.args[0]), sb.ICONS)
+
     def test_open_list_keeps_targets_while_refreshing_values(self):
         previous = [{'id': 'one', 'state': 'Busy'}, {'id': 'two', 'state': 'Done'}]
         incoming = [{'id': 'new', 'state': 'Busy'}, {'id': 'one', 'state': 'Done', 'tokens': 12}]

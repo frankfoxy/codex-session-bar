@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import random
 import re
 import shutil
 import sqlite3
@@ -42,6 +43,11 @@ ICON_ROWS = [
 ]
 ICONS = {i for row in ICON_ROWS for i in row}
 COM_INIT_LOCK = threading.Lock()
+
+
+def random_icon(current):
+    # An explicit random choice should visibly change an existing picker icon.
+    return random.choice([icon for row in ICON_ROWS for icon in row if icon != current])
 
 
 def strip_icon(title):
@@ -1707,7 +1713,17 @@ def run_gui(args):
             popup.setStyleSheet("QFrame#iconPicker{background:#242a2e;border:1px solid #47535b;border-radius:12px;} QLabel{color:#d9e2e6;} QPushButton{background:transparent;border:0;border-radius:6px;color:#fff;padding:0px;} QPushButton:hover{background:#425149;}")
             layout = QVBoxLayout(popup)
             layout.setContentsMargins(12, 10, 12, 12)
-            layout.addWidget(QLabel("Session icon"))
+            heading = QHBoxLayout()
+            heading.addWidget(QLabel("Session icon"))
+            heading.addStretch()
+            shuffle = QPushButton('🎲')
+            shuffle.setFont(QFont('Segoe UI Emoji', 15))
+            shuffle.setFixedSize(32, 30)
+            shuffle.setToolTip('Random icon')
+            shuffle.setAccessibleName('Random icon')
+            shuffle.clicked.connect(lambda: self.choose_icon(random_icon(leading_icon(self.snapshot.get('label', '')))))
+            heading.addWidget(shuffle)
+            layout.addLayout(heading)
             grid = QGridLayout()
             grid.setSpacing(2)
             for row, icons in enumerate(ICON_ROWS):
@@ -1885,7 +1901,7 @@ def run_gui(args):
         bar.set_auto_thread(False)
         from PyQt6.QtTest import QTest
         def checks():
-            bar.update_data({"id": selected[0], "label": "🧪 Demo workspace", "model": "gpt-6.1-sol",
+            demo_data = {"id": selected[0], "label": "🧪 xxx 会话名称", "model": "gpt-6.1-sol",
                              "turn": {"status": "inProgress", "started_at": time.time() - 1738},
                              "usage": {"total_token_usage": {"total_tokens": 24840000,
                                        "input_tokens": 24000000, "output_tokens": 840000, "cached_input_tokens": 21000000},
@@ -1894,7 +1910,8 @@ def run_gui(args):
                                         "windowDurationMins": 10080, "resetsAt": time.time() + 350000}}},
                              "limits_at": time.time(), "sessions": [],
                              "output_rate": {"value": 42.3, "start": time.time()-20, "end": time.time()-10,
-                                             "output_tokens": 423}})
+                                             "output_tokens": 423}}
+            bar.update_data(dict(demo_data))
             app.processEvents()
             compact_height = bar.height()
             assert compact_height == 40
@@ -1939,10 +1956,21 @@ def run_gui(args):
                 assert not bar.details.isVisible() and bar.height() == compact_height
             bar.show_icons()
             assert bar.popup.isVisible()
-            assert len(bar.popup.findChildren(QPushButton)) == 91
+            assert len(bar.popup.findChildren(QPushButton)) == 92
+            random_button = next(button for button in bar.popup.findChildren(QPushButton)
+                                 if button.accessibleName() == 'Random icon')
+            assert random_button.text() == '🎲'
             bar.popup.grab().save(str(RUNTIME / "icon-picker-verification.png"))
             icon_popup = bar.popup
-            bar.popup.close()
+            random_tid = selected[0]
+            QTest.mouseClick(random_button, Qt.MouseButton.LeftButton)
+            random_command = commands.get_nowait()
+            assert random_command[:2] == ('icon', random_tid)
+            assert random_command[2] in ICONS and random_command[2] != '🧪'
+            assert not bar.popup.isVisible()
+            bar.rename_done(random_tid, with_icon(demo_data['label'], random_command[2]))
+            assert bar.icon.text() == random_command[2]
+            bar.update_data(dict(demo_data))
             bar.show_icons()
             assert bar.popup is icon_popup and bar.popup.isVisible()
             bar.popup.close()
@@ -2052,6 +2080,43 @@ def run_gui(args):
                              "turn": {"status": "completed"}, "sessions": []})
             assert bar.snapshot["id"] == other_id and bar.icon.isEnabled()
             assert bar.icon.text() == "🔬"
+            # Render a sanitized titlebar context with the actual bar/picker
+            # widgets. This never captures or renames a user's desktop chat.
+            binding['auto'] = False
+            bar.set_auto_thread(False)
+            bar.update_data({**demo_data, 'id': selected[0]})
+            bar.details.hide()
+            if bar.popup:
+                bar.popup.close()
+            bar.show_icons()
+            preview = QWidget()
+            preview.setObjectName('previewHost')
+            preview.setStyleSheet('QWidget#previewHost{background:#1e2023;}')
+            preview.setFixedSize(1280, 360)
+            menus = QLabel('‹    ›    ◫      File    Edit    View    Help', preview)
+            menus.setFont(QFont('Segoe UI', 10))
+            menus.setStyleSheet('color:#a9acb0;background:transparent;')
+            menus.setGeometry(16, 0, 360, 44)
+            controls = QLabel('−      □      ×', preview)
+            controls.setStyleSheet('color:#a9acb0;background:transparent;')
+            controls.setGeometry(1170, 0, 106, 44)
+            bar.setParent(preview)
+            bar.setWindowFlags(Qt.WindowType.Widget)
+            bar.move(1160-bar.width(), 2)
+            bar.show()
+            assert bar.x() > menus.geometry().right()
+            picker = bar.popup
+            picker.setParent(preview)
+            picker.setWindowFlags(Qt.WindowType.Widget)
+            picker.move(1160-picker.width(), 52)
+            picker.hide()
+            preview.show()
+            app.processEvents()
+            preview.grab(preview.rect().adjusted(0, 0, 0, -316)).save(str(RUNTIME / 'titlebar-verification.png'))
+            picker.show()
+            app.processEvents()
+            assert picker.geometry().bottom() < preview.height()
+            preview.grab().save(str(RUNTIME / 'titlebar-icons-verification.png'))
             print(json.dumps({"ui": "pass", "drag": True, "pin": True, "icons": 90, "compact_height": compact_height,
                               "details_preserve_height": True,
                               "host_move_hide_restore": True, "drag_offset_preserved": True, "tps": True,
@@ -2060,8 +2125,10 @@ def run_gui(args):
                               "cached_reopen_ms": preloaded_open_ms, "metrics_update_reuses_rows": True,
                               "inline_recent_metrics": True, "all_busy_summary": True,
                               "open_list_order_fixed": True, "icon_picker_reused": True,
+                              "random_icon_queued": True, "titlebar_demo_sanitized": True,
                               "screenshot": str(RUNTIME / "ui-verification.png")}))
             bar.close()
+            preview.close()
         def report_checks():
             try:
                 checks()
