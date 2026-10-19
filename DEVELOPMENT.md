@@ -32,6 +32,12 @@ The bar watches the host window every 80 ms. A separate read-only titlebar obser
 
 No credentials or personal session IDs belong in the repository. Do not submit prompts, resume tasks, interrupt work or write Codex databases for verification.
 
+## Visibility and emoji
+
+The bar always uses `WindowStaysOnTopHint`. Closing hides it with an explicit `user_hidden` flag, which host-follow updates must respect. Tray Open, the existing single-instance local socket, and the named auto-reset Windows show event clear that flag; Quit stops the process. The event name is `Local\\codex-session-bar-<home-hash>-show`, matching the first 12 SHA-256 hex characters of the case-folded Codex home path. The installed opening skill starts the existing scheduled task if needed, signals the event, then verifies fresh diagnostics. It does not restart Codex or write runtime files.
+
+`emoji_catalog.json` contains Unicode Emoji 18.0 fully-qualified sequences plus components, generated from the official `emoji-test.txt`; preserve `UNICODE-LICENSE.txt`. The picker uses a batched, uniform-size Qt list model instead of thousands of buttons. Search covers names, group, subgroup and literal emoji. Longest-first prefix buckets preserve full flag, skin-tone, keycap and ZWJ sequences during title changes without scanning the entire catalog for each title.
+
 ## Verification
 
 ```powershell

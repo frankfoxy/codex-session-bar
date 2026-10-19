@@ -34,26 +34,53 @@ sys.dont_write_bytecode = True
 HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).resolve()
 INSTANCE_NAME = 'codex-session-bar-' + hashlib.sha256(str(HOME).casefold().encode()).hexdigest()[:12]
 SETTINGS = APP_DIR / "settings.json"
-ICON_ROWS = [
-    ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "🟤", "⚫", "⚪", "🟥", "🟧", "🟨", "🟩", "🟦", "🟪", "🟫", "⬛", "⬜"],
-    ["🚧", "✅", "⏸️", "⏳", "❗", "📌", "⭐", "🔥", "🆕", "👀", "🔁", "🧊", "🔒", "❌", "🎯", "🏁", "💯", "⚠️"],
-    ["🐛", "🔍", "🩺", "🚨", "💥", "🛠️", "🩹", "🧹", "🔬", "⏱️", "🔌", "📦", "🧩", "⚡", "📡", "🎛️", "🧮", "🔋"],
-    ["💻", "🧪", "📝", "🚀", "♻️", "🔀", "🌿", "⚙️", "🐍", "🌐", "🤖", "🔐", "💡", "📚", "📊", "📈", "🧠", "❓"],
-    ["💬", "📧", "📅", "👥", "📋", "💰", "🧾", "📞", "🌟", "🎉", "❤️", "🍀", "☕", "🌙", "🏠", "✈️", "🎮", "🐱"],
-]
-ICONS = {i for row in ICON_ROWS for i in row}
+EMOJI_CATALOG = json.loads((APP_DIR / 'emoji_catalog.json').read_text(encoding='utf-8'))
+EMOJI_ENTRIES = EMOJI_CATALOG['entries']
+ICONS = {entry['emoji'] for entry in EMOJI_ENTRIES}
+ICON_PREFIXES = {}
+for _icon in sorted(ICONS, key=len, reverse=True):
+    ICON_PREFIXES.setdefault(_icon[0], []).append(_icon)
 COM_INIT_LOCK = threading.Lock()
 
 
 def random_icon(current):
     # An explicit random choice should visibly change an existing picker icon.
-    return random.choice([icon for row in ICON_ROWS for icon in row if icon != current])
+    return random.choice([entry['emoji'] for entry in EMOJI_ENTRIES if entry['emoji'] != current])
+
+
+def filter_emojis(query='', group='All emoji'):
+    query = query.strip().casefold()
+    return [entry for entry in EMOJI_ENTRIES
+            if (group == 'All emoji' or entry['group'] == group)
+            and (not query or query in ' '.join(entry.values()).casefold())]
+
+
+class ShowSignal:
+    """A local auto-reset Windows event lets chat commands restore the bar."""
+    def __init__(self, name=None):
+        self.kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        self.kernel.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
+        self.kernel.CreateEventW.restype = wintypes.HANDLE
+        self.kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        self.kernel.WaitForSingleObject.restype = wintypes.DWORD
+        self.kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.handle = self.kernel.CreateEventW(None, False, False, name or 'Local\\'+INSTANCE_NAME+'-show')
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def consume(self):
+        return bool(self.handle) and self.kernel.WaitForSingleObject(self.handle, 0) == 0
+
+    def close(self):
+        if self.handle:
+            self.kernel.CloseHandle(self.handle)
+            self.handle = None
 
 
 def strip_icon(title):
     """Remove one leading emoji/grapheme, retaining ordinary Unicode text."""
     title = title.strip()
-    for icon in sorted(ICONS, key=len, reverse=True):
+    for icon in ICON_PREFIXES.get(title[:1], []):
         if title.startswith(icon):
             return title[len(icon):].lstrip()
     # Also support an existing emoji outside the picker, including ZWJ sequences.
@@ -834,13 +861,14 @@ def load_recent_cache():
 
 
 def run_gui(args):
-    from PyQt6.QtCore import Qt, QTimer, QPoint, QObject, pyqtSignal, QByteArray
+    from PyQt6.QtCore import Qt, QTimer, QPoint, QObject, pyqtSignal, QByteArray, QAbstractListModel, QSize
     from PyQt6.QtGui import QFont, QFontDatabase, QIcon, QPixmap, QPainter
     from PyQt6.QtSvg import QSvgRenderer
     from PyQt6.QtSvgWidgets import QSvgWidget
     from PyQt6.QtNetwork import QLocalServer, QLocalSocket
     from PyQt6.QtWidgets import (QApplication, QWidget, QFrame, QLabel, QPushButton,
-                                QVBoxLayout, QHBoxLayout, QGridLayout, QComboBox, QCheckBox, QSizePolicy)
+                                QVBoxLayout, QHBoxLayout, QComboBox, QCheckBox, QSizePolicy,
+                                QSystemTrayIcon, QMenu, QListView, QLineEdit)
 
     app = QApplication(sys.argv[:1])
     # The offscreen Windows Qt plugin needs explicit fonts; native Windows also
@@ -851,6 +879,29 @@ def run_gui(args):
             QFontDatabase.addApplicationFont(str(font_path))
     app.setApplicationName("Codex Session Bar")
     app.setQuitOnLastWindowClosed(False)
+    class EmojiModel(QAbstractListModel):
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.entries = EMOJI_ENTRIES
+
+        def rowCount(self, parent=None):
+            return len(self.entries)
+
+        def data(self, index, role):
+            if not index.isValid() or index.row() >= len(self.entries):
+                return None
+            entry = self.entries[index.row()]
+            if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.UserRole):
+                return entry['emoji']
+            if role in (Qt.ItemDataRole.ToolTipRole, Qt.ItemDataRole.AccessibleTextRole):
+                return entry['emoji']+' '+entry['name']+'\n'+entry['group']
+            if role == Qt.ItemDataRole.TextAlignmentRole:
+                return Qt.AlignmentFlag.AlignCenter
+
+        def filter(self, query, group):
+            self.beginResetModel()
+            self.entries = filter_emojis(query, group)
+            self.endResetModel()
     server = QLocalServer()
     if not args.test_ui:
         socket = QLocalSocket()
@@ -1119,7 +1170,10 @@ def run_gui(args):
         def __init__(self):
             super().__init__()
             settings = load_settings()
-            self.topmost = settings.get("topmost", True)
+            self.topmost = True
+            self.user_hidden = False
+            self.quit_requested = False
+            self.tray = None
             self.host_hwnd = None
             self.host_rect = None
             # Reset old exterior/bottom-relative docking once on upgrade.
@@ -1208,14 +1262,6 @@ def run_gui(args):
             row.addWidget(self.tps)
             self.quota = QuotaView()
             row.addWidget(self.quota)
-            self.pin = QPushButton()
-            self.pin.setIcon(svg_icon('<path d="m16 3 5 5-4 2-3 5-2-2-7 7 7-7-2-2 5-3z"/>'))
-            self.pin.setToolTip("Always on top")
-            self.pin.setFixedSize(28, 28)
-            self.pin.setCheckable(True)
-            self.pin.setChecked(self.topmost)
-            self.pin.clicked.connect(self.toggle_pin)
-            row.addWidget(self.pin)
             self.expand = QPushButton()
             self.expand.setIcon(svg_icon('<path d="m6 9 6 6 6-6"/>'))
             self.expand.setFixedSize(26, 28)
@@ -1225,8 +1271,9 @@ def run_gui(args):
             close = QPushButton()
             close.setIcon(svg_icon('<path d="m6 6 12 12M18 6 6 18"/>'))
             close.setFixedSize(26, 28)
-            close.setToolTip("Quit session bar")
-            close.clicked.connect(self.close)
+            close.setToolTip('Hide to tray · click tray icon or ask Codex to open the session bar')
+            close.setAccessibleName('Hide session bar')
+            close.clicked.connect(self.hide_to_tray)
             row.addWidget(close)
             self.details = DetailsPopup(self, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
             self.details.setObjectName("details")
@@ -1261,6 +1308,9 @@ def run_gui(args):
             refresh = QPushButton("Refresh limits")
             refresh.clicked.connect(lambda: commands.put(("refresh",)))
             actions.addWidget(refresh)
+            quit_button = QPushButton('Quit session bar')
+            quit_button.clicked.connect(self.quit_bar)
+            actions.addWidget(quit_button)
             actions.addStretch()
             detail.addLayout(actions)
             self.note = QLabel("Chat detection 0.1s · Status 0.5s · Account limits 60s")
@@ -1268,6 +1318,22 @@ def run_gui(args):
             self.note.setWordWrap(True)
             detail.addWidget(self.note)
             self.details.hide()
+            recovery = QLabel('× hides the bar. Click its tray icon, or ask Codex: 打开会话条')
+            recovery.setWordWrap(True)
+            recovery.setObjectName('muted')
+            detail.addWidget(recovery)
+            if not args.test_ui and QSystemTrayIcon.isSystemTrayAvailable():
+                self.tray = QSystemTrayIcon(svg_icon('<rect x="2" y="6" width="20" height="12" rx="3"/><path d="M6 12h3m3 0h6"/>'), self)
+                self.tray.setToolTip('Codex Session Bar · Click to open')
+                self.tray_menu = QMenu()
+                self.tray_menu.addAction('Open session bar', self.show_bar)
+                self.tray_menu.addAction('Hide session bar', self.hide_to_tray)
+                self.tray_menu.addSeparator()
+                self.tray_menu.addAction('Quit session bar', self.quit_bar)
+                self.tray.setContextMenu(self.tray_menu)
+                self.tray.activated.connect(lambda reason: self.show_bar() if reason in
+                    (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick) else None)
+                self.tray.show()
             self.clock = QTimer(self)
             self.clock.timeout.connect(self.tick)
             self.clock.start(1000)
@@ -1299,13 +1365,27 @@ def run_gui(args):
                                + margins.left()+margins.right()+outer_margins.left()+outer_margins.right()+2)
             self.layout().activate()
 
-        def toggle_pin(self):
-            point = self.pos()
-            self.topmost = self.pin.isChecked()
-            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, self.topmost)
-            self.show()
-            self.move(point)
-            self.write_settings()
+        def hide_to_tray(self):
+            self.user_hidden = True
+            if self.popup:
+                self.popup.close()
+            self.details.hide()
+            self.hide()
+            self.write_diagnostic()
+
+        def show_bar(self):
+            self.user_hidden = False
+            if args.test_ui:
+                self.show()
+            else:
+                self.sync_host()
+            if self.isVisible():
+                self.raise_()
+            self.write_diagnostic()
+
+        def quit_bar(self):
+            self.quit_requested = True
+            self.close()
 
         def toggle_details(self):
             if self.details.isVisible():
@@ -1710,12 +1790,10 @@ def run_gui(args):
             self.details.hide()
             popup = QFrame(self, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
             popup.setObjectName("iconPicker")
-            popup.setStyleSheet("QFrame#iconPicker{background:#242a2e;border:1px solid #47535b;border-radius:12px;} QLabel{color:#d9e2e6;} QPushButton{background:transparent;border:0;border-radius:6px;color:#fff;padding:0px;} QPushButton:hover{background:#425149;}")
+            popup.setStyleSheet("QFrame#iconPicker{background:#242a2e;border:1px solid #47535b;border-radius:12px;} QLabel{color:#d9e2e6;} QPushButton{background:transparent;border:0;border-radius:6px;color:#fff;padding:0px;} QPushButton:hover{background:#425149;} QComboBox{background:#30383e;color:#dce5ea;border:1px solid #47535b;border-radius:5px;padding:5px;} QComboBox QAbstractItemView{background:#30383e;color:#dce5ea;selection-background-color:#425149;}")
             layout = QVBoxLayout(popup)
             layout.setContentsMargins(12, 10, 12, 12)
             heading = QHBoxLayout()
-            heading.addWidget(QLabel("Session icon"))
-            heading.addStretch()
             shuffle = QPushButton('🎲')
             shuffle.setFont(QFont('Segoe UI Emoji', 15))
             shuffle.setFixedSize(32, 30)
@@ -1723,22 +1801,44 @@ def run_gui(args):
             shuffle.setAccessibleName('Random icon')
             shuffle.clicked.connect(lambda: self.choose_icon(random_icon(leading_icon(self.snapshot.get('label', '')))))
             heading.addWidget(shuffle)
+            heading.addWidget(QLabel('Session icon'))
+            heading.addStretch()
+            heading.addWidget(QLabel(f"{len(EMOJI_ENTRIES):,} emoji · Unicode {EMOJI_CATALOG['version']}"))
             layout.addLayout(heading)
-            grid = QGridLayout()
-            grid.setSpacing(2)
-            for row, icons in enumerate(ICON_ROWS):
-                for column, icon in enumerate(icons):
-                    button = QPushButton(icon)
-                    button.setFont(QFont("Segoe UI Emoji", 15))
-                    button.setFixedSize(32, 34)
-                    button.setToolTip(icon)
-                    button.clicked.connect(lambda unused=False, value=icon: self.choose_icon(value))
-                    grid.addWidget(button, row, column)
-            layout.addLayout(grid)
+            filters = QHBoxLayout()
+            self.emoji_search = QLineEdit()
+            self.emoji_search.setPlaceholderText('Search emoji or English name…')
+            self.emoji_search.setStyleSheet('background:#1e2327;color:#dce5ea;border:1px solid #47535b;border-radius:5px;padding:5px;')
+            filters.addWidget(self.emoji_search, 1)
+            self.emoji_category = QComboBox()
+            self.emoji_category.addItems(['All emoji']+list(dict.fromkeys(e['group'] for e in EMOJI_ENTRIES)))
+            self.emoji_category.setFixedWidth(190)
+            filters.addWidget(self.emoji_category)
+            layout.addLayout(filters)
+            self.emoji_model = EmojiModel(popup)
+            self.emoji_view = QListView()
+            self.emoji_view.setModel(self.emoji_model)
+            self.emoji_view.setFont(QFont('Segoe UI Emoji', 16))
+            self.emoji_view.setViewMode(QListView.ViewMode.IconMode)
+            self.emoji_view.setResizeMode(QListView.ResizeMode.Adjust)
+            self.emoji_view.setMovement(QListView.Movement.Static)
+            self.emoji_view.setGridSize(QSize(36, 38))
+            self.emoji_view.setWordWrap(False)
+            self.emoji_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.emoji_view.setUniformItemSizes(True)
+            self.emoji_view.setLayoutMode(QListView.LayoutMode.Batched)
+            self.emoji_view.setBatchSize(200)
+            self.emoji_view.setFixedHeight(230)
+            self.emoji_view.setStyleSheet('QListView{background:transparent;border:0;color:#fff;} QListView::item:hover{background:#425149;border-radius:5px;} QListView::item:selected{background:#425149;} QScrollBar:vertical{background:transparent;width:8px;} QScrollBar::handle:vertical{background:#52636e;min-height:24px;border-radius:4px;} QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;} QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}')
+            self.emoji_view.clicked.connect(lambda index: self.choose_icon(index.data(Qt.ItemDataRole.UserRole)))
+            self.emoji_search.textChanged.connect(lambda: self.emoji_model.filter(self.emoji_search.text(), self.emoji_category.currentText()))
+            self.emoji_category.currentTextChanged.connect(lambda: self.emoji_model.filter(self.emoji_search.text(), self.emoji_category.currentText()))
+            layout.addWidget(self.emoji_view)
             clear = QPushButton("Clear icon")
             clear.setMinimumHeight(28)
             clear.clicked.connect(lambda: self.choose_icon(""))
             layout.addWidget(clear)
+            popup.setFixedWidth(636)
             popup.adjustSize()
             anchor = self.mapToGlobal(QPoint(0, 0))
             screen = QApplication.screenAt(anchor) or self.screen()
@@ -1805,6 +1905,9 @@ def run_gui(args):
             self.sync_host_state(state)
 
         def sync_host_state(self, state):
+            if self.user_hidden:
+                self.hide()
+                return
             if not state.get('visible'):
                 self.host_hidden = True
                 if self.popup:
@@ -1854,7 +1957,8 @@ def run_gui(args):
                     "tokens": d.get("usage", {}).get("total_token_usage", {}).get("total_tokens", d.get("tokens_used")),
                     "token_timestamp": d.get("token_at"), "quota": limit_windows(d.get("limits", {})),
                     "quota_error": d.get("limits_error", ""), "updated_at": time.time(),
-                    "topmost": self.topmost, "geometry": self.geometry().getRect(),
+                    "topmost": self.topmost, "user_hidden": self.user_hidden,
+                    "tray_available": bool(self.tray), "geometry": self.geometry().getRect(),
                     "last_rename": self.last_rename, "auto_thread": binding["auto"],
                     "last_icon_action": self.last_icon_action,
                     "last_navigation": self.last_navigation,
@@ -1875,7 +1979,13 @@ def run_gui(args):
             write_json_atomic(RUNTIME / diagnostic_name, safe)
 
         def closeEvent(self, event):
+            if not args.test_ui and not self.quit_requested:
+                self.hide_to_tray()
+                event.ignore()
+                return
             self.write_settings()
+            if self.tray:
+                self.tray.hide()
             stop.set()
             data_wake.set()
             quota_wake.set()
@@ -1887,7 +1997,13 @@ def run_gui(args):
             app.quit()
 
     bar = Bar()
-    server.newConnection.connect(lambda: (server.nextPendingConnection().deleteLater(), bar.show(), bar.raise_()))
+    server.newConnection.connect(lambda: (server.nextPendingConnection().deleteLater(), bar.show_bar()))
+    show_signal = None
+    if not args.test_ui:
+        show_signal = ShowSignal()
+        show_clock = QTimer(bar)
+        show_clock.timeout.connect(lambda: bar.show_bar() if show_signal.consume() else None)
+        show_clock.start(200)
     bar.show()
     saved = load_settings()
     if isinstance(saved.get("x"), int) and isinstance(saved.get("y"), int):
@@ -1954,12 +2070,34 @@ def run_gui(args):
                 bar.details.grab().save(str(RUNTIME / "details-verification.png"))
                 bar.toggle_details()
                 assert not bar.details.isVisible() and bar.height() == compact_height
+            icon_open_started = time.perf_counter()
             bar.show_icons()
+            icon_open_ms = round((time.perf_counter()-icon_open_started)*1000, 1)
             assert bar.popup.isVisible()
-            assert len(bar.popup.findChildren(QPushButton)) == 92
+            assert len(bar.popup.findChildren(QPushButton)) == 2
+            assert bar.emoji_model.rowCount() == len(EMOJI_ENTRIES) > 3900
+            bar.emoji_category.setCurrentText('Flags')
+            assert all(entry['group'] == 'Flags' for entry in bar.emoji_model.entries)
+            bar.emoji_category.setCurrentText('All emoji')
+            bar.emoji_search.setText('rocket')
+            assert any(e['emoji'] == '🚀' for e in bar.emoji_model.entries)
+            bar.emoji_view.doItemsLayout()
+            app.processEvents()
+            rocket_index = bar.emoji_model.index(next(i for i, e in enumerate(bar.emoji_model.entries) if e['emoji'] == '🚀'), 0)
+            QTest.mouseClick(bar.emoji_view.viewport(), Qt.MouseButton.LeftButton,
+                             pos=bar.emoji_view.visualRect(rocket_index).center())
+            assert commands.get_nowait() == ('icon', selected[0], '🚀')
+            bar.rename_done(selected[0], with_icon(demo_data['label'], '🚀'))
+            bar.update_data(dict(demo_data))
+            bar.show_icons()
+            bar.emoji_search.clear()
             random_button = next(button for button in bar.popup.findChildren(QPushButton)
                                  if button.accessibleName() == 'Random icon')
             assert random_button.text() == '🎲'
+            heading_label = next(label for label in bar.popup.findChildren(QLabel) if label.text() == 'Session icon')
+            assert random_button.geometry().right() < heading_label.geometry().left()
+            bar.emoji_view.doItemsLayout()
+            app.processEvents()
             bar.popup.grab().save(str(RUNTIME / "icon-picker-verification.png"))
             icon_popup = bar.popup
             random_tid = selected[0]
@@ -1983,12 +2121,14 @@ def run_gui(args):
             bar.sync_host_state({'visible': True, 'rect': [150, 75, 1350, 1075]})
             assert bar.pos() == dragged + QPoint(50, 25)
             bar.clamp = real_clamp
-            QTest.mouseClick(bar.pin, Qt.MouseButton.LeftButton)
-            assert not bar.topmost
-            assert not bar.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
-            QTest.mouseClick(bar.pin, Qt.MouseButton.LeftButton)
             assert bar.topmost
             assert bar.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+            hide_button = next(button for button in bar.findChildren(QPushButton) if button.accessibleName() == 'Hide session bar')
+            QTest.mouseClick(hide_button, Qt.MouseButton.LeftButton)
+            bar.sync_host_state({'visible': True, 'rect': [150, 75, 1350, 1075]})
+            assert not bar.isVisible() and bar.user_hidden
+            bar.show_bar()
+            assert bar.isVisible() and not bar.user_hidden
             app.processEvents()
             bar.grab().save(str(RUNTIME / "ui-verification.png"))
             # Clicking a title opens ten real-shaped rows, while a drag above
@@ -2092,7 +2232,7 @@ def run_gui(args):
             preview = QWidget()
             preview.setObjectName('previewHost')
             preview.setStyleSheet('QWidget#previewHost{background:#1e2023;}')
-            preview.setFixedSize(1280, 360)
+            preview.setFixedSize(1280, 450)
             menus = QLabel('‹    ›    ◫      File    Edit    View    Help', preview)
             menus.setFont(QFont('Segoe UI', 10))
             menus.setStyleSheet('color:#a9acb0;background:transparent;')
@@ -2112,12 +2252,12 @@ def run_gui(args):
             picker.hide()
             preview.show()
             app.processEvents()
-            preview.grab(preview.rect().adjusted(0, 0, 0, -316)).save(str(RUNTIME / 'titlebar-verification.png'))
+            preview.grab(preview.rect().adjusted(0, 0, 0, -(preview.height()-44))).save(str(RUNTIME / 'titlebar-verification.png'))
             picker.show()
             app.processEvents()
             assert picker.geometry().bottom() < preview.height()
             preview.grab().save(str(RUNTIME / 'titlebar-icons-verification.png'))
-            print(json.dumps({"ui": "pass", "drag": True, "pin": True, "icons": 90, "compact_height": compact_height,
+            print(json.dumps({"ui": "pass", "drag": True, "always_topmost": True, "icons": len(EMOJI_ENTRIES), "compact_height": compact_height,
                               "details_preserve_height": True,
                               "host_move_hide_restore": True, "drag_offset_preserved": True, "tps": True,
                               "session_follow": True, "late_snapshot_rejected": True,
@@ -2126,8 +2266,10 @@ def run_gui(args):
                               "inline_recent_metrics": True, "all_busy_summary": True,
                               "open_list_order_fixed": True, "icon_picker_reused": True,
                               "random_icon_queued": True, "titlebar_demo_sanitized": True,
+                              "hide_restore": True, "emoji_search": True,
+                              "icon_open_ms": icon_open_ms,
                               "screenshot": str(RUNTIME / "ui-verification.png")}))
-            bar.close()
+            bar.quit_bar()
             preview.close()
         def report_checks():
             try:
@@ -2152,10 +2294,8 @@ def run_gui(args):
                 from PyQt6.QtTest import QTest
                 current = leading_icon(bar.snapshot.get("label", ""))
                 QTest.mouseClick(bar.icon, Qt.MouseButton.LeftButton)
-                for button in bar.popup.findChildren(QPushButton):
-                    if button.text() == current or (current == "◈" and button.text() == "Clear icon"):
-                        QTest.mouseClick(button, Qt.MouseButton.LeftButton)
-                        break
+                if current == '◈' or current in ICONS:
+                    bar.choose_icon('' if current == '◈' else current)
                 else:
                     bar.popup.close()
             QTimer.singleShot(3000, verify_current_icon)
@@ -2163,6 +2303,8 @@ def run_gui(args):
             QTimer.singleShot(args.capture_after * 1000,
                               lambda: bar.grab().save(str(RUNTIME / "live-bar.png")))
     result = app.exec()
+    if show_signal:
+        show_signal.close()
     stop.set()
     recent_wake.set()
     recent_client.close()

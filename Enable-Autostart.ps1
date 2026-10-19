@@ -33,5 +33,12 @@ $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
 $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 Register-ScheduledTask -TaskName 'Codex Session Bar' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Compact Codex session bar. Waits while Codex is closed and follows its window when reopened.' -Force | Out-Null
+$skillSource = Join-Path $PSScriptRoot 'SKILL.md'
+if (Test-Path -LiteralPath $skillSource) {
+    $skillHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+    $skillDirectory = Join-Path $skillHome 'skills/codex-session-bar'
+    [IO.Directory]::CreateDirectory($skillDirectory) | Out-Null
+    Copy-Item -LiteralPath $skillSource -Destination (Join-Path $skillDirectory 'SKILL.md') -Force
+}
 Start-ScheduledTask -TaskName 'Codex Session Bar'
 Get-ScheduledTask -TaskName 'Codex Session Bar' | Select-Object TaskName, State

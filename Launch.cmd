@@ -1,5 +1,5 @@
 @echo off
-powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command "try { $ErrorActionPreference='Stop'; Start-ScheduledTask -TaskName 'Codex Session Bar'; exit 0 } catch { exit 1 }"
+powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command "try { $ErrorActionPreference='Stop'; $barTask=Get-ScheduledTask -TaskName 'Codex Session Bar'; if ($barTask.State -eq 'Running') { $barAction=$barTask.Actions[0]; Start-Process -FilePath $barAction.Execute -ArgumentList $barAction.Arguments -WorkingDirectory $barAction.WorkingDirectory -WindowStyle Hidden } else { Start-ScheduledTask -TaskName 'Codex Session Bar' }; exit 0 } catch { exit 1 }"
 if not errorlevel 1 exit /b
 if defined CODEX_SESSION_BAR_PYTHON (
   start "" "%CODEX_SESSION_BAR_PYTHON%" -B "%~dp0session_bar.py"

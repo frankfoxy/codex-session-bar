@@ -9,6 +9,28 @@ import session_bar as sb
 
 
 class DataTests(unittest.TestCase):
+    def test_complete_emoji_catalog_search_and_sequences(self):
+        self.assertGreater(len(sb.EMOJI_ENTRIES), 3900)
+        for emoji in ('🚀', '🇨🇳', '👩🏽\u200d💻', '1️⃣', '🏳️\u200d🌈'):
+            self.assertIn(emoji, sb.ICONS)
+            self.assertEqual(sb.with_icon(emoji+' Session', '🌟'), '🌟 Session')
+        self.assertIn('🚀', [entry['emoji'] for entry in sb.filter_emojis('rocket')])
+        self.assertTrue(all(entry['group'] == 'Flags' for entry in sb.filter_emojis(group='Flags')))
+        self.assertEqual(sb.filter_emojis('no-such-emoji-name-xyz'), [])
+
+    @unittest.skipUnless(sb.sys.platform == 'win32', 'Windows named events')
+    def test_show_signal_is_one_shot_and_closes(self):
+        signal = sb.ShowSignal('Local\\codex-session-bar-test-'+str(sb.os.getpid()))
+        try:
+            self.assertFalse(signal.consume())
+            signal.kernel.SetEvent.argtypes = [sb.wintypes.HANDLE]
+            self.assertTrue(signal.kernel.SetEvent(signal.handle))
+            self.assertTrue(signal.consume())
+            self.assertFalse(signal.consume())
+        finally:
+            signal.close()
+        self.assertFalse(signal.consume())
+
     def test_random_icon_uses_picker_and_excludes_current(self):
         with patch.object(sb.random, 'choice', side_effect=lambda choices: choices[0]) as choice:
             result = sb.random_icon('🔴')
