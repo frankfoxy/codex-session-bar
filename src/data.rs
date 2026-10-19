@@ -98,6 +98,8 @@ impl Row {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Recent {
     #[serde(default)]
+    pub all_rows: Vec<Row>,
+    #[serde(default)]
     pub rows: Vec<Row>,
     #[serde(default)]
     pub busy_metrics: Vec<Row>,
@@ -502,9 +504,12 @@ impl Store {
         }
         let busy_metrics: Vec<Row> = rows.iter().filter(|r| r.state == "Busy").cloned().collect();
         rows.sort_by(|a, b| b.updated_at.total_cmp(&a.updated_at).then(a.id.cmp(&b.id)));
+        let mut all_rows = rows.clone();
+        all_rows.sort_by_key(|r| r.state != "Busy");
         rows.truncate(10);
         rows.sort_by_key(|r| r.state != "Busy");
         Ok(Recent {
+            all_rows,
             rows,
             busy_count: Some(busy_metrics.len()),
             busy_metrics,

@@ -64,6 +64,9 @@ enum Hit {
     Hide,
     Details,
     Recent(String),
+    ChooseFixed,
+    Fixed(String),
+    Back,
     Random,
     Clear,
     Emoji(usize),
@@ -87,6 +90,7 @@ enum Popup {
     Recent,
     Icons,
     Details,
+    Fixed,
 }
 
 struct Painter {
@@ -260,7 +264,6 @@ struct App {
     popup: HWND,
     edit: HWND,
     combo: HWND,
-    selector: HWND,
     edit_font: HFONT,
     child_brush: HBRUSH,
     popup_kind: Option<Popup>,
@@ -268,6 +271,8 @@ struct App {
     hits: Vec<Area>,
     popup_hits: Vec<Area>,
     filters: Vec<usize>,
+    chat_filters: Vec<usize>,
+    chat_cursor: usize,
     groups: Vec<String>,
     category: String,
     search: String,
@@ -356,7 +361,6 @@ impl App {
             popup,
             edit: HWND::default(),
             combo: HWND::default(),
-            selector: HWND::default(),
             edit_font: HFONT::default(),
             child_brush: CreateSolidBrush(COLORREF(0x25211c)),
             popup_kind: None,
@@ -365,6 +369,8 @@ impl App {
             hits: Vec::new(),
             popup_hits: Vec::new(),
             filters,
+            chat_filters: Vec::new(),
+            chat_cursor: 0,
             groups,
             category: "默认集合".into(),
             search: String::new(),
@@ -755,16 +761,186 @@ impl App {
                     false,
                 );
             }
-            Some(Popup::Details) => {
-                p.fill(rect(16., 77., 528., 28.), 0x1c2125, 3.);
-                p.border(rect(16., 77., 528., 28.), 0x47535b, 3.);
+            Some(Popup::Fixed) => {
                 p.label(
-                    "Choose a fixed chat…",
-                    rect(23., 77., 500., 28.),
-                    13.,
+                    "Choose a fixed chat",
+                    rect(16., 9., 350., 30.),
+                    14.,
                     TEXT,
                     false,
                 );
+                area(Hit::Back, rect(width - 74., 9., 58., 30.));
+                p.label(
+                    "‹  Back",
+                    rect(width - 68., 9., 54., 30.),
+                    12.,
+                    MUTED,
+                    false,
+                );
+                p.fill(rect(16., 49., width - 32., 35.), 0x1c2125, 6.);
+                p.border(rect(16., 49., width - 32., 35.), 0x43515a, 6.);
+                if self.testing {
+                    p.label(
+                        if self.search.is_empty() {
+                            "Search chats…"
+                        } else {
+                            &self.search
+                        },
+                        rect(27., 49., width - 54., 35.),
+                        13.,
+                        MUTED,
+                        false,
+                    );
+                }
+                for (slot, &index) in self
+                    .chat_filters
+                    .iter()
+                    .skip(self.scroll)
+                    .take(8)
+                    .enumerate()
+                {
+                    let row = &self.rows[index];
+                    let y = 100. + slot as f32 * 44.;
+                    let selected = !live.auto_thread && row.id == live.fixed_thread;
+                    let busy = row.state == "Busy";
+                    let r = rect(16., y, width - 32., 40.);
+                    p.fill(
+                        r,
+                        if selected {
+                            0x293f37
+                        } else if busy {
+                            0x352e24
+                        } else {
+                            0x282f34
+                        },
+                        7.,
+                    );
+                    area(Hit::Fixed(row.id.clone()), r);
+                    if selected || self.chat_cursor == self.scroll + slot {
+                        p.border(r, if selected { 0x5ca985 } else { 0x59849c }, 7.);
+                    }
+                    p.fill(rect(23., y + 5., 30., 30.), 0x333c43, 7.);
+                    p.label(
+                        &self.catalog.icon(&row.label),
+                        rect(26., y + 4., 28., 32.),
+                        20.,
+                        TEXT,
+                        true,
+                    );
+                    let with_metrics = busy && row.tokens.is_some();
+                    p.label(
+                        self.catalog.strip(&row.label),
+                        rect(
+                            62.,
+                            y + 2.,
+                            width - 202.,
+                            if with_metrics { 21. } else { 36. },
+                        ),
+                        13.,
+                        TEXT,
+                        false,
+                    );
+                    if with_metrics {
+                        p.label(
+                            &format!(
+                                "{} TOK  ·  {} t/s",
+                                data::compact(row.tokens),
+                                row.rate().map(|v| format!("{v:.1}")).unwrap_or("—".into())
+                            ),
+                            rect(62., y + 22., width - 202., 16.),
+                            10.,
+                            MUTED,
+                            false,
+                        );
+                    }
+                    p.label(
+                        &row.status_text(),
+                        rect(width - 126., y + 3., 85., 34.),
+                        11.,
+                        match row.state.as_str() {
+                            "Busy" | "Waiting" => ORANGE,
+                            "Done" => GREEN,
+                            "Failed" => 0xf87171,
+                            _ => MUTED,
+                        },
+                        false,
+                    );
+                    if selected {
+                        p.label("✓", rect(width - 39., y + 3., 20., 34.), 14., GREEN, false);
+                    }
+                }
+                if self.chat_filters.is_empty() {
+                    p.label(
+                        "No matching chats",
+                        rect(27., 120., width - 54., 44.),
+                        13.,
+                        MUTED,
+                        false,
+                    );
+                }
+                if self.chat_filters.len() > 8 {
+                    p.fill(rect(width - 9., 101., 3., 350.), 0x35414a, 1.5);
+                    let thumb = (350. * 8. / self.chat_filters.len() as f32).max(20.);
+                    let offset =
+                        (350. - thumb) * self.scroll as f32 / (self.chat_filters.len() - 8) as f32;
+                    p.fill(rect(width - 9., 101. + offset, 3., thumb), 0x77929f, 1.5);
+                }
+                p.label(
+                    &format!(
+                        "{} chats  ·  Scroll to browse  ·  Enter to select",
+                        self.chat_filters.len()
+                    ),
+                    rect(18., height - 35., width - 36., 26.),
+                    11.,
+                    MUTED,
+                    false,
+                );
+            }
+            Some(Popup::Details) => {
+                let field = rect(16., 77., width - 32., 32.);
+                p.fill(field, 0x1c2125, 6.);
+                area(Hit::ChooseFixed, field);
+                p.border(field, 0x475b66, 6.);
+                let fixed = (!live.auto_thread)
+                    .then(|| {
+                        live.recent
+                            .all_rows
+                            .iter()
+                            .chain(&live.recent.rows)
+                            .find(|r| r.id == live.fixed_thread)
+                    })
+                    .flatten();
+                let label = fixed.map(|r| r.label.as_str()).or_else(|| {
+                    self.current(&live)
+                        .filter(|_| !live.auto_thread)
+                        .map(|s| s.label.as_str())
+                });
+                if let Some(label) = label {
+                    p.label(
+                        &self.catalog.icon(label),
+                        rect(23., 79., 26., 28.),
+                        18.,
+                        TEXT,
+                        true,
+                    );
+                    p.label(
+                        self.catalog.strip(label),
+                        rect(55., 77., width - 104., 32.),
+                        13.,
+                        TEXT,
+                        false,
+                    );
+                } else {
+                    p.label(
+                        "Choose a fixed chat…",
+                        rect(27., 77., width - 76., 32.),
+                        13.,
+                        MUTED,
+                        false,
+                    );
+                }
+                p.line(width - 38., 90., width - 33., 95., MUTED, 1.4);
+                p.line(width - 33., 95., width - 28., 90., MUTED, 1.4);
                 p.label(
                     "Session details",
                     rect(16., 8., width - 32., 28.),
@@ -810,7 +986,11 @@ impl App {
                     );
                 } else {
                     p.label(
-                        "No chat selected · showing all Busy chats",
+                        if self.identity(&live).is_empty() {
+                            "No chat selected · showing all Busy chats"
+                        } else {
+                            "Loading chat metrics…"
+                        },
                         rect(16., 112., width - 32., 25.),
                         12.,
                         MUTED,
@@ -958,6 +1138,9 @@ impl App {
         if self.popup_kind == Some(Popup::Recent) {
             self.rows = data::stable_rows(&self.rows, &live.recent.rows);
         }
+        if self.popup_kind == Some(Popup::Fixed) && !live.recent.all_rows.is_empty() {
+            self.rows = data::stable_rows(&self.rows, &live.recent.all_rows);
+        }
         let host = host::bounds(live.host);
         if !self.testing {
             if self.hidden || !host::shown(live.host) {
@@ -1046,7 +1229,10 @@ impl App {
         if signature != self.last_signature || self.last_draw.elapsed().as_millis() >= 500 {
             self.last_signature = signature;
             let _ = InvalidateRect(self.bar, None, false);
-            if matches!(self.popup_kind, Some(Popup::Recent) | Some(Popup::Details)) {
+            if matches!(
+                self.popup_kind,
+                Some(Popup::Recent) | Some(Popup::Details) | Some(Popup::Fixed)
+            ) {
                 let _ = InvalidateRect(self.popup, None, false);
             }
             self.last_draw = Instant::now();
@@ -1082,7 +1268,7 @@ impl App {
         if hwnd == self.popup || IsChild(self.popup, hwnd).as_bool() {
             return true;
         }
-        [self.combo, self.selector].iter().any(|&combo| {
+        [self.combo].iter().any(|&combo| {
             let mut info = COMBOBOXINFO {
                 cbSize: size_of::<COMBOBOXINFO>() as u32,
                 ..Default::default()
@@ -1092,12 +1278,8 @@ impl App {
                 && (hwnd == info.hwndList || IsChild(info.hwndList, hwnd).as_bool())
         })
     }
-    fn choose_fixed_chat(&self, index: isize) -> bool {
-        let Some(row) = index
-            .checked_sub(1)
-            .filter(|&i| i >= 0)
-            .and_then(|i| self.rows.get(i as usize))
-        else {
+    fn choose_fixed_chat(&self, id: &str) -> bool {
+        let Some(row) = self.rows.iter().find(|r| r.id == id) else {
             return false;
         };
         let mut live = self.state.lock().unwrap();
@@ -1111,14 +1293,13 @@ impl App {
             self.close_popup();
             return Ok(());
         }
-        for hwnd in [self.edit, self.combo, self.selector] {
+        for hwnd in [self.edit, self.combo] {
             if !hwnd.is_invalid() {
                 let _ = DestroyWindow(hwnd);
             }
         }
         self.edit = HWND::default();
         self.combo = HWND::default();
-        self.selector = HWND::default();
         // A newly created child needs one layout even if the panel bounds match.
         self.popup_layout = None;
         self.popup_kind = Some(kind);
@@ -1131,6 +1312,7 @@ impl App {
             }
             Popup::Icons => [384, 450],
             Popup::Details => [560, 310],
+            Popup::Fixed => [560, 500],
         };
         if kind == Popup::Icons {
             self.scroll = 0;
@@ -1184,51 +1366,49 @@ impl App {
                 LPARAM(w!("Search emoji…").as_ptr() as isize),
             );
         }
-        if kind == Popup::Details {
-            self.selector = CreateWindowExW(
+        if kind == Popup::Fixed {
+            self.rows = if !live.recent.all_rows.is_empty() {
+                live.recent.all_rows.clone()
+            } else if self.testing {
+                self.rows.clone()
+            } else {
+                data::stable_rows(
+                    &data::Store::new(&self.paths).sessions().unwrap_or_default(),
+                    &live.recent.rows,
+                )
+            };
+            self.rows.sort_by_key(|r| r.state != "Busy");
+            self.search.clear();
+            self.scroll = 0;
+            self.filter_fixed();
+            if !live.auto_thread {
+                self.chat_cursor = self
+                    .chat_filters
+                    .iter()
+                    .position(|&i| self.rows[i].id == live.fixed_thread)
+                    .unwrap_or(0);
+                self.scroll = self.chat_cursor.saturating_sub(7);
+            }
+            self.edit = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
-                w!("COMBOBOX"),
+                w!("EDIT"),
                 w!(""),
-                WS_CHILD
-                    | WS_VISIBLE
-                    | WS_TABSTOP
-                    | WINDOW_STYLE(CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0),
-                16,
-                77,
-                528,
-                300,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+                27,
+                55,
+                506,
+                24,
                 self.popup,
-                HMENU(102isize as *mut _),
+                HMENU(103isize as *mut _),
                 GetModuleHandleW(None)?,
                 None,
             )?;
             let _ = SendMessageW(
-                self.selector,
-                CB_ADDSTRING,
+                self.edit,
+                EM_SETCUEBANNER,
                 WPARAM(0),
-                LPARAM(w!("Choose a fixed chat…").as_ptr() as isize),
+                LPARAM(w!("Search chats…").as_ptr() as isize),
             );
-            if !self.testing {
-                let store = data::Store::new(&self.paths);
-                self.rows = store.sessions().unwrap_or_default();
-            }
-            for row in &self.rows {
-                let _ = SendMessageW(
-                    self.selector,
-                    CB_ADDSTRING,
-                    WPARAM(0),
-                    LPARAM(wide(&row.label).as_ptr() as isize),
-                );
-            }
-            let selected = if live.auto_thread {
-                0
-            } else {
-                self.rows
-                    .iter()
-                    .position(|row| row.id == live.fixed_thread)
-                    .map_or(0, |index| index + 1)
-            };
-            let _ = SendMessageW(self.selector, CB_SETCURSEL, WPARAM(selected), LPARAM(0));
         }
         let previous_font = self.edit_font;
         self.edit_font = CreateFontW(
@@ -1247,7 +1427,7 @@ impl App {
             DEFAULT_PITCH.0 as u32,
             w!("Microsoft YaHei UI"),
         );
-        for child in [self.edit, self.combo, self.selector] {
+        for child in [self.edit, self.combo] {
             if !child.is_invalid() {
                 let _ = SendMessageW(
                     child,
@@ -1264,7 +1444,7 @@ impl App {
         if !self.testing {
             let _ = ShowWindow(self.popup, SW_SHOW);
             let _ = SetForegroundWindow(self.popup);
-            if kind == Popup::Icons {
+            if matches!(kind, Popup::Icons | Popup::Fixed) {
                 let _ = SetFocus(self.edit);
             }
         }
@@ -1273,7 +1453,7 @@ impl App {
     unsafe fn place_popup(&mut self) {
         // Token/TPS text can change the bar's width and anchor while the user
         // is choosing. Let native combo tracking finish before moving its panel.
-        if [self.combo, self.selector].iter().any(|&combo| {
+        if [self.combo].iter().any(|&combo| {
             !combo.is_invalid()
                 && SendMessageW(combo, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0 != 0
         }) {
@@ -1314,9 +1494,12 @@ impl App {
         Self::round_window(self.popup, w, h, (18. * scale) as i32);
         // Child controls stay in physical pixels, matching the parent DPI.
         for (child, x, y, cw, ch) in [
-            (self.edit, 14, 49, 190, 29),
+            if self.popup_kind == Some(Popup::Fixed) {
+                (self.edit, 27, 55, 506, 24)
+            } else {
+                (self.edit, 14, 49, 190, 29)
+            },
             (self.combo, 214, 49, 155, 350),
-            (self.selector, 16, 77, 528, 300),
         ] {
             if !child.is_invalid() {
                 let _ = MoveWindow(
@@ -1331,6 +1514,9 @@ impl App {
         }
     }
     fn settings(&self) {
+        if self.testing {
+            return;
+        }
         let mut value = self.settings.clone();
         let live = self.snapshot();
         value.auto_thread = live.auto_thread;
@@ -1361,6 +1547,19 @@ impl App {
             }
             Hit::Details => {
                 let _ = self.popup(Popup::Details);
+            }
+            Hit::ChooseFixed => {
+                let _ = self.popup(Popup::Fixed);
+            }
+            Hit::Back => {
+                let _ = self.popup(Popup::Details);
+            }
+            Hit::Fixed(id) => {
+                if self.choose_fixed_chat(&id) {
+                    self.settings();
+                    self.last_identity = id;
+                    let _ = self.popup(Popup::Details);
+                }
             }
             Hit::Hide => {
                 self.hidden = true;
@@ -1444,6 +1643,66 @@ impl App {
         self.filters = self.catalog.filter(&self.search, &self.category);
         self.scroll = 0;
         let _ = InvalidateRect(self.popup, None, false);
+    }
+    fn filter_fixed(&mut self) {
+        let query = self.search.trim().to_lowercase();
+        self.chat_filters = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| query.is_empty() || row.label.to_lowercase().contains(&query))
+            .map(|(index, _)| index)
+            .collect();
+        self.chat_cursor = 0;
+        self.scroll = 0;
+    }
+    fn move_fixed_cursor(&mut self, delta: isize) {
+        self.chat_cursor = self
+            .chat_cursor
+            .saturating_add_signed(delta)
+            .min(self.chat_filters.len().saturating_sub(1));
+        if self.chat_cursor < self.scroll {
+            self.scroll = self.chat_cursor;
+        }
+        if self.chat_cursor >= self.scroll + 8 {
+            self.scroll = self.chat_cursor - 7;
+        }
+    }
+    fn fixed_hit_at(&self, x: f32, y: f32) -> Option<Hit> {
+        let width = self.popup_size[0] as f32;
+        if (width - 74. ..width - 16.).contains(&x) && (9. ..39.).contains(&y) {
+            return Some(Hit::Back);
+        }
+        if !(16. ..width - 16.).contains(&x)
+            || !(100. ..452.).contains(&y)
+            || (y - 100.) % 44. >= 40.
+        {
+            return None;
+        }
+        let slot = self.scroll + ((y - 100.) / 44.) as usize;
+        self.chat_filters
+            .get(slot)
+            .map(|&index| Hit::Fixed(self.rows[index].id.clone()))
+    }
+    unsafe fn fixed_key(&mut self, key: u32) -> bool {
+        if self.popup_kind != Some(Popup::Fixed) {
+            return false;
+        }
+        match key {
+            k if k == VK_UP.0 as u32 => self.move_fixed_cursor(-1),
+            k if k == VK_DOWN.0 as u32 => self.move_fixed_cursor(1),
+            k if k == VK_RETURN.0 as u32 => {
+                if let Some(&index) = self.chat_filters.get(self.chat_cursor) {
+                    let _ = self.hit(Hit::Fixed(self.rows[index].id.clone()));
+                }
+            }
+            k if k == VK_ESCAPE.0 as u32 => {
+                let _ = self.popup(Popup::Details);
+            }
+            _ => return false,
+        }
+        let _ = InvalidateRect(self.popup, None, false);
+        true
     }
 }
 
@@ -1541,11 +1800,15 @@ unsafe extern "system" fn wndproc(
                     }
                 } else {
                     let areas = if is_bar { &app.hits } else { &app.popup_hits };
-                    if let Some(hit) = areas
-                        .iter()
-                        .find(|a| a.contains(x, y))
-                        .map(|a| a.hit.clone())
-                    {
+                    let hit = if !is_bar && app.popup_kind == Some(Popup::Fixed) {
+                        app.fixed_hit_at(x, y)
+                    } else {
+                        areas
+                            .iter()
+                            .find(|a| a.contains(x, y))
+                            .map(|a| a.hit.clone())
+                    };
+                    if let Some(hit) = hit {
                         if let Some(action) = app.hit(hit) {
                             ACTIONS.with(|sender| {
                                 if let Some(sender) = sender.borrow().as_ref() {
@@ -1555,6 +1818,20 @@ unsafe extern "system" fn wndproc(
                         }
                     }
                 }
+                Some(LRESULT(0))
+            }
+            WM_MOUSEWHEEL if !is_bar && app.popup_kind == Some(Popup::Fixed) => {
+                let delta = ((wparam.0 >> 16) as i16) as i32;
+                app.scroll = if delta < 0 {
+                    (app.scroll + 3).min(app.chat_filters.len().saturating_sub(8))
+                } else {
+                    app.scroll.saturating_sub(3)
+                };
+                app.chat_cursor = app.chat_cursor.clamp(
+                    app.scroll,
+                    (app.scroll + 7).min(app.chat_filters.len().saturating_sub(1)),
+                );
+                let _ = InvalidateRect(app.popup, None, false);
                 Some(LRESULT(0))
             }
             WM_MOUSEWHEEL if !is_bar && app.popup_kind == Some(Popup::Icons) => {
@@ -1579,11 +1856,12 @@ unsafe extern "system" fn wndproc(
                 let code = ((wparam.0 >> 16) & 0xffff) as u32;
                 if (id == 100 && code == EN_CHANGE) || (id == 101 && code == CBN_SELCHANGE) {
                     app.update_filter();
-                } else if id == 102 && code == CBN_SELENDOK {
-                    let index = SendMessageW(app.selector, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
-                    if app.choose_fixed_chat(index) {
-                        app.settings();
-                    }
+                } else if id == 103 && code == EN_CHANGE {
+                    let mut text = [0u16; 256];
+                    let len = GetWindowTextW(app.edit, &mut text);
+                    app.search = String::from_utf16_lossy(&text[..len as usize]);
+                    app.filter_fixed();
+                    let _ = InvalidateRect(app.popup, None, false);
                 }
                 Some(LRESULT(0))
             }
@@ -1709,6 +1987,18 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
         APP.with(|a| *a.borrow_mut() = Some(app));
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if msg.message == WM_KEYDOWN
+                && APP.with(|slot| {
+                    let Ok(mut value) = slot.try_borrow_mut() else {
+                        return false;
+                    };
+                    value.as_mut().is_some_and(|app| {
+                        app.owns_popup_window(msg.hwnd) && app.fixed_key(msg.wParam.0 as u32)
+                    })
+                })
+            {
+                continue;
+            }
             if msg.message == WM_KEYDOWN && msg.wParam.0 == VK_ESCAPE.0 as usize {
                 APP.with(|slot| {
                     if let Ok(mut app) = slot.try_borrow_mut() {
@@ -1748,7 +2038,7 @@ unsafe fn capture(
     width: u32,
     height: u32,
     path: &std::path::Path,
-) -> Result<()> {
+) -> Result<Vec<Area>> {
     let dc = CreateCompatibleDC(None);
     let mut info = BITMAPINFO::default();
     info.bmiHeader = BITMAPINFOHEADER {
@@ -1774,7 +2064,7 @@ unsafe fn capture(
     )?;
     app.painter.target.SetDpi(96., 96.);
     app.painter.target.BeginDraw();
-    app.render(kind, width as f32, height as f32);
+    let hits = app.render(kind, width as f32, height as f32);
     app.painter.target.EndDraw(None, None)?;
     let raw = std::slice::from_raw_parts(bits as *const u8, (width * height * 4) as usize);
     let mut rgba = Vec::with_capacity(raw.len());
@@ -1785,7 +2075,7 @@ unsafe fn capture(
     SelectObject(dc, previous);
     let _ = DeleteObject(bitmap);
     let _ = DeleteDC(dc);
-    Ok(())
+    Ok(hits)
 }
 pub fn self_test(paths: &Paths) -> Result<()> {
     unsafe {
@@ -1818,7 +2108,11 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         let rows: Vec<Row> = (0..10)
             .map(|i| Row {
                 id: format!("fixture-{i}"),
-                label: format!("{} xxx 会话名称 {}", if i < 3 { "🧪" } else { "💬" }, i + 1),
+                label: format!(
+                    "{} xxx 会话名称 {}",
+                    ["🧪", "🚧", "🚀", "💬", "🎯", "📦", "💻", "🧠", "🌈", "📷"][i],
+                    i + 1
+                ),
                 state: if i < 3 { "Busy".into() } else { "Done".into() },
                 tokens: Some(27190000),
                 tps: Some(42.3),
@@ -1828,6 +2122,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             })
             .collect();
         state.lock().unwrap().recent = data::Recent {
+            all_rows: rows.clone(),
             rows: rows.clone(),
             busy_count: Some(3),
             busy_metrics: rows[..3].to_vec(),
@@ -1873,7 +2168,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             live.snapshot = Some(snap);
         }
         let w = app.measure_bar() as u32;
-        capture(
+        let bar_hits = capture(
             &app,
             None,
             w,
@@ -1899,56 +2194,60 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         )?;
         app.rows = rows.clone();
         app.popup(Popup::Details)?;
-        // Exercise the real native combo with the fixture window kept hidden.
-        // Repeating the live timer's placement call must leave it expanded.
-        let _ = SendMessageW(app.selector, CB_SHOWDROPDOWN, WPARAM(1), LPARAM(0));
-        assert_ne!(
-            SendMessageW(app.selector, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0,
-            0
-        );
-        for _ in 0..100 {
-            app.place_popup();
-        }
-        assert_ne!(
-            SendMessageW(app.selector, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0,
-            0,
-            "Timer placement closed the fixed-chat dropdown"
-        );
-        let mut info = COMBOBOXINFO {
-            cbSize: size_of::<COMBOBOXINFO>() as u32,
-            ..Default::default()
-        };
-        GetComboBoxInfo(app.selector, &mut info)?;
-        assert!(app.owns_popup_window(info.hwndList));
-        assert!(!app.owns_popup_window(app.bar));
-        let panel_before = host::bounds(app.popup.0 as isize).unwrap();
-        let bar_before = host::bounds(app.bar.0 as isize).unwrap();
-        let _ = SetWindowPos(
-            app.bar,
-            HWND_TOPMOST,
-            bar_before[0] + 120,
-            bar_before[1],
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-        app.place_popup();
-        assert_eq!(
-            host::bounds(app.popup.0 as isize),
-            Some(panel_before),
-            "Changing bar metrics moved a panel during dropdown tracking"
-        );
-        let _ = SendMessageW(app.selector, CB_SHOWDROPDOWN, WPARAM(0), LPARAM(0));
-        app.place_popup();
-        assert_ne!(host::bounds(app.popup.0 as isize), Some(panel_before));
-        let _ = SendMessageW(app.selector, CB_SETCURSEL, WPARAM(2), LPARAM(0));
-        let index = SendMessageW(app.selector, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+        assert!(capture(
+            &app,
+            Some(Popup::Details),
+            560,
+            310,
+            &paths.runtime.join("rust-details-verification.png")
+        )?
+        .iter()
+        .any(|a| a.hit == Hit::ChooseFixed));
         let before = app.snapshot();
-        assert!(app.choose_fixed_chat(index));
+        app.last_identity = app.identity(&before);
+        app.popup(Popup::Fixed)?;
+        let order = app.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        state.lock().unwrap().recent.all_rows.reverse();
+        for _ in 0..100 {
+            app.tick();
+        }
+        assert_eq!(app.popup_kind, Some(Popup::Fixed));
+        assert_eq!(
+            app.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            order
+        );
+        app.search = "名称 2".into();
+        app.filter_fixed();
+        assert_eq!(app.chat_filters.len(), 1);
+        assert_eq!(app.rows[app.chat_filters[0]].id, rows[1].id);
+        assert_eq!(
+            app.fixed_hit_at(80., 120.),
+            Some(Hit::Fixed(rows[1].id.clone()))
+        );
+        app.search.clear();
+        app.filter_fixed();
+        app.move_fixed_cursor(9);
+        assert_eq!(app.chat_cursor, 9);
+        assert_eq!(app.scroll, 2);
+        assert!(!app.choose_fixed_chat("missing-chat"));
+        app.move_fixed_cursor(-8);
+        assert!(app.fixed_key(VK_RETURN.0 as u32));
         assert_eq!(app.snapshot().fixed_thread, rows[1].id);
         assert!(!app.snapshot().auto_thread);
-        assert!(!app.choose_fixed_chat(0));
-        *state.lock().unwrap() = before;
+        assert_eq!(app.popup_kind, Some(Popup::Details));
+        state.lock().unwrap().recent.all_rows = rows.clone();
+        app.popup(Popup::Fixed)?;
+        let picker_hits = capture(
+            &app,
+            Some(Popup::Fixed),
+            560,
+            500,
+            &paths.runtime.join("rust-fixed-verification.png"),
+        )?;
+        assert!(picker_hits
+            .iter()
+            .any(|a| a.hit == Hit::Fixed(rows[1].id.clone())));
+        app.popup(Popup::Details)?;
         capture(
             &app,
             Some(Popup::Details),
@@ -1956,6 +2255,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             310,
             &paths.runtime.join("rust-details-verification.png"),
         )?;
+        *state.lock().unwrap() = before;
         app.popup(Popup::Icons)?;
         let _ = SendMessageW(app.combo, CB_SHOWDROPDOWN, WPARAM(1), LPARAM(0));
         for _ in 0..100 {
@@ -1969,7 +2269,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         let _ = SendMessageW(app.combo, CB_SHOWDROPDOWN, WPARAM(0), LPARAM(0));
         assert_eq!(app.catalog.rename("👩🏽‍💻 中文标题", "🚀"), "🚀 中文标题");
         assert_eq!(app.catalog.filter("rocket", "All emoji").len(), 1);
-        let hits = app.render(None, w as f32, 34.);
+        let hits = bar_hits;
         let title = hits.iter().find(|a| a.hit == Hit::Title).unwrap();
         let grip = hits.iter().find(|a| a.hit == Hit::Grip).unwrap();
         assert!(title.r.right < grip.r.left);
@@ -1986,7 +2286,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert!(app.hidden);
         app.hidden = false;
         app.diagnostic();
-        paths.write("rust-ui-test.json",&json!({"ui":"pass","runtime":"rust","emoji_count":app.catalog.entries.len(),"default_collection":90,"recent_rows":10,"startup_home_quota":true,"open_list_order_fixed":true,"random_icon_bound":true,"drag_grip_separate":true,"fixed_chat_dropdown_survives_100_refreshes":true,"emoji_dropdown_survives_100_refreshes":true,"fixed_chat_selection":true,"font_chinese":app.painter.chinese,"renderer":"DirectWrite + software Direct2D"}));
+        paths.write("rust-ui-test.json",&json!({"ui":"pass","runtime":"rust","emoji_count":app.catalog.entries.len(),"default_collection":90,"recent_rows":10,"startup_home_quota":true,"open_list_order_fixed":true,"random_icon_bound":true,"drag_grip_separate":true,"fixed_chat_picker_survives_100_refreshes":true,"fixed_chat_search":true,"fixed_chat_keyboard_scroll":true,"fixed_chat_color_icons":true,"emoji_dropdown_survives_100_refreshes":true,"fixed_chat_selection":true,"font_chinese":app.painter.chinese,"renderer":"DirectWrite + software Direct2D"}));
         println!(
             "{}",
             json!({"ui":"pass","emoji":app.catalog.entries.len(),"font":app.painter.chinese,"screenshots":paths.runtime.to_string_lossy()})
