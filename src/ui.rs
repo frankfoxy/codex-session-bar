@@ -546,10 +546,12 @@ impl App {
                     x += w + 2.;
                     let rgb = quota
                         .map(|q| {
-                            if q.remaining < 15. {
+                            if q.remaining < 25. {
                                 0xf87171
-                            } else if q.remaining < 40. {
+                            } else if q.remaining < 50. {
                                 ORANGE
+                            } else if q.remaining < 75. {
+                                0x60a5fa
                             } else {
                                 0x27ce79
                             }
