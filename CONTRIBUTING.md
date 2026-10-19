@@ -17,7 +17,10 @@ For live checks, avoid submitting prompts, stopping work, or changing unrelated
 chats. Use the existing account and desktop connection instead of storing keys.
 
 Never commit `settings.json`, credentials, session databases, JSONL histories,
-logs, generated screenshots, caches, or temporary files. Keep all task temporary
+logs, live screenshots, caches, or temporary files. The README's curated
+`preview-*.png` images may be updated from sanitized UI fixtures; inspect them
+before publishing and keep personal chat data out. See [development notes](DEVELOPMENT.md).
+Keep all task temporary
 content under the active workspace's direct `tmp` directory. Do not create drive
 letter mappings. See the workspace rules when embedding this project in a larger
 checkout.
