@@ -1,55 +1,97 @@
 # Development and troubleshooting
 
-User-facing features and setup are in [README](README.md). This document covers integration details and verification.
+The default runtime is the Rust executable in `bin/codex-session-bar.exe`.
+The earlier Python sources remain as migration reference; launchers and the
+scheduled task use Rust and do not start Python, Qt, a WebView or an independent
+Codex app-server.
 
-## Data and identity
+## Build and verification
 
-- Open `state_5.sqlite` and `thread_history_1.sqlite` read-only. Exclude archived chats and subagents from the recent picker.
-- Identify the visible chat using Windows UI Automation and a unique local title match. Do not infer the active page from background activity. Clear old data during identity changes and reject late snapshots.
-- Read JSONL usage from a bounded tail and subsequent increments. TPS must use samples from the current turn and expires after 30 seconds. Cached input is part of input totals; last-call usage is not whole-turn usage.
-- Read account limits through `account/rateLimits/read` every 60 seconds. Keep previous values on failure and label them stale. Unknown is distinct from zero.
-
-## Desktop actions and responsiveness
-
-Use the desktop's bundled `codex-app-tools` MCP adapter for `set_thread_title` and `navigate_to_codex_page`. An independent app-server does not notify the running desktop renderer of title changes. Require explicit desktop confirmation; never silently fall back to a local title write.
-
-The control worker warms and reuses its own adapter. Missing desktop pipes and transport failures trigger reconnection, with at most one retry for an explicit, idempotent target action. Application errors are surfaced without retries. Coalesce pending navigation commands to the latest target; preserve icon writes bound to their original chat. Icon changes fetch only the current title, without reading usage logs.
-
-Quota, control actions, recent scans and current-view tracking have separate workers. The recent scanner uses its own adapter, approximately every 3 seconds while closed and 1.5 seconds while open. Reopening a cached picker reuses its widgets. An open picker preserves its displayed IDs and order, including rows that leave the latest top ten; updates merge by ID. Reopening applies the latest Busy-first order. An initially empty menu can populate when its first result arrives.
-
-On the Codex home page, show a Recent chats entry, the scanned Busy count and aggregate Busy usage. Account quota has its own GUI signal and renders before any chat is selected. Keep icon changes disabled until an actual visible chat is identified; never substitute a background chat for the home page. Entering or leaving a chat preserves the independent account quota.
-
-Busy totals cover all scanned Busy local root chats, including those outside the ten visible rows. Sum available cumulative tokens and fresh TPS samples; expose partial coverage in tooltips. A missing rollout affects only that chat's metrics.
-
-The bar watches the host window every 80 ms. A separate read-only titlebar observer supplies safe blank bounds. Too little space falls back below the menu. Current-view detection runs incrementally every 0.1 seconds and wakes data reads; session data normally refreshes every 0.5 seconds.
-
-## Runtime and configuration
-
-- Preferences: ignored `settings.json` beside the script.
-- Runtime: the workspace's direct `tmp/codex-session-bar/` child. When installed under `tools/codex-session-bar`, use that enclosing workspace; otherwise use the repository root.
-- Override the workspace with `CODEX_SESSION_BAR_WORKSPACE`, pointing to an existing directory. Temporary content must remain in its direct `tmp` child.
-- Override the launcher interpreter with `CODEX_SESSION_BAR_PYTHON` if needed.
-- If there are multiple desktop pipes, restart from the intended Codex instance rather than guessing the destination.
-- Autostart installs the current-user `Codex Session Bar` scheduled task, with up to three recovery restarts. It waits for the desktop to appear.
-
-No credentials or personal session IDs belong in the repository. Do not submit prompts, resume tasks, interrupt work or write Codex databases for verification.
-
-## Visibility and emoji
-
-The bar always uses `WindowStaysOnTopHint`. Closing hides it with an explicit `user_hidden` flag, which host-follow updates must respect. Tray Open, the existing single-instance local socket, and the named auto-reset Windows show event clear that flag; Quit stops the process. The event name is `Local\\codex-session-bar-<home-hash>-show`, matching the first 12 SHA-256 hex characters of the case-folded Codex home path. The installed opening skill starts the existing scheduled task if needed, signals the event, then verifies fresh diagnostics. It does not restart Codex or write runtime files.
-
-`emoji_catalog.json` contains Unicode Emoji 18.0 fully-qualified sequences plus components, generated from the official `emoji-test.txt`; preserve `UNICODE-LICENSE.txt`. The picker uses a batched, uniform-size Qt list model instead of thousands of buttons. Search covers names, group, subgroup and literal emoji. Longest-first prefix buckets preserve full flag, skin-tone, keycap and ZWJ sequences during title changes without scanning the entire catalog for each title.
-
-## Verification
+Use Windows, the Rust MSVC toolchain and Visual Studio C++ Build Tools.
+`Build.ps1` places Cargo caches, targets and temporary files in the enclosing
+workspace's direct `tmp/session-bar-rust-build` directory. It uses the installed
+compiler directly, without asking rustup to update a toolchain.
 
 ```powershell
-python -B -m unittest discover -s . -p test_session_bar.py -v
-$env:QT_QPA_PLATFORM = 'offscreen'
-python -B session_bar.py --test-ui
+.\Build.ps1 -Check
+.\bin\codex-session-bar.exe --self-test
+.\bin\codex-session-bar.exe --inspect
+.\bin\codex-session-bar.exe --observe
 ```
 
-These checks use fixtures and do not navigate user chats. They cover transport reuse/recovery, queued navigation, fixed picker order, live metric updates, icon identity, dock bounds, window following and stale snapshot rejection. UI screenshots go to workspace `tmp`, not the repository. Curated README previews are sanitized fixture captures.
+`-Check` runs the unit suite before producing the release binary. `--self-test`
+uses sanitized fixtures, hidden windows and software-rendered captures under
+`tmp/codex-session-bar`. It verifies the home-page overview, fixed recent-list
+order, emoji catalog/search, bound random-icon actions and separate drag area.
+Inspect its PNGs before changing curated README previews. The other two probes
+are read-only: `--inspect` checks real recent-chat and quota RPC responses;
+`--observe` checks window identity, titlebar bounds and local usage. Neither
+navigates chats, renames them, submits prompts or resumes work.
 
-`python -B session_bar.py --probe` is a live diagnostic: it resets the current icon to its existing value to verify desktop synchronization. It does not submit a prompt. Do not run it unnecessarily against unrelated chats.
+## Data and desktop integration
 
-Inspect `live-status.json` and bounded stderr excerpts in the runtime directory for identity, connection errors, picker timings and quota availability. Do not publish these files. Compatibility depends on Codex's local database and desktop tool formats, which may change across app versions.
+`data.rs` opens the local SQLite databases read-only with in-memory temporary
+storage. Archived chats and subagents are excluded. Token records are parsed
+from at most a 256 KiB tail, followed by bounded increments. Partial lines remain
+unconsumed until completed; TPS samples must belong to the current turn and
+expire after 30 seconds. Cached input is included in input totals.
+
+`host.rs` uses a dedicated COM/UI Automation observer. Only window metadata,
+the outer document title and header-control bounds are read; chat bodies are
+not traversed. Exact titles must map uniquely to a local root chat. Home and
+ambiguous pages display an account overview rather than guessing a background
+chat. The titlebar observer excludes embedded browser documents and protects
+native window buttons. A separate observer keeps header scans off the fast
+chat-follow path.
+
+`desktop.rs` reuses the desktop's bundled App Tools MCP adapter for recent
+status, quota, navigation and title updates. Quota comes from `get_usage_limits`
+on the existing desktop connection; no account-server or extra MCP tool servers
+are started for it. Context metadata anchors transport without identifying the
+visible page. Icon updates fetch the original chat title, preserve its text,
+and require explicit desktop confirmation. Pending navigation is coalesced;
+queued icon changes retain their original chat ID. Application errors are not
+retried as transport errors.
+
+Current usage, recent scans, account limits and explicit actions have separate
+workers. Newly identified chats bypass the normal 500 ms usage refresh delay.
+An open recent list freezes row IDs and order; updates merge live metrics by ID.
+Reopening applies the latest Busy-first order. Busy totals cover all scanned
+local roots, including those outside the ten displayed rows. Missing usage is
+shown as unavailable, not zero. Failed refreshes retain previous data as stale.
+
+## Rendering and window lifecycle
+
+`ui.rs` uses native Win32 windows, software Direct2D and DirectWrite. Chinese
+text uses Microsoft YaHei UI (Microsoft YaHei fallback); Latin text uses Segoe
+UI and color emoji use Segoe UI Emoji. ClearType and per-monitor DPI awareness
+avoid bitmap-font and whole-window scaling artifacts. Search and category
+controls use native Windows widgets with a ClearType Chinese font.
+
+The bar follows the Codex window without activation. Only the center grip
+starts dragging. Saved offsets are host-relative and cannot cover header menu
+controls. If the blank header is too narrow, docking falls below the menu.
+Closing hides to tray and sets an explicit hidden flag; host movement cannot
+restore a user-hidden bar. Quit terminates the companion and its own adapter
+children. It never stops Codex or another task.
+
+Preferences remain in ignored `settings.json`. Runtime files stay in the
+workspace's direct `tmp/codex-session-bar` directory. Set
+`CODEX_SESSION_BAR_WORKSPACE` to an existing workspace when needed. The named
+Windows show event keeps the installed opening skill compatible with both
+versions. The native mutex prevents duplicate Rust instances. The scheduled
+task remains named `Codex Session Bar`; the launcher, tray and chat skill can
+restore a hidden instance or start an exited one.
+
+## Diagnostics and disclosure
+
+`live-status.json` records runtime, PID, visible identity, quota, caches, font
+selection and docking bounds. Read bounded stderr excerpts for desktop errors.
+Never commit runtime diagnostics, credentials, settings, local databases,
+rollouts or live screenshots. README images must use sanitized fixtures.
+
+`emoji_catalog.json` preserves the Unicode Emoji 18.0 entries and their license.
+The first page is the original 90-item 默认集合. The full catalog is filtered and
+virtualized as a 90-cell viewport with scroll, category and search controls.
+Random selection excludes the current icon. Prefix matching is longest-first
+so flags, skin tones, keycaps and ZWJ sequences remain intact during renames.

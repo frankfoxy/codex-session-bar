@@ -1,19 +1,9 @@
 @echo off
-powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command "try { $ErrorActionPreference='Stop'; $barTask=Get-ScheduledTask -TaskName 'Codex Session Bar'; if ($barTask.State -eq 'Running') { $barAction=$barTask.Actions[0]; Start-Process -FilePath $barAction.Execute -ArgumentList $barAction.Arguments -WorkingDirectory $barAction.WorkingDirectory -WindowStyle Hidden } else { Start-ScheduledTask -TaskName 'Codex Session Bar' }; exit 0 } catch { exit 1 }"
+powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command "try { $ErrorActionPreference='Stop'; $barTask=Get-ScheduledTask -TaskName 'Codex Session Bar'; if ($barTask.State -eq 'Running') { $barAction=$barTask.Actions[0]; $barStart=@{FilePath=$barAction.Execute;WorkingDirectory=$barAction.WorkingDirectory;WindowStyle='Hidden'}; if ($barAction.Arguments) { $barStart.ArgumentList=$barAction.Arguments }; Start-Process @barStart } else { Start-ScheduledTask -TaskName 'Codex Session Bar' }; exit 0 } catch { exit 1 }"
 if not errorlevel 1 exit /b
-if defined CODEX_SESSION_BAR_PYTHON (
-  start "" "%CODEX_SESSION_BAR_PYTHON%" -B "%~dp0session_bar.py"
+if exist "%~dp0bin\codex-session-bar.exe" (
+  start "" "%~dp0bin\codex-session-bar.exe"
   exit /b
 )
-where pythonw.exe >nul 2>nul
-if not errorlevel 1 (
-  start "" pythonw.exe -B "%~dp0session_bar.py"
-  exit /b
-)
-where pyw.exe >nul 2>nul
-if not errorlevel 1 (
-  start "" pyw.exe -3 -B "%~dp0session_bar.py"
-  exit /b
-)
-echo Python was not found. Install Python 3.10+ and the packages in requirements.txt.
+echo The Rust executable was not found. Run Build.ps1 first.
 pause

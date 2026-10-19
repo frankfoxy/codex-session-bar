@@ -15,20 +15,12 @@ if (-not $taskTemp.StartsWith($tmpRoot + [IO.Path]::DirectorySeparatorChar, [Str
 $env:TEMP = $taskTemp
 $env:TMP = $taskTemp
 $env:TMPDIR = $taskTemp
-$pythonArgs = '-B '
-if ($env:CODEX_SESSION_BAR_PYTHON) {
-    $python = (Get-Command $env:CODEX_SESSION_BAR_PYTHON -ErrorAction Stop).Source
-} elseif ($command = Get-Command pythonw.exe -ErrorAction SilentlyContinue) {
-    $python = $command.Source
-} elseif ($command = Get-Command pyw.exe -ErrorAction SilentlyContinue) {
-    $python = $command.Source
-    $pythonArgs = '-3 -B '
-} else {
-    throw 'Python was not found. Install Python 3.10+ and requirements.txt first.'
+$executable = Join-Path $PSScriptRoot 'bin/codex-session-bar.exe'
+if (-not (Test-Path -LiteralPath $executable)) {
+    throw 'Rust executable was not found. Build it with Build.ps1 first.'
 }
-$scriptFile = Join-Path $PSScriptRoot 'session_bar.py'
 $userId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-$action = New-ScheduledTaskAction -Execute $python -Argument ($pythonArgs + '"' + $scriptFile + '" --capture-after 5') -WorkingDirectory $PSScriptRoot
+$action = New-ScheduledTaskAction -Execute $executable -WorkingDirectory $PSScriptRoot
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
 $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)

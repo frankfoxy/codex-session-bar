@@ -4,6 +4,8 @@
 
 把当前会话、Token 用量、生成速度和剩余额度放进标题栏空白处。多任务运行时，随时查看哪些会话还在忙，快速回到想看的聊天。
 
+**Rust 原生 Windows 版** · 运行不需要 Python 或 Qt · 中文使用微软雅黑，支持多屏 DPI 缩放。
+
 ![悬浮条位于 Codex 标题栏的菜单与窗口按钮之间](preview-titlebar.png)
 
 | 实时掌握进度 | 快速切换会话 | 自定义会话图标 |
@@ -16,7 +18,7 @@
 
 - **正在忙几个？** 橙色 `Busy (5)` 显示运行中的会话数量。
 - **用了多少、跑得多快？** 同行显示当前会话累计 Token、输出 `t/s` 和本轮耗时。
-- **还能用多少？** SVG 电池展示剩余额度，旁边圆环提示距离重置的进度。
+- **还能用多少？** 矢量电池展示剩余额度，旁边圆环提示距离重置的进度。
 - **随窗口走。** 自动跟随当前聊天和 Codex 窗口的移动、隐藏与恢复；支持拖动，始终置顶。
 
 ## 02 · 多个会话，点开就切
@@ -34,7 +36,7 @@
 
 点击悬浮条左端图标，即可展开完整选择面板，修改当前会话的图标。
 
-![标题栏上的悬浮条与完整 Emoji 面板，最左边骰子按钮可随机选择](preview-titlebar-icons.png?v=default-set)
+![完整 Emoji 面板，最左边骰子按钮可随机选择](preview-icons.png?v=rust)
 
 **首屏是“默认集合”**：保留原来的 90 个常用图标及排列顺序。下拉选择 **All emoji** 可浏览 Unicode Emoji 18.0 全集的 3,972 个图标与组件，也可选择其他分类。支持英文名称或 Emoji 搜索，包含肤色、国旗和组合 Emoji。
 
@@ -44,7 +46,9 @@
 
 ## 快速开始
 
-需要 **Windows 10/11、Python 3.10+、Node.js、已登录的 Codex Desktop**，以及可用的 Codex CLI 和桌面自带的 App Tools 插件。Python、Node.js 和 Codex CLI 应能从命令行启动。
+运行需要 **Windows 10/11、Node.js、已登录的 Codex Desktop**，以及桌面自带的 App Tools 插件。无需安装 Python、Qt 或额外的 Codex CLI。
+
+以下是从源码构建的步骤，需要已安装 **Rust MSVC 工具链和 Visual Studio C++ Build Tools**。已构建的程序可直接运行。
 
 **1. 获取项目**
 
@@ -53,15 +57,15 @@ git clone https://github.com/frankfoxy/codex-session-bar.git
 cd codex-session-bar
 ```
 
-**2. 安装依赖**
+**2. 构建原生程序**
 
 ```powershell
-python -m pip install --no-cache-dir -r requirements.txt
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1
 ```
 
 **3. 启动**
 
-打开 Codex，然后双击 **Launch.cmd**。默认英文、单行显示，自动跟随当前聊天。
+打开 Codex，然后双击 **Launch.cmd** 或 **bin\codex-session-bar.exe**。默认英文、单行显示，自动跟随当前聊天。首次启动停留在首页时，也能查看额度、Busy 汇总和最近会话。
 
 ### 可选：登录后自动启动
 

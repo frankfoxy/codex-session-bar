@@ -7,12 +7,11 @@ publishing is authorized. Do not rewrite published history or force-push.
 Run from the repository directory:
 
 ```powershell
-python -B -m unittest discover -s . -p test_session_bar.py -v
-$env:QT_QPA_PLATFORM = 'offscreen'
-python -B session_bar.py --test-ui
+powershell -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1 -Check
+.\bin\codex-session-bar.exe --self-test
 ```
 
-The UI checks use fixtures and do not navigate the user's desktop sessions.
+The Rust unit and UI checks use fixtures and do not navigate the user's desktop sessions.
 For live checks, avoid submitting prompts, stopping work, or changing unrelated
 chats. Use the existing account and desktop connection instead of storing keys.
 
