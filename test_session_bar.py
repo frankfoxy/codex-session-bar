@@ -18,6 +18,14 @@ class DataTests(unittest.TestCase):
         self.assertTrue(all(entry['group'] == 'Flags' for entry in sb.filter_emojis(group='Flags')))
         self.assertEqual(sb.filter_emojis('no-such-emoji-name-xyz'), [])
 
+    def test_default_collection_preserves_original_palette_order(self):
+        entries = sb.filter_emojis(group=sb.DEFAULT_GROUP)
+        self.assertEqual(len(entries), 90)
+        self.assertEqual([entry['emoji'] for entry in entries], sb.DEFAULT_ICONS)
+        self.assertEqual(entries[0]['emoji'], '🔴')
+        self.assertEqual(entries[-1]['emoji'], '🐱')
+        self.assertIn('🚀', [entry['emoji'] for entry in sb.filter_emojis('rocket', sb.DEFAULT_GROUP)])
+
     @unittest.skipUnless(sb.sys.platform == 'win32', 'Windows named events')
     def test_show_signal_is_one_shot_and_closes(self):
         signal = sb.ShowSignal('Local\\codex-session-bar-test-'+str(sb.os.getpid()))

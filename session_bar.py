@@ -36,6 +36,16 @@ INSTANCE_NAME = 'codex-session-bar-' + hashlib.sha256(str(HOME).casefold().encod
 SETTINGS = APP_DIR / "settings.json"
 EMOJI_CATALOG = json.loads((APP_DIR / 'emoji_catalog.json').read_text(encoding='utf-8'))
 EMOJI_ENTRIES = EMOJI_CATALOG['entries']
+DEFAULT_GROUP = '默认集合'
+DEFAULT_ICONS = [
+    '🔴','🟠','🟡','🟢','🔵','🟣','🟤','⚫','⚪','🟥','🟧','🟨','🟩','🟦','🟪','🟫','⬛','⬜',
+    '🚧','✅','⏸️','⏳','❗','📌','⭐','🔥','🆕','👀','🔁','🧊','🔒','❌','🎯','🏁','💯','⚠️',
+    '🐛','🔍','🩺','🚨','💥','🛠️','🩹','🧹','🔬','⏱️','🔌','📦','🧩','⚡','📡','🎛️','🧮','🔋',
+    '💻','🧪','📝','🚀','♻️','🔀','🌿','⚙️','🐍','🌐','🤖','🔐','💡','📚','📊','📈','🧠','❓',
+    '💬','📧','📅','👥','📋','💰','🧾','📞','🌟','🎉','❤️','🍀','☕','🌙','🏠','✈️','🎮','🐱',
+]
+_emoji_by_icon = {entry['emoji']: entry for entry in EMOJI_ENTRIES}
+DEFAULT_ENTRIES = [_emoji_by_icon[icon] for icon in DEFAULT_ICONS]
 ICONS = {entry['emoji'] for entry in EMOJI_ENTRIES}
 ICON_PREFIXES = {}
 for _icon in sorted(ICONS, key=len, reverse=True):
@@ -50,8 +60,9 @@ def random_icon(current):
 
 def filter_emojis(query='', group='All emoji'):
     query = query.strip().casefold()
-    return [entry for entry in EMOJI_ENTRIES
-            if (group == 'All emoji' or entry['group'] == group)
+    entries = DEFAULT_ENTRIES if group == DEFAULT_GROUP else EMOJI_ENTRIES
+    return [entry for entry in entries
+            if (group in ('All emoji', DEFAULT_GROUP) or entry['group'] == group)
             and (not query or query in ' '.join(entry.values()).casefold())]
 
 
@@ -882,7 +893,7 @@ def run_gui(args):
     class EmojiModel(QAbstractListModel):
         def __init__(self, parent):
             super().__init__(parent)
-            self.entries = EMOJI_ENTRIES
+            self.entries = DEFAULT_ENTRIES
 
         def rowCount(self, parent=None):
             return len(self.entries)
@@ -1779,6 +1790,9 @@ def run_gui(args):
                 return
             if self.popup and self.popup_kind == 'icons':
                 self.popup_thread = selected[0]
+                self.emoji_category.setCurrentText(DEFAULT_GROUP)
+                self.emoji_search.clear()
+                self.emoji_view.scrollToTop()
                 self.place_popup(self.popup)
                 self.popup.show()
                 self.last_icon_action = {"phase": "picker_open", "thread": selected[0], "at": time.time()}
@@ -1803,7 +1817,8 @@ def run_gui(args):
             heading.addWidget(shuffle)
             heading.addWidget(QLabel('Session icon'))
             heading.addStretch()
-            heading.addWidget(QLabel(f"{len(EMOJI_ENTRIES):,} emoji · Unicode {EMOJI_CATALOG['version']}"))
+            self.emoji_count = QLabel(f"90 / {len(EMOJI_ENTRIES):,} emoji")
+            heading.addWidget(self.emoji_count)
             layout.addLayout(heading)
             filters = QHBoxLayout()
             self.emoji_search = QLineEdit()
@@ -1811,19 +1826,21 @@ def run_gui(args):
             self.emoji_search.setStyleSheet('background:#1e2327;color:#dce5ea;border:1px solid #47535b;border-radius:5px;padding:5px;')
             filters.addWidget(self.emoji_search, 1)
             self.emoji_category = QComboBox()
-            self.emoji_category.addItems(['All emoji']+list(dict.fromkeys(e['group'] for e in EMOJI_ENTRIES)))
+            self.emoji_category.addItems([DEFAULT_GROUP, 'All emoji']+list(dict.fromkeys(e['group'] for e in EMOJI_ENTRIES)))
             self.emoji_category.setFixedWidth(190)
             filters.addWidget(self.emoji_category)
             layout.addLayout(filters)
             self.emoji_model = EmojiModel(popup)
+            self.emoji_model.modelReset.connect(lambda: self.emoji_count.setText(f"{self.emoji_model.rowCount():,} / {len(EMOJI_ENTRIES):,} emoji"))
             self.emoji_view = QListView()
             self.emoji_view.setModel(self.emoji_model)
-            self.emoji_view.setFont(QFont('Segoe UI Emoji', 16))
+            self.emoji_view.setFont(QFont('Segoe UI Emoji', 15))
             self.emoji_view.setViewMode(QListView.ViewMode.IconMode)
             self.emoji_view.setResizeMode(QListView.ResizeMode.Adjust)
             self.emoji_view.setMovement(QListView.Movement.Static)
-            self.emoji_view.setGridSize(QSize(36, 38))
+            self.emoji_view.setGridSize(QSize(33, 38))
             self.emoji_view.setWordWrap(False)
+            self.emoji_view.setTextElideMode(Qt.TextElideMode.ElideNone)
             self.emoji_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             self.emoji_view.setUniformItemSizes(True)
             self.emoji_view.setLayoutMode(QListView.LayoutMode.Batched)
@@ -2075,7 +2092,9 @@ def run_gui(args):
             icon_open_ms = round((time.perf_counter()-icon_open_started)*1000, 1)
             assert bar.popup.isVisible()
             assert len(bar.popup.findChildren(QPushButton)) == 2
-            assert bar.emoji_model.rowCount() == len(EMOJI_ENTRIES) > 3900
+            assert bar.emoji_category.currentText() == DEFAULT_GROUP
+            assert [e['emoji'] for e in bar.emoji_model.entries] == DEFAULT_ICONS
+            assert bar.emoji_model.rowCount() == 90
             bar.emoji_category.setCurrentText('Flags')
             assert all(entry['group'] == 'Flags' for entry in bar.emoji_model.entries)
             bar.emoji_category.setCurrentText('All emoji')
@@ -2091,6 +2110,7 @@ def run_gui(args):
             bar.update_data(dict(demo_data))
             bar.show_icons()
             bar.emoji_search.clear()
+            bar.emoji_category.setCurrentText(DEFAULT_GROUP)
             random_button = next(button for button in bar.popup.findChildren(QPushButton)
                                  if button.accessibleName() == 'Random icon')
             assert random_button.text() == '🎲'
@@ -2267,6 +2287,7 @@ def run_gui(args):
                               "open_list_order_fixed": True, "icon_picker_reused": True,
                               "random_icon_queued": True, "titlebar_demo_sanitized": True,
                               "hide_restore": True, "emoji_search": True,
+                              "default_collection": 90,
                               "icon_open_ms": icon_open_ms,
                               "screenshot": str(RUNTIME / "ui-verification.png")}))
             bar.quit_bar()
