@@ -46,6 +46,7 @@ const TEXT: u32 = 0xe8eef2;
 const MUTED: u32 = 0xa8b8c4;
 const ORANGE: u32 = 0xf5a34b;
 const GREEN: u32 = 0x65d69b;
+const DETAILS_HEIGHT: i32 = 408;
 thread_local! {static APP:RefCell<Option<App>>=const{RefCell::new(None)};}
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
@@ -1437,6 +1438,17 @@ impl App {
                     TEXT,
                     false,
                 );
+                let version = concat!("v", env!("CARGO_PKG_VERSION"));
+                let version_width = p.width(version, 11.) + 18.;
+                let version_x = width - 16. - version_width;
+                p.fill(rect(version_x, 12., version_width, 23.), 0x303b43, 6.);
+                p.label(
+                    version,
+                    rect(version_x + 9., 12., version_width - 18., 23.),
+                    11.,
+                    MUTED,
+                    false,
+                );
                 area(Hit::Follow, rect(16., 42., width - 32., 27.));
                 p.border(rect(19., 49., 14., 14.), MUTED, 3.);
                 if live.auto_thread {
@@ -1503,44 +1515,21 @@ impl App {
                         .join("   ")
                 };
                 p.label(&quota, rect(16., 167., width - 32., 25.), 12., MUTED, false);
-                let guard_row = rect(16., 202., width - 32., 31.);
-                p.fill(guard_row, 0x293238, 6.);
-                area(Hit::Guard, guard_row);
-                p.label(
-                    "Codex Git memory protection",
-                    rect(27., 202., width - 100., 31.),
-                    12.,
-                    TEXT,
-                    false,
-                );
-                p.toggle(width - 60., 210., live.guard.enabled);
-                p.label(
-                    &format!(
-                        "{} · {} processes / {:.0} GiB · 5s",
-                        live.guard.note,
-                        live.guard.max_processes,
-                        live.guard.max_private_mib as f64 / 1024.
-                    ),
-                    rect(20., 235., width - 40., 29.),
-                    11.,
-                    if live.guard.available { MUTED } else { ORANGE },
-                    false,
-                );
                 for (hit, x) in [
                     (Hit::Refresh, 16.),
                     (Hit::Dock, 58.),
                     (Hit::Quit, width - 52.),
                 ] {
                     if hit == Hit::Refresh {
-                        p.fill(rect(x, 275., 36., 32.), 0x2b3a3c, 5.);
+                        p.fill(rect(x, 202., 36., 32.), 0x2b3a3c, 5.);
                     }
-                    area(hit.clone(), rect(x, 275., 36., 32.));
-                    p.border(rect(x, 275., 36., 32.), 0x47535b, 5.);
-                    p.action_icon(&hit, x + 6., 281.);
+                    area(hit.clone(), rect(x, 202., 36., 32.));
+                    p.border(rect(x, 202., 36., 32.), 0x47535b, 5.);
+                    p.action_icon(&hit, x + 6., 208.);
                 }
                 p.label(
                     &live.action_note,
-                    rect(16., 312., width - 32., 28.),
+                    rect(16., 239., width - 32., 25.),
                     11.,
                     if live.action_note.starts_with("Action failed") {
                         0xf87171
@@ -1551,9 +1540,40 @@ impl App {
                 );
                 p.label(
                     "Ctrl+Alt+J: recent chats · × hides to tray",
-                    rect(16., 345., width - 32., 25.),
+                    rect(16., 270., width - 32., 25.),
                     11.,
                     MUTED,
+                    false,
+                );
+                p.line(16., 305., width - 16., 305., 0x3b484f, 1.);
+                p.label(
+                    "Extensions",
+                    rect(20., 310., width - 40., 25.),
+                    12.,
+                    MUTED,
+                    false,
+                );
+                let guard_row = rect(16., 340., width - 32., 31.);
+                p.fill(guard_row, 0x293238, 6.);
+                area(Hit::Guard, guard_row);
+                p.label(
+                    "Codex Git memory protection",
+                    rect(27., 340., width - 100., 31.),
+                    12.,
+                    TEXT,
+                    false,
+                );
+                p.toggle(width - 60., 348., live.guard.enabled);
+                p.label(
+                    &format!(
+                        "{} · {} processes / {:.0} GiB · 5s",
+                        live.guard.note,
+                        live.guard.max_processes,
+                        live.guard.max_private_mib as f64 / 1024.
+                    ),
+                    rect(20., 373., width - 40., 25.),
+                    11.,
+                    if live.guard.available { MUTED } else { ORANGE },
                     false,
                 );
             }
@@ -2310,7 +2330,7 @@ impl App {
                 [560, 436]
             }
             Popup::Icons => [384, 450],
-            Popup::Details => [560, 380],
+            Popup::Details => [560, DETAILS_HEIGHT],
             Popup::Fixed => [560, 500],
         };
         if kind == Popup::Icons {
@@ -3789,7 +3809,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             &app,
             Some(Popup::Details),
             560,
-            380,
+            DETAILS_HEIGHT as u32,
             &paths.runtime.join("rust-details-verification.png")
         )?
         .iter()
@@ -3858,8 +3878,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             &app,
             Some(Popup::Details),
             560,
-            380,
-            &paths.runtime.join("rust-details-verification.png"),
+            DETAILS_HEIGHT as u32,
+            &paths.runtime.join("rust-details-fixed-verification.png"),
         )?;
         *state.lock().unwrap() = before;
         let _ = app.hit(Hit::Icon);
