@@ -107,6 +107,14 @@ fn display_title(name: Option<&str>, title: &str) -> String {
     }
     "Untitled chat".into()
 }
+pub fn visible_chat_title(label: &str) -> Option<String> {
+    let label = label.trim();
+    match label.to_lowercase().as_str() {
+        "" | "codex" | "chatgpt" | "home" | "首页" => None,
+        "new chat" | "new conversation" | "新聊天" | "新建会话" => Some("New chat".into()),
+        _ => Some(display_title(None, label)),
+    }
+}
 impl Row {
     pub fn rate(&self) -> Option<f64> {
         self.tps.filter(|v| {
@@ -432,9 +440,27 @@ impl Store {
         Ok(rows)
     }
     pub fn resolve(&self, label: &str) -> Result<Option<String>> {
+        if label.trim().is_empty() {
+            return Ok(None);
+        }
         let db = self.db("state_5.sqlite")?;
         let mut q=db.prepare("SELECT id FROM threads WHERE coalesce(nullif(name,''),title)=? AND agent_path IS NULL AND archived=0 LIMIT 2")?;
         let ids = q
+            .query_map([label], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !ids.is_empty() {
+            return Ok(if ids.len() == 1 {
+                ids.into_iter().next()
+            } else {
+                None
+            });
+        }
+        // The frontend can still show the first prompt while its generated name
+        // has already been persisted. Accept that exact alias only if unique.
+        let mut query = db.prepare(
+            "SELECT id FROM threads WHERE title=? AND agent_path IS NULL AND archived=0 LIMIT 2",
+        )?;
+        let ids = query
             .query_map([label], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(if ids.len() == 1 {
@@ -766,6 +792,32 @@ mod tests {
         assert!(store.resolve("duplicate").unwrap().is_none());
         assert!(store.resolve("missing").unwrap().is_none());
         assert_eq!(store.sessions().unwrap().len(), 3);
+        let db = Connection::open(dir.join("state_5.sqlite")).unwrap();
+        db.execute_batch("UPDATE threads SET name='Generated name' WHERE id='one'; UPDATE threads SET name='Second name' WHERE id='two'; UPDATE threads SET name='Third name' WHERE id='three';").unwrap();
+        assert_eq!(store.resolve("unique").unwrap().as_deref(), Some("one"));
+        assert_eq!(
+            store.resolve("Generated name").unwrap().as_deref(),
+            Some("one")
+        );
+        assert!(store.resolve("duplicate").unwrap().is_none());
+        assert_eq!(
+            store.resolve("Second name").unwrap().as_deref(),
+            Some("two")
+        );
+        assert!(store.resolve("  ").unwrap().is_none());
+    }
+
+    #[test]
+    fn visible_title_covers_new_chat_before_metadata_arrives() {
+        assert_eq!(visible_chat_title("New chat").as_deref(), Some("New chat"));
+        assert_eq!(visible_chat_title("新建会话").as_deref(), Some("New chat"));
+        assert_eq!(
+            visible_chat_title("📷 相机采集").as_deref(),
+            Some("📷 相机采集")
+        );
+        for label in ["", "Codex", "ChatGPT", "Home", "首页"] {
+            assert!(visible_chat_title(label).is_none());
+        }
     }
 
     #[test]

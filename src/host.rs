@@ -281,6 +281,7 @@ pub fn start(paths: &Paths, state: &State, stop: &Stop) -> Vec<thread::JoinHandl
                         t.document = None;
                         let mut live = s.lock().unwrap();
                         live.view = None;
+                        live.view_label.clear();
                         if live.auto_thread {
                             live.snapshot = None;
                         }

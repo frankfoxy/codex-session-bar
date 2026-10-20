@@ -168,6 +168,9 @@ fn run() -> Result<()> {
     if args.iter().any(|s| s == "--name-smoke-test") {
         return naming::smoke(&paths);
     }
+    if args.iter().any(|s| s == "--name-context-check") {
+        return naming::inspect_context(&paths);
+    }
     if args.iter().any(|s| s == "--observe") {
         return host::inspect(&paths);
     }

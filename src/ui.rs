@@ -750,10 +750,16 @@ impl App {
     }
     unsafe fn bar_text(&self, live: &crate::Shared) -> (String, String, String, String, String) {
         let current = self.current(live);
+        let visible = live
+            .auto_thread
+            .then(|| data::visible_chat_title(&live.view_label))
+            .flatten();
         let title = current
             .map(|s| self.catalog.strip(&s.label).to_string())
             .unwrap_or_else(|| {
-                if self.identity(live).is_empty() {
+                if let Some(label) = &visible {
+                    self.catalog.strip(label).into()
+                } else if self.identity(live).is_empty() {
                     "Recent chats".into()
                 } else {
                     "Switching…".into()
@@ -761,6 +767,7 @@ impl App {
             });
         let icon = current
             .map(|s| self.catalog.icon(&s.label))
+            .or_else(|| visible.as_ref().map(|s| self.catalog.icon(s)))
             .unwrap_or("◈".into());
         let stale = live.recent.stale || now() - live.recent.loaded_at > 10.;
         let busy = live
@@ -776,6 +783,8 @@ impl App {
             .unwrap_or("Connecting…".into());
         let (tokens, rate, partial) = if let Some(s) = current {
             (s.tokens(), s.rate(), false)
+        } else if visible.is_some() || !self.identity(live).is_empty() {
+            (None, None, false)
         } else {
             live.recent.totals()
         };
@@ -1409,7 +1418,7 @@ impl App {
                     false,
                 );
                 p.label(
-                    "Based on message text · uses your Codex account",
+                    "Based on the last 3 exchanges · uses your Codex account",
                     rect(16., 72., width - 32., 24.),
                     11.,
                     MUTED,
@@ -1428,7 +1437,11 @@ impl App {
                 }
                 p.label(
                     if self.name_status.busy {
-                        "Generating from chat messages…"
+                        if self.name_status.stage.is_empty() {
+                            "Reading recent messages…"
+                        } else {
+                            &self.name_status.stage
+                        }
                     } else if !self.name_status.error.is_empty() {
                         &self.name_status.error
                     } else {
@@ -2636,7 +2649,7 @@ impl App {
         let live = self.snapshot();
         let current = self.current(&live);
         let (_, title, status, _, _) = unsafe { self.bar_text(&live) };
-        self.paths.write(if self.testing{"rust-test-status.json"}else{"live-status.json"},&json!({"pid":std::process::id(),"runtime":"rust","updated_at":now(),"thread":self.identity(&live),"overview":self.identity(&live).is_empty(),"display_title":title,"display_status":status,"tokens":current.and_then(|s|s.tokens()),"auto_thread":live.auto_thread,"topmost":true,"user_hidden":self.hidden,"host_hidden":self.host_hidden,"host_window":live.host,"host_rect":self.last_host,"host_offset":self.settings.host_offset,"titlebar_slot":live.slot,"quota":live.quota,"quota_error":live.quota_error,"recent_cache":{"rows":live.recent.rows.len(),"busy_count":live.recent.busy_count,"stale":live.recent.stale,"error":live.recent.error},"active_view":{"thread":live.view,"label":live.view_label,"available":live.view.is_some(),"source":"uia-current-page"},"action_note":live.action_note,"font":{"chinese":self.painter.chinese,"latin":"Segoe UI","emoji":"Segoe UI Emoji","renderer":"DirectWrite / software Direct2D","antialias":"ClearType","per_monitor_dpi":true}}));
+        self.paths.write(if self.testing{"rust-test-status.json"}else{"live-status.json"},&json!({"pid":std::process::id(),"runtime":"rust","updated_at":now(),"thread":self.identity(&live),"overview":self.identity(&live).is_empty() && data::visible_chat_title(&live.view_label).is_none(),"display_title":title,"display_status":status,"tokens":current.and_then(|s|s.tokens()),"auto_thread":live.auto_thread,"topmost":true,"user_hidden":self.hidden,"host_hidden":self.host_hidden,"host_window":live.host,"host_rect":self.last_host,"host_offset":self.settings.host_offset,"titlebar_slot":live.slot,"quota":live.quota,"quota_error":live.quota_error,"recent_cache":{"rows":live.recent.rows.len(),"busy_count":live.recent.busy_count,"stale":live.recent.stale,"error":live.recent.error},"active_view":{"thread":live.view,"label":live.view_label,"available":live.view.is_some() || data::visible_chat_title(&live.view_label).is_some(),"identity_pending":live.auto_thread && live.view.is_none() && data::visible_chat_title(&live.view_label).is_some(),"source":"uia-current-page"},"action_note":live.action_note,"font":{"chinese":self.painter.chinese,"latin":"Segoe UI","emoji":"Segoe UI Emoji","renderer":"DirectWrite / software Direct2D","antialias":"ClearType","per_monitor_dpi":true}}));
     }
     unsafe fn hit(&mut self, hit: Hit) -> Option<Action> {
         match hit {
@@ -3581,6 +3594,25 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         };
         assert_eq!(app.bar_text(&app.snapshot()).1, "Recent chats");
         assert!(app.current(&app.snapshot()).is_none());
+        {
+            let mut live = state.lock().unwrap();
+            live.view_label = "📷 xxx 新会话".into();
+            // A visible page can precede its database identity or usage snapshot.
+            let text = app.bar_text(&live);
+            assert_eq!(text.0, "📷");
+            assert_eq!(text.1, "xxx 新会话");
+            assert_eq!(text.3, "—");
+            assert_eq!(text.4, "— t/s");
+            live.view = Some("not-yet-loaded".into());
+            assert_eq!(app.bar_text(&live).1, "xxx 新会话");
+            live.view = None;
+            live.view_label = "New chat".into();
+            assert_eq!(app.bar_text(&live).1, "New chat");
+            live.view_label = "Codex".into();
+            assert_eq!(app.bar_text(&live).1, "Recent chats");
+            assert_ne!(app.bar_text(&live).3, "—");
+            live.view_label.clear();
+        }
         assert_eq!(app.catalog.defaults.len(), 90);
         assert!(app.catalog.entries.len() > 3900);
         let avocado = app
