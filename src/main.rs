@@ -3,6 +3,7 @@
 mod data;
 mod desktop;
 mod host;
+mod search;
 mod ui;
 
 use anyhow::{Context, Result};

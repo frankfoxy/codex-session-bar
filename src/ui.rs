@@ -1,7 +1,9 @@
 use crate::{
     data::{self, Catalog, Row},
     desktop::{Action, Workers},
-    host, now, Paths, Settings, State, Stop,
+    host, now,
+    search::ChatSearch,
+    Paths, Settings, State, Stop,
 };
 use anyhow::Result;
 use rand::seq::IteratorRandom;
@@ -22,7 +24,13 @@ use windows::{
         Foundation::*,
         Graphics::{Direct2D::Common::*, Direct2D::*, DirectWrite::*, Dxgi::Common::*, Gdi::*},
         System::{LibraryLoader::*, Threading::*},
-        UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
+        UI::{
+            Controls::*,
+            HiDpi::*,
+            Input::{Ime::*, KeyboardAndMouse::*},
+            Shell::*,
+            WindowsAndMessaging::*,
+        },
     },
 };
 
@@ -133,6 +141,7 @@ enum Hit {
     Refresh,
     Dock,
     Follow,
+    Exact,
     Quit,
 }
 #[derive(Clone)]
@@ -333,6 +342,9 @@ struct App {
     popup_hits: Vec<Area>,
     filters: Vec<usize>,
     chat_filters: Vec<usize>,
+    chat_search: ChatSearch,
+    search_exact: bool,
+    chat_scroll_drag: Option<f32>,
     chat_cursor: usize,
     groups: Vec<String>,
     category: String,
@@ -432,6 +444,9 @@ impl App {
             popup_hits: Vec::new(),
             filters,
             chat_filters: Vec::new(),
+            chat_search: ChatSearch::default(),
+            search_exact: false,
+            chat_scroll_drag: None,
             chat_cursor: 0,
             groups,
             category: "默认集合".into(),
@@ -676,7 +691,43 @@ impl App {
                 p.line(x + 16., 13., x + 8., 21., MUTED, 1.3);
             }
             Some(Popup::Recent) => {
-                p.label("Recent chats", rect(14., 8., 112., 30.), 13., TEXT, false);
+                p.fill(rect(16., 13., 260., 36.), 0x1c2125, 6.);
+                p.border(rect(16., 13., 260., 36.), 0x43515a, 6.);
+                if self.testing {
+                    p.label(
+                        if self.search.is_empty() {
+                            "Search chats / pinyin…"
+                        } else {
+                            &self.search
+                        },
+                        rect(27., 14., 238., 34.),
+                        13.,
+                        MUTED,
+                        false,
+                    );
+                }
+                let exact = rect(288., 14., 80., 34.);
+                area(Hit::Exact, exact);
+                p.fill(
+                    exact,
+                    if self.search_exact {
+                        0x294438
+                    } else {
+                        0x30383e
+                    },
+                    6.,
+                );
+                p.label(
+                    if self.search_exact {
+                        "✓  Exact"
+                    } else {
+                        "Exact"
+                    },
+                    rect(298., 14., 70., 34.),
+                    12.,
+                    if self.search_exact { GREEN } else { MUTED },
+                    false,
+                );
                 let (tokens, rate, partial) = live.recent.totals();
                 let total = format!(
                     "Total {}{} t/s  ·  {}{} TOK",
@@ -685,14 +736,26 @@ impl App {
                     data::compact(tokens),
                     if partial && tokens.is_some() { "*" } else { "" }
                 );
-                p.label(&total, rect(130., 8., 400., 30.), 12., MUTED, false);
-                area(Hit::Refresh, rect(width - 78., 9., 64., 28.));
-                p.label("Refresh", rect(width - 74., 9., 60., 28.), 11., TEXT, false);
-                for (index, row) in self.rows.iter().enumerate() {
-                    let y = 46. + index as f32 * 43.;
+                area(Hit::Refresh, rect(width - 80., 14., 64., 34.));
+                p.label(
+                    "Refresh",
+                    rect(width - 74., 14., 60., 34.),
+                    11.,
+                    TEXT,
+                    false,
+                );
+                for (slot, &index) in self
+                    .chat_filters
+                    .iter()
+                    .skip(self.scroll)
+                    .take(8)
+                    .enumerate()
+                {
+                    let row = &self.rows[index];
+                    let y = 60. + slot as f32 * 43.;
                     let busy = row.state == "Busy";
                     let current = row.id == self.identity(&live);
-                    let r = rect(12., y, width - 24., 39.);
+                    let r = rect(12., y, width - 30., 39.);
                     p.fill(
                         r,
                         if current {
@@ -704,8 +767,8 @@ impl App {
                         },
                         7.,
                     );
-                    if current {
-                        p.border(r, 0x527b69, 7.);
+                    if current || self.chat_cursor == self.scroll + slot {
+                        p.border(r, if current { 0x527b69 } else { 0x59849c }, 7.);
                     }
                     area(Hit::Recent(row.id.clone()), r);
                     p.label(
@@ -748,32 +811,59 @@ impl App {
                             ORANGE
                         } else if row.state == "Done" {
                             GREEN
+                        } else if row.state == "Failed" {
+                            0xf87171
+                        } else if row.state == "Waiting" {
+                            ORANGE
                         } else {
                             MUTED
                         },
                         false,
                     );
                 }
-                if self.rows.is_empty() {
+                if self.chat_filters.is_empty() {
                     p.label(
-                        if live.recent.error.is_empty() {
+                        if !self.rows.is_empty() {
+                            "No matching chats"
+                        } else if live.recent.error.is_empty() {
                             "Loading recent chats…"
                         } else {
                             "Cached list unavailable · refresh pending"
                         },
-                        rect(16., 50., width - 32., 45.),
+                        rect(20., 86., width - 40., 45.),
                         13.,
                         MUTED,
                         false,
                     );
                 }
+                if self.chat_filters.len() > 8 {
+                    let thumb = (337. * 8. / self.chat_filters.len() as f32).max(20.);
+                    let offset =
+                        (337. - thumb) * self.scroll as f32 / (self.chat_filters.len() - 8) as f32;
+                    p.fill(rect(width - 11., 62., 4., 337.), 0x303c44, 2.);
+                    p.fill(rect(width - 11., 62. + offset, 4., thumb), 0x6f8b9d, 2.);
+                }
+                let hint = if live.recent.stale || now() - live.recent.loaded_at > 10. {
+                    " · Cached"
+                } else {
+                    ""
+                };
+                p.line(16., height - 38., width - 16., height - 38., 0x354148, 1.);
                 p.label(
-                    if live.recent.stale || now() - live.recent.loaded_at > 10. {
-                        "Cached · Refresh pending"
-                    } else {
-                        "Order stays fixed while open · Busy first on reopen"
-                    },
-                    rect(16., height - 29., width - 32., 24.),
+                    &format!(
+                        "{} / {} chats{hint}",
+                        self.chat_filters.len(),
+                        self.rows.len()
+                    ),
+                    rect(16., height - 29., 240., 24.),
+                    11.,
+                    MUTED,
+                    false,
+                );
+                let tw = p.width(&total, 11.).min(width - 290.);
+                p.label(
+                    &total,
+                    rect(width - 16. - tw, height - 29., tw + 1., 24.),
                     11.,
                     MUTED,
                     false,
@@ -1205,6 +1295,25 @@ impl App {
         if self.popup_kind == Some(Popup::Fixed) && !live.recent.all_rows.is_empty() {
             self.rows = data::stable_rows(&self.rows, &live.recent.all_rows);
         }
+        if matches!(self.popup_kind, Some(Popup::Recent | Popup::Fixed))
+            && self.chat_search.sync(&self.rows, &self.catalog)
+        {
+            // A renamed title may change a filter match; keep the visible anchor
+            // and selection rather than resetting the user's scroll position.
+            let top = self.chat_filters.get(self.scroll).copied();
+            let selected = self.chat_filters.get(self.chat_cursor).copied();
+            self.chat_filters =
+                self.chat_search
+                    .filter(&self.rows, &self.search, self.search_exact);
+            self.scroll = top
+                .and_then(|i| self.chat_filters.iter().position(|&v| v == i))
+                .unwrap_or(self.scroll)
+                .min(self.chat_filters.len().saturating_sub(8));
+            self.chat_cursor = selected
+                .and_then(|i| self.chat_filters.iter().position(|&v| v == i))
+                .unwrap_or(self.chat_cursor)
+                .min(self.chat_filters.len().saturating_sub(1));
+        }
         let host = host::bounds(live.host);
         if !self.testing {
             if self.hidden || !host::shown(live.host) {
@@ -1321,6 +1430,9 @@ impl App {
         let _ = Shell_NotifyIconW(if add { NIM_ADD } else { NIM_DELETE }, &data);
     }
     unsafe fn close_popup(&mut self) {
+        if self.chat_scroll_drag.take().is_some() {
+            let _ = ReleaseCapture();
+        }
         let _ = ShowWindow(self.popup, SW_HIDE);
         self.popup_kind = None;
         self.hover = None;
@@ -1372,7 +1484,7 @@ impl App {
         self.popup_size = match kind {
             Popup::Recent => {
                 self.rows = live.recent.rows.clone();
-                [650, ((self.rows.len().max(1) * 43) as i32) + 80]
+                [650, 448]
             }
             Popup::Icons => [384, 450],
             Popup::Details => [560, 310],
@@ -1430,22 +1542,25 @@ impl App {
                 LPARAM(w!("Search emoji…").as_ptr() as isize),
             );
         }
-        if kind == Popup::Fixed {
-            self.rows = if !live.recent.all_rows.is_empty() {
-                live.recent.all_rows.clone()
-            } else if self.testing {
-                self.rows.clone()
-            } else {
-                data::stable_rows(
-                    &data::Store::new(&self.paths).sessions().unwrap_or_default(),
-                    &live.recent.rows,
-                )
-            };
-            self.rows.sort_by_key(|r| r.state != "Busy");
+        if matches!(kind, Popup::Recent | Popup::Fixed) {
+            if kind == Popup::Fixed {
+                self.rows = if !live.recent.all_rows.is_empty() {
+                    live.recent.all_rows.clone()
+                } else if self.testing {
+                    self.rows.clone()
+                } else {
+                    data::stable_rows(
+                        &data::Store::new(&self.paths).sessions().unwrap_or_default(),
+                        &live.recent.rows,
+                    )
+                };
+                self.rows.sort_by_key(|r| r.state != "Busy");
+            }
             self.search.clear();
+            self.search_exact = false;
             self.scroll = 0;
             self.filter_fixed();
-            if !live.auto_thread {
+            if kind == Popup::Fixed && !live.auto_thread {
                 self.chat_cursor = self
                     .chat_filters
                     .iter()
@@ -1459,8 +1574,8 @@ impl App {
                 w!(""),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
                 27,
-                55,
-                506,
+                if kind == Popup::Recent { 19 } else { 55 },
+                if kind == Popup::Recent { 238 } else { 506 },
                 24,
                 self.popup,
                 HMENU(103isize as *mut _),
@@ -1470,8 +1585,8 @@ impl App {
             let _ = SendMessageW(
                 self.edit,
                 EM_SETCUEBANNER,
-                WPARAM(0),
-                LPARAM(w!("Search chats…").as_ptr() as isize),
+                WPARAM(1),
+                LPARAM(w!("Search chats / pinyin…").as_ptr() as isize),
             );
         }
         let previous_font = self.edit_font;
@@ -1508,7 +1623,7 @@ impl App {
         if !self.testing {
             let _ = ShowWindow(self.popup, SW_SHOW);
             let _ = SetForegroundWindow(self.popup);
-            if matches!(kind, Popup::Icons | Popup::Fixed) {
+            if matches!(kind, Popup::Icons | Popup::Fixed | Popup::Recent) {
                 let _ = SetFocus(self.edit);
             }
         }
@@ -1560,6 +1675,8 @@ impl App {
         for (child, x, y, cw, ch) in [
             if self.popup_kind == Some(Popup::Fixed) {
                 (self.edit, 27, 55, 506, 24)
+            } else if self.popup_kind == Some(Popup::Recent) {
+                (self.edit, 27, 19, 238, 24)
             } else {
                 (self.edit, 14, 49, 190, 29)
             },
@@ -1687,6 +1804,12 @@ impl App {
                 self.settings();
                 let _ = InvalidateRect(self.popup, None, false);
             }
+            Hit::Exact => {
+                self.search_exact = !self.search_exact;
+                self.filter_fixed();
+                let _ = InvalidateRect(self.popup, None, false);
+                let _ = SetFocus(self.edit);
+            }
             Hit::Quit => {
                 self.quit = true;
                 self.stop.store(true, Ordering::Relaxed);
@@ -1709,14 +1832,10 @@ impl App {
         let _ = InvalidateRect(self.popup, None, false);
     }
     fn filter_fixed(&mut self) {
-        let query = self.search.trim().to_lowercase();
+        self.chat_search.sync(&self.rows, &self.catalog);
         self.chat_filters = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| query.is_empty() || row.label.to_lowercase().contains(&query))
-            .map(|(index, _)| index)
-            .collect();
+            .chat_search
+            .filter(&self.rows, &self.search, self.search_exact);
         self.chat_cursor = 0;
         self.scroll = 0;
     }
@@ -1734,6 +1853,25 @@ impl App {
     }
     fn fixed_hit_at(&self, x: f32, y: f32) -> Option<Hit> {
         let width = self.popup_size[0] as f32;
+        if self.popup_kind == Some(Popup::Recent) {
+            if (288. ..368.).contains(&x) && (14. ..48.).contains(&y) {
+                return Some(Hit::Exact);
+            }
+            if (width - 80. ..width - 16.).contains(&x) && (14. ..48.).contains(&y) {
+                return Some(Hit::Refresh);
+            }
+            if !(12. ..width - 18.).contains(&x)
+                || !(60. ..404.).contains(&y)
+                || (y - 60.) % 43. >= 39.
+            {
+                return None;
+            }
+            let slot = self.scroll + ((y - 60.) / 43.) as usize;
+            return self
+                .chat_filters
+                .get(slot)
+                .map(|&index| Hit::Recent(self.rows[index].id.clone()));
+        }
         if (width - 74. ..width - 16.).contains(&x) && (9. ..39.).contains(&y) {
             return Some(Hit::Back);
         }
@@ -1749,24 +1887,94 @@ impl App {
             .map(|&index| Hit::Fixed(self.rows[index].id.clone()))
     }
     unsafe fn fixed_key(&mut self, key: u32) -> bool {
-        if self.popup_kind != Some(Popup::Fixed) {
+        if !matches!(self.popup_kind, Some(Popup::Fixed | Popup::Recent)) {
             return false;
+        }
+        // Let the Chinese IME use Enter/arrows to select and commit candidates.
+        let ime = ImmGetContext(self.edit);
+        if !ime.is_invalid() {
+            let composing = ImmGetCompositionStringW(ime, GCS_COMPSTR, None, 0) > 0;
+            let _ = ImmReleaseContext(self.edit, ime);
+            if composing {
+                return false;
+            }
         }
         match key {
             k if k == VK_UP.0 as u32 => self.move_fixed_cursor(-1),
             k if k == VK_DOWN.0 as u32 => self.move_fixed_cursor(1),
+            k if k == VK_PRIOR.0 as u32 => self.move_fixed_cursor(-8),
+            k if k == VK_NEXT.0 as u32 => self.move_fixed_cursor(8),
             k if k == VK_RETURN.0 as u32 => {
                 if let Some(&index) = self.chat_filters.get(self.chat_cursor) {
-                    let _ = self.hit(Hit::Fixed(self.rows[index].id.clone()));
+                    let hit = if self.popup_kind == Some(Popup::Recent) {
+                        Hit::Recent(self.rows[index].id.clone())
+                    } else {
+                        Hit::Fixed(self.rows[index].id.clone())
+                    };
+                    if let Some(action) = self.hit(hit) {
+                        ACTIONS.with(|sender| {
+                            if let Some(sender) = sender.borrow().as_ref() {
+                                let _ = sender.send(action);
+                            }
+                        });
+                    }
                 }
             }
             k if k == VK_ESCAPE.0 as u32 => {
-                let _ = self.popup(Popup::Details);
+                if self.popup_kind == Some(Popup::Recent) {
+                    self.close_popup();
+                } else {
+                    let _ = self.popup(Popup::Details);
+                }
             }
             _ => return false,
         }
         let _ = InvalidateRect(self.popup, None, false);
         true
+    }
+    fn chat_scroll_geometry(&self) -> Option<(f32, f32, f32)> {
+        if self.chat_filters.len() <= 8 {
+            return None;
+        }
+        let (top, height) = match self.popup_kind {
+            Some(Popup::Recent) => (62., 337.),
+            Some(Popup::Fixed) => (100., 350.),
+            _ => return None,
+        };
+        Some((
+            top,
+            height,
+            (height * 8. / self.chat_filters.len() as f32).max(20.),
+        ))
+    }
+    unsafe fn begin_chat_scroll(&mut self, x: f32, y: f32) -> bool {
+        let Some((top, height, thumb)) = self.chat_scroll_geometry() else {
+            return false;
+        };
+        let width = self.popup_size[0] as f32;
+        if !(width - 17. ..width - 4.).contains(&x) || !(top..top + height).contains(&y) {
+            return false;
+        }
+        let offset = (height - thumb) * self.scroll as f32 / (self.chat_filters.len() - 8) as f32;
+        self.chat_scroll_drag = Some(if (top + offset..top + offset + thumb).contains(&y) {
+            y - top - offset
+        } else {
+            thumb / 2.
+        });
+        let _ = SetCapture(self.popup);
+        self.drag_chat_scroll(y);
+        true
+    }
+    unsafe fn drag_chat_scroll(&mut self, y: f32) {
+        if let (Some(grab), Some((top, height, thumb))) =
+            (self.chat_scroll_drag, self.chat_scroll_geometry())
+        {
+            self.scroll = (((y - top - grab) / (height - thumb)).clamp(0., 1.)
+                * (self.chat_filters.len() - 8) as f32)
+                .round() as usize;
+            self.chat_cursor = self.chat_cursor.clamp(self.scroll, self.scroll + 7);
+            let _ = InvalidateRect(self.popup, None, false);
+        }
     }
 }
 
@@ -1809,7 +2017,9 @@ unsafe extern "system" fn wndproc(
                 Some(LRESULT(0))
             }
             WM_MOUSEMOVE => {
-                if let Some((start, original)) = app.drag {
+                if app.chat_scroll_drag.is_some() {
+                    app.drag_chat_scroll(y);
+                } else if let Some((start, original)) = app.drag {
                     let mut point = POINT::default();
                     let _ = GetCursorPos(&mut point);
                     let _ = SetWindowPos(
@@ -1835,6 +2045,9 @@ unsafe extern "system" fn wndproc(
                 Some(LRESULT(0))
             }
             WM_LBUTTONDOWN => {
+                if !is_bar && app.begin_chat_scroll(x, y) {
+                    return Some(LRESULT(0));
+                }
                 if is_bar
                     && app
                         .hits
@@ -1851,7 +2064,9 @@ unsafe extern "system" fn wndproc(
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {
-                if app.drag.take().is_some() {
+                if app.chat_scroll_drag.take().is_some() {
+                    let _ = ReleaseCapture();
+                } else if app.drag.take().is_some() {
                     let _ = ReleaseCapture();
                     if let (Some(current), Some(host)) =
                         (host::bounds(app.bar.0 as isize), app.last_host)
@@ -1864,7 +2079,9 @@ unsafe extern "system" fn wndproc(
                     }
                 } else {
                     let areas = if is_bar { &app.hits } else { &app.popup_hits };
-                    let hit = if !is_bar && app.popup_kind == Some(Popup::Fixed) {
+                    let hit = if !is_bar
+                        && matches!(app.popup_kind, Some(Popup::Fixed | Popup::Recent))
+                    {
                         app.fixed_hit_at(x, y)
                     } else {
                         areas
@@ -1884,7 +2101,9 @@ unsafe extern "system" fn wndproc(
                 }
                 Some(LRESULT(0))
             }
-            WM_MOUSEWHEEL if !is_bar && app.popup_kind == Some(Popup::Fixed) => {
+            WM_MOUSEWHEEL
+                if !is_bar && matches!(app.popup_kind, Some(Popup::Fixed | Popup::Recent)) =>
+            {
                 let delta = ((wparam.0 >> 16) as i16) as i32;
                 app.scroll = if delta < 0 {
                     (app.scroll + 3).min(app.chat_filters.len().saturating_sub(8))
@@ -2051,6 +2270,18 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
         APP.with(|a| *a.borrow_mut() = Some(app));
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            // The search edit owns focus; wheel scrolling still belongs to its list.
+            if msg.message == WM_MOUSEWHEEL {
+                if let Some(popup) = APP.with(|slot| {
+                    slot.try_borrow().ok().and_then(|a| {
+                        a.as_ref()
+                            .filter(|app| app.owns_popup_window(msg.hwnd))
+                            .map(|app| app.popup)
+                    })
+                }) {
+                    msg.hwnd = popup;
+                }
+            }
             if msg.message == WM_KEYDOWN
                 && APP.with(|slot| {
                     let Ok(mut value) = slot.try_borrow_mut() else {
@@ -2188,12 +2419,12 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         };
         state.lock().unwrap().quota = vec![quota];
         state.lock().unwrap().quota_at = now();
-        let rows: Vec<Row> = (0..10)
+        let rows: Vec<Row> = (0..40)
             .map(|i| Row {
                 id: format!("fixture-{i}"),
                 label: format!(
                     "{} xxx 会话名称 {}",
-                    ["🧪", "🚧", "🚀", "💬", "🎯", "📦", "💻", "🧠", "🌈", "📷"][i],
+                    ["🧪", "🚧", "🚀", "💬", "🎯", "📦", "💻", "🧠", "🌈", "📷"][i % 10],
                     i + 1
                 ),
                 state: if i < 3 { "Busy".into() } else { "Done".into() },
@@ -2201,6 +2432,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
                 tps: Some(42.3),
                 rate_at: Some(now()),
                 started_at: Some(now() - 754.),
+                updated_at: now() - i as f64 * 60.,
                 ..Default::default()
             })
             .collect();
@@ -2217,6 +2449,26 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert_eq!(app.catalog.defaults.len(), 90);
         assert!(app.catalog.entries.len() > 3900);
         app.popup(Popup::Recent)?;
+        assert_eq!(app.rows.len(), 40);
+        assert_eq!(app.popup_size, [650, 448]);
+        app.search = "huihuamingcheng 25".into();
+        app.filter_fixed();
+        assert_eq!(app.chat_filters, [24]);
+        app.search_exact = true;
+        app.filter_fixed();
+        assert!(app.chat_filters.is_empty());
+        app.search = "xxx 会话名称 25".into();
+        app.filter_fixed();
+        assert_eq!(app.chat_filters, [24]);
+        app.search_exact = false;
+        app.search.clear();
+        app.filter_fixed();
+        app.move_fixed_cursor(24);
+        assert_eq!(app.scroll, 17);
+        assert_eq!(
+            app.fixed_hit_at(80., 381.),
+            Some(Hit::Recent(rows[24].id.clone()))
+        );
         let original = app.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
         let mut changed = rows.clone();
         changed.reverse();
@@ -2225,6 +2477,29 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             app.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
             original
         );
+        state.lock().unwrap().recent.rows.reverse();
+        for _ in 0..100 {
+            app.tick();
+        }
+        assert_eq!(app.popup_kind, Some(Popup::Recent));
+        assert_eq!(app.scroll, 17);
+        assert_eq!(
+            app.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            original
+        );
+        assert!(app.begin_chat_scroll(640., 394.));
+        app.drag_chat_scroll(1000.);
+        assert_eq!(app.scroll, 32);
+        app.chat_scroll_drag = None;
+        let _ = ReleaseCapture();
+        app.search = "mingcheng 25".into();
+        app.filter_fixed();
+        let (actions, received) = std::sync::mpsc::channel();
+        ACTIONS.with(|a| *a.borrow_mut() = Some(actions));
+        assert!(app.fixed_key(VK_RETURN.0 as u32));
+        assert!(matches!(received.try_recv().unwrap(), Action::Navigate(id) if id == rows[24].id));
+        ACTIONS.with(|a| *a.borrow_mut() = None);
+        state.lock().unwrap().recent.rows = rows.clone();
         app.close_popup();
         let snap = data::Snapshot {
             id: "fixture-0".into(),
@@ -2260,13 +2535,26 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         )?;
         app.popup_kind = Some(Popup::Recent);
         app.rows = rows.clone();
+        app.search.clear();
+        app.filter_fixed();
         capture(
             &app,
             Some(Popup::Recent),
             650,
-            510,
+            448,
             &paths.runtime.join("rust-recent-verification.png"),
         )?;
+        app.search = "mingcheng 2".into();
+        app.filter_fixed();
+        capture(
+            &app,
+            Some(Popup::Recent),
+            650,
+            448,
+            &paths.runtime.join("rust-recent-search-verification.png"),
+        )?;
+        app.search.clear();
+        app.filter_fixed();
         app.popup_kind = Some(Popup::Icons);
         capture(
             &app,
@@ -2301,7 +2589,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         );
         app.search = "名称 2".into();
         app.filter_fixed();
-        assert_eq!(app.chat_filters.len(), 1);
+        assert_eq!(app.chat_filters.len(), 13);
         assert_eq!(app.rows[app.chat_filters[0]].id, rows[1].id);
         assert_eq!(
             app.fixed_hit_at(80., 120.),
@@ -2369,7 +2657,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert!(app.hidden);
         app.hidden = false;
         app.diagnostic();
-        paths.write("rust-ui-test.json",&json!({"ui":"pass","runtime":"rust","emoji_count":app.catalog.entries.len(),"default_collection":90,"recent_rows":10,"startup_home_quota":true,"open_list_order_fixed":true,"random_icon_bound":true,"drag_grip_separate":true,"fixed_chat_picker_survives_100_refreshes":true,"fixed_chat_search":true,"fixed_chat_keyboard_scroll":true,"fixed_chat_color_icons":true,"emoji_dropdown_survives_100_refreshes":true,"fixed_chat_selection":true,"font_chinese":app.painter.chinese,"renderer":"DirectWrite + software Direct2D"}));
+        paths.write("rust-ui-test.json",&json!({"ui":"pass","runtime":"rust","emoji_count":app.catalog.entries.len(),"default_collection":90,"recent_rows":40,"recent_search_pinyin":true,"recent_search_exact":true,"recent_scroll_drag":true,"recent_scroll_survives_100_refreshes":true,"recent_keyboard_navigation":true,"startup_home_quota":true,"open_list_order_fixed":true,"random_icon_bound":true,"drag_grip_separate":true,"fixed_chat_picker_survives_100_refreshes":true,"fixed_chat_search":true,"fixed_chat_keyboard_scroll":true,"fixed_chat_color_icons":true,"emoji_dropdown_survives_100_refreshes":true,"fixed_chat_selection":true,"font_chinese":app.painter.chinese,"renderer":"DirectWrite + software Direct2D"}));
         println!(
             "{}",
             json!({"ui":"pass","emoji":app.catalog.entries.len(),"font":app.painter.chinese,"screenshots":paths.runtime.to_string_lossy()})

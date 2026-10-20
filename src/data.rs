@@ -4,7 +4,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     time::Duration,
@@ -200,12 +200,13 @@ pub fn stable_rows(previous: &[Row], incoming: &[Row]) -> Vec<Row> {
     if previous.is_empty() {
         return incoming.to_vec();
     }
+    let incoming: HashMap<_, _> = incoming.iter().map(|r| (r.id.as_str(), r)).collect();
     previous
         .iter()
         .map(|old| {
             incoming
-                .iter()
-                .find(|r| r.id == old.id)
+                .get(old.id.as_str())
+                .copied()
                 .unwrap_or(old)
                 .clone()
         })
@@ -332,7 +333,7 @@ impl Store {
     }
     pub fn sessions(&self) -> Result<Vec<Row>> {
         let db = self.db("state_5.sqlite")?;
-        let mut query=db.prepare("SELECT id,coalesce(nullif(name,''),title),updated_at FROM threads WHERE archived=0 AND agent_path IS NULL ORDER BY updated_at DESC LIMIT 50")?;
+        let mut query=db.prepare("SELECT id,coalesce(nullif(name,''),title),updated_at FROM threads WHERE archived=0 AND agent_path IS NULL ORDER BY updated_at DESC,id")?;
         let rows = query
             .query_map([], |r| {
                 Ok(Row {
@@ -455,25 +456,28 @@ impl Store {
         Ok(data)
     }
     pub fn recent(&mut self, payload: &Value) -> Result<Recent> {
-        let db = self.db("state_5.sqlite")?;
         let history = self.db("thread_history_1.sqlite")?;
-        let mut seen = HashSet::new();
-        let mut rows = Vec::new();
-        for entry in ["pinnedThreads", "threads"]
+        let entries: HashMap<_, _> = ["pinnedThreads", "threads"]
             .iter()
             .flat_map(|key| payload[*key].as_array().into_iter().flatten())
-        {
-            let Some(id) = entry["id"].as_str() else {
-                continue;
-            };
-            if entry["kind"] != "codex"
-                || entry["hostId"].as_str().is_some_and(|v| v != "local")
-                || !seen.insert(id.to_string())
-            {
-                continue;
-            }
-            if !db.query_row("SELECT EXISTS(SELECT 1 FROM threads WHERE id=? AND archived=0 AND agent_path IS NULL)",[id],|r|r.get::<_,bool>(0))? {continue;}
-            let turn=history.query_row("SELECT status FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1",[id],|r|r.get::<_,String>(0)).optional()?.unwrap_or_default();
+            .filter(|entry| {
+                entry["kind"] == "codex" && !entry["hostId"].as_str().is_some_and(|v| v != "local")
+            })
+            .filter_map(|entry| entry["id"].as_str().map(|id| (id, entry)))
+            .collect();
+        // Local metadata supplies the complete list even when the app's status
+        // snapshot is bounded. Fetch token logs only for confirmed busy chats.
+        let mut rows = self.sessions()?;
+        let mut turns = history.prepare("SELECT status FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1")?;
+        for row in &mut rows {
+            let entry = entries
+                .get(row.id.as_str())
+                .copied()
+                .unwrap_or(&Value::Null);
+            let turn = turns
+                .query_row([&row.id], |r| r.get::<_, String>(0))
+                .optional()?
+                .unwrap_or_default();
             let state = match entry["status"].as_str().unwrap_or("") {
                 "active" | "busy" | "running" | "inProgress" => "Busy",
                 "needsAttention" | "needs_attention" | "waiting" | "blocked" => "Waiting",
@@ -483,31 +487,33 @@ impl Store {
                     "interrupted" => "Stopped",
                     _ => "Ready",
                 },
-                _ => "Unknown",
+                _ => match turn.as_str() {
+                    "completed" => "Done",
+                    "failed" => "Failed",
+                    "interrupted" => "Stopped",
+                    _ => "Unknown",
+                },
             };
-            let mut row = Row {
-                id: id.into(),
-                label: entry["title"].as_str().unwrap_or("Untitled chat").into(),
-                state: state.into(),
-                updated_at: entry["updatedAt"].as_f64().unwrap_or(0.0),
-                ..Row::default()
-            };
+            row.state = state.into();
+            let updated = entry["updatedAt"]
+                .as_f64()
+                .map(|t| if t > 1e12 { t / 1000. } else { t })
+                .or_else(|| entry["updatedAt"].as_str().and_then(timestamp))
+                .unwrap_or(0.);
+            row.updated_at = row.updated_at.max(updated);
             if state == "Busy" {
-                if let Ok(snapshot) = self.read(id) {
+                if let Ok(snapshot) = self.read(&row.id) {
                     row.tokens = snapshot.tokens();
                     row.started_at = snapshot.turn.started_at;
                     row.tps = snapshot.rate();
                     row.rate_at = snapshot.output_rate.as_ref().map(|r| r.end);
                 }
             }
-            rows.push(row);
         }
         let busy_metrics: Vec<Row> = rows.iter().filter(|r| r.state == "Busy").cloned().collect();
         rows.sort_by(|a, b| b.updated_at.total_cmp(&a.updated_at).then(a.id.cmp(&b.id)));
         let mut all_rows = rows.clone();
         all_rows.sort_by_key(|r| r.state != "Busy");
-        rows.truncate(10);
-        rows.sort_by_key(|r| r.state != "Busy");
         Ok(Recent {
             all_rows,
             rows,
@@ -524,11 +530,19 @@ fn timestamp(value: &str) -> Option<f64> {
         .map(|t| t.timestamp_millis() as f64 / 1000.0)
 }
 pub fn load_recent(paths: &Paths) -> Recent {
-    let mut recent: Recent =
-        serde_json::from_value(read_json(&paths.runtime.join("recent-cache.json"), 65536))
-            .unwrap_or_default();
+    let mut recent: Recent = serde_json::from_value(read_json(
+        &paths.runtime.join("recent-cache.json"),
+        1024 * 1024,
+    ))
+    .unwrap_or_default();
     recent.stale = true;
-    recent.rows.truncate(10);
+    // Upgrade old caches, whose `rows` contained only ten busy-first entries.
+    if !recent.all_rows.is_empty() {
+        recent.rows = recent.all_rows.clone();
+    }
+    recent
+        .rows
+        .sort_by(|a, b| b.updated_at.total_cmp(&a.updated_at).then(a.id.cmp(&b.id)));
     recent
 }
 
@@ -598,6 +612,44 @@ mod tests {
         assert!(store.resolve("duplicate").unwrap().is_none());
         assert!(store.resolve("missing").unwrap().is_none());
         assert_eq!(store.sessions().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn recent_includes_all_local_chats_in_recency_order_even_beyond_rpc_window() {
+        let (paths, dir) = fixture("all-recent");
+        let mut db = Connection::open(dir.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT,name TEXT,title TEXT,archived INTEGER,agent_path TEXT,updated_at INTEGER);").unwrap();
+        let tx = db.transaction().unwrap();
+        for i in 0..80 {
+            tx.execute(
+                "INSERT INTO threads VALUES(?,NULL,?,0,NULL,?)",
+                rusqlite::params![format!("chat-{i}"), format!("会话 {i}"), 10000 - i],
+            )
+            .unwrap();
+        }
+        tx.execute(
+            "INSERT INTO threads VALUES('child',NULL,'child',0,'agent',20000)",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO threads VALUES('archived',NULL,'old',1,NULL,30000)",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let history = Connection::open(dir.join("thread_history_1.sqlite")).unwrap();
+        history.execute_batch("CREATE TABLE thread_turns(thread_id TEXT,status TEXT,rollout_ordinal INTEGER); INSERT INTO thread_turns VALUES('chat-0','completed',1);").unwrap();
+        let mut store = Store::new(&paths);
+        let recent = store.recent(&serde_json::json!({"threads":[{"kind":"codex","hostId":"local","id":"chat-79","status":"active"}]})).unwrap();
+        assert_eq!(recent.rows.len(), 80);
+        assert_eq!(recent.rows[0].id, "chat-0");
+        assert_eq!(recent.rows[0].state, "Done");
+        assert_eq!(recent.rows[79].id, "chat-79");
+        assert_eq!(recent.rows[79].state, "Busy");
+        assert_eq!(recent.all_rows[0].id, "chat-79");
+        assert_eq!(recent.busy_count, Some(1));
+        assert_eq!(recent.rows[1].state, "Unknown");
     }
 
     #[test]
