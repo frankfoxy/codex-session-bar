@@ -1,10 +1,7 @@
 settings.json
 bin/
 target/
-__pycache__/
 tmp/
-.venv/
-*.py[cod]
 *.log
 *.jsonl
 *.sqlite*

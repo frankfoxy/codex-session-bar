@@ -4,9 +4,9 @@
 
 **默认停靠在 Codex 标题栏的空白区中央**，自动避开左侧菜单和右侧窗口按钮。当前会话、Token、生成速度和剩余额度，一行看全；窗口移动、最小化和恢复时，悬浮条一起跟随。
 
-**Rust 原生 Windows 版** · 运行不需要 Python 或 Qt · 中文使用微软雅黑，支持多屏 DPI 缩放。
+**v0.1.0 · Rust 原生 Windows 版** · 运行不需要 Python 或 Qt · 中文使用微软雅黑，支持多屏 DPI 缩放。
 
-![默认在标题栏空白区居中停靠，菜单与窗口按钮保持可用；下方放大展示悬浮条](preview-docking.svg)
+![默认在标题栏空白区居中停靠，菜单与窗口按钮保持可用；下方放大展示悬浮条](assets/images/preview-docking.svg)
 
 空间足够时自动居中停靠；窗口过窄时移到标题栏下方，避免遮挡操作区域。也可以拖动调整位置，在设置中点击停靠图标恢复自动位置。
 
@@ -18,7 +18,7 @@
 
 ## 01 · 进度与额度，一条看全
 
-![单行状态悬浮条](preview-bar.png)
+![单行状态悬浮条](assets/images/preview-bar.png)
 
 - **正在忙几个？** 橙色 `Busy (5)` 显示运行中的会话数量。
 - **用了多少、跑得多快？** 同行显示当前会话累计 Token、输出 `t/s` 和本轮耗时。
@@ -29,7 +29,7 @@
 
 点击悬浮条上的**会话名称**，或按 **Ctrl + Alt + J**，展开或收起会话列表；快捷键也能恢复隐藏的悬浮条。
 
-![最近会话列表与运行中会话的汇总指标](preview-chats.png)
+![最近会话列表与运行中会话的汇总指标](assets/images/preview-chats.png)
 
 - **最近使用优先**，只列出本机有可读正文缓存或日志的会话，不显示只有元数据的记录。支持滚轮、拖动滚动条和方向键浏览；Busy 用橙色状态和底色区分。
 - **输入即筛选**：支持中文、英文、全拼、拼音首字母及多音字，多个关键词用空格分隔，支持部分名称匹配。
@@ -41,17 +41,17 @@
 - **后台预加载**，点击即可显示已有列表；点击会话名称切换，点击图标编辑图标。
 - **选择时不跳动**：列表打开期间固定条目顺序和滚动位置，状态和数值继续更新；关闭后再打开，才按最新使用时间排序。
 
-![可选正文搜索与匹配分类，示例会话按 Busy、名称和正文命中排序](preview-body-search.png)
+![可选正文搜索与匹配分类，示例会话按 Busy、名称和正文命中排序](assets/images/preview-body-search.png)
 
 需要持续盯住一个会话时，在详情里点击 **Choose a fixed chat…**。彩色 Emoji 和状态帮助区分会话，支持搜索、滚轮浏览及方向键选择；确认后关闭自动跟随，固定显示选定会话。
 
-![深色固定会话选择面板，带彩色 Emoji、Busy 状态和选中标记](preview-fixed-chats.png)
+![深色固定会话选择面板，带彩色 Emoji、Busy 状态和选中标记](assets/images/preview-fixed-chats.png)
 
 ## 03 · 给会话一个容易认的图标
 
 点击悬浮条左端图标，修改当前会话的图标。也可直接点击 Recent 或固定会话列表中的图标：选择面板优先在列表左侧展开，空间不足时自动避让，原列表保持可见；选完图标、按 Esc 或返回列表后，搜索条件、滚动位置及选中项都保留。
 
-![完整 Emoji 面板，最左边骰子按钮可随机选择](preview-icons.png?v=rust)
+![完整 Emoji 面板，最左边骰子按钮可随机选择](assets/images/preview-icons.png?v=rust)
 
 **首屏是“默认集合”**：保留原来的 90 个常用图标及排列顺序。下拉选择 **All emoji** 可浏览 Unicode Emoji 18.0 全集的 3,972 个图标与组件，也可选择其他分类。输入英文名称或 Emoji 时，始终搜索完整图标库，包含肤色、国旗和组合 Emoji；清空搜索后恢复原分类。
 
@@ -63,7 +63,13 @@
 
 运行需要 **Windows 10/11、Node.js、已登录的 Codex Desktop**，以及桌面自带的 App Tools 插件。无需安装 Python、Qt 或额外的 Codex CLI。
 
-以下是从源码构建的步骤，需要已安装 **Rust MSVC 工具链和 Visual Studio C++ Build Tools**。已构建的程序可直接运行。
+### 下载即用（推荐）
+
+到 [v0.1.0 发布页](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.1.0) 下载 **codex-session-bar-0.1.0-windows-x64.zip**，解压到固定目录，打开 Codex 后双击 **Launch.cmd**。无需编译；可用同页的 `SHA256SUMS.txt` 校验下载文件。GitHub 的 **Source code** 附件是源码包。
+
+### 从源码构建
+
+需要 **Rust MSVC 工具链和 Visual Studio C++ Build Tools**。
 
 **1. 获取项目**
 
@@ -114,12 +120,12 @@ Codex 关闭时工具在后台等待，重新打开后自动出现。安装时�
 | :--- | :--- |
 | `27.2M` / `TOK` | 会话累计 Token，包含重复发送的上下文；不是费用金额 |
 | `t/s` | 最近保存样本的输出 Token 速度，包含采样间的工具和网络等待 |
-| `Busy (N)` / `Total` | 全部已扫描的本地 Busy 主会话，可能多于列表中的 10 条 |
+| `Busy (N)` / `Total` | 全部已扫描的本地 Busy 主会话，不受列表当前可见条数限制 |
 | 电池百分比 | 账户共享的剩余额度 |
 | `—` / `*` | 数据暂不可用 / 数据不完整或沿用缓存，悬停可查看说明 |
 
 本项目是独立的 Windows 伴随工具。Codex 更新可能影响兼容性；出现无法识别当前聊天或连接失败时，会明确提示。
 
-[开发与故障排查](DEVELOPMENT.md) · [参与贡献](CONTRIBUTING.md)
+[开发与故障排查](DEVELOPMENT.md) · [参与贡献](CONTRIBUTING.md) · [打包与发布](RELEASING.md)
 
 Emoji 数据来自 [Unicode 官方 Emoji 数据](https://unicode.org/Public/emoji/latest/)，许可见 [UNICODE-LICENSE.txt](UNICODE-LICENSE.txt)。

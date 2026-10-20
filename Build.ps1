@@ -1,4 +1,4 @@
-param([switch]$Check)
+param([switch]$Check, [switch]$NoInstall)
 $ErrorActionPreference = 'Stop'
 $workspace = if ($env:CODEX_SESSION_BAR_WORKSPACE) {
     (Resolve-Path -LiteralPath $env:CODEX_SESSION_BAR_WORKSPACE).Path
@@ -32,7 +32,12 @@ if ($Check) {
 }
 & (Join-Path $toolchain 'cargo.exe') build --release --locked --jobs 2 --manifest-path $manifest
 if ($LASTEXITCODE -ne 0) { throw 'Rust build failed' }
+$artifact = Join-Path $env:CARGO_TARGET_DIR 'release/codex-session-bar.exe'
+if ($NoInstall) {
+    Write-Output ('Built ' + $artifact)
+    return
+}
 $destination = Join-Path $PSScriptRoot 'bin'
 [IO.Directory]::CreateDirectory($destination) | Out-Null
-Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'release/codex-session-bar.exe') -Destination (Join-Path $destination 'codex-session-bar.exe') -Force
+Copy-Item -LiteralPath $artifact -Destination (Join-Path $destination 'codex-session-bar.exe') -Force
 Write-Output ('Built ' + (Join-Path $destination 'codex-session-bar.exe'))

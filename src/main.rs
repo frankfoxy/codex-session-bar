@@ -156,8 +156,12 @@ pub type State = Arc<Mutex<Shared>>;
 pub type Stop = Arc<AtomicBool>;
 
 fn run() -> Result<()> {
-    let paths = Paths::discover()?;
     let args: Vec<String> = env::args().collect();
+    if args.iter().any(|s| s == "--version" || s == "-V") {
+        println!("Codex Session Bar {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    let paths = Paths::discover()?;
     if args.iter().any(|s| s == "--self-test") {
         return ui::self_test(&paths);
     }

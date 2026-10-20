@@ -1,8 +1,9 @@
 # Development and troubleshooting
 
 The default runtime is the Rust executable in `bin/codex-session-bar.exe`.
-The earlier Python sources remain as migration reference; launchers and the
-scheduled task use Rust and do not start Python, Qt or a WebView. Status polling does not start an independent Codex app-server.
+Only the Rust runtime is maintained. Launchers and the scheduled task do not
+start Python, Qt or a WebView. Status polling does not start an independent
+Codex app-server.
 
 ## Build and verification
 
@@ -26,6 +27,18 @@ Inspect its PNGs before changing curated README previews. The other two probes
 are read-only: `--inspect` checks real recent-chat and quota RPC responses;
 `--observe` checks window identity, titlebar bounds and local usage. Neither
 navigates chats, renames them, submits prompts or resumes work.
+
+## Repository layout and releases
+
+- `src/`: native Rust application.
+- `assets/images/`: sanitized README screenshots and docking illustration.
+- `emoji_catalog.json`: runtime emoji catalog.
+- `Build.ps1`: build/test; `-NoInstall` keeps the installed executable untouched.
+- `Package.ps1`: build/test and stage an allowlisted Windows x64 ZIP plus SHA-256.
+- `RELEASING.md`: version, tag, publishing and upgrade steps.
+
+`--version` prints the Cargo package version without opening the UI or creating runtime files.
+Build output and release staging live under workspace `tmp`, not in Git.
 
 ## Data and desktop integration
 
