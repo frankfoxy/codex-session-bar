@@ -50,7 +50,7 @@ const GREEN: u32 = 0x65d69b;
 const NEW_RESULT: u32 = 0x70b7ff;
 const DETAILS_HEIGHT: i32 = 310;
 const PREFERENCES_HEIGHT: i32 = 464;
-const RECENT_ROW: i32 = 72;
+const RECENT_ROW: i32 = 48;
 const LAYOUT_CACHE_LIMIT: usize = 256;
 const RECENT_TOP: i32 = 48;
 const RECENT_FRAME: i32 = 92;
@@ -209,7 +209,7 @@ struct Painter {
     target: ID2D1DCRenderTarget,
     text: IDWriteFactory,
     formats: RefCell<HashMap<String, IDWriteTextFormat>>,
-    layouts: RefCell<HashMap<(String,u32,u32,u32,bool,bool),(IDWriteTextLayout,u64)>>,
+    layouts: RefCell<HashMap<(String,u32,u32,u32,bool,bool,u8),(IDWriteTextLayout,u64)>>,
     measurements: RefCell<HashMap<(String,u32),f32>>,
     layout_clock: Cell<u64>,
     brushes: RefCell<HashMap<u32,ID2D1SolidColorBrush>>,
@@ -290,7 +290,7 @@ impl Painter {
     }
     unsafe fn label(&self, text: &str, r: D2D_RECT_F, size: f32, rgb: u32, emoji: bool) {
         let _ = (|| -> Result<()> {
-            let layout = self.layout(text,size,emoji,(r.right-r.left).max(1.),(r.bottom-r.top).max(1.),false)?;
+            let layout = self.layout(text,size,emoji,(r.right-r.left).max(1.),(r.bottom-r.top).max(1.),false,0)?;
             let brush = self.brush(rgb)?;
             self.target.DrawTextLayout(
                 D2D_POINT_2F {
@@ -361,7 +361,17 @@ impl Painter {
     }
     fn release_layouts(&self){self.layouts.borrow_mut().clear();self.measurements.borrow_mut().clear();}
     unsafe fn wrapped_label(&self,text:&str,r:D2D_RECT_F,size:f32,rgb:u32){
-        if let Ok(layout)=self.layout(text,size,false,(r.right-r.left).max(1.),(r.bottom-r.top).max(1.),true){
+        if let Ok(layout)=self.layout(text,size,false,(r.right-r.left).max(1.),(r.bottom-r.top).max(1.),true,0){
+            if let Ok(brush)=self.brush(rgb){self.target.DrawTextLayout(D2D_POINT_2F{x:r.left,y:r.top},&layout,&brush,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT|D2D1_DRAW_TEXT_OPTIONS_CLIP);}
+        }
+    }
+    unsafe fn centered_title(&self,text:&str,r:D2D_RECT_F){
+        if let Ok(layout)=self.layout(text,13.,false,(r.right-r.left).max(1.),(r.bottom-r.top).max(1.),true,1){
+            if let Ok(brush)=self.brush(TEXT){self.target.DrawTextLayout(D2D_POINT_2F{x:r.left,y:r.top},&layout,&brush,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT|D2D1_DRAW_TEXT_OPTIONS_CLIP);}
+        }
+    }
+    unsafe fn right_label(&self,text:&str,r:D2D_RECT_F,size:f32,rgb:u32){
+        if let Ok(layout)=self.layout(text,size,false,(r.right-r.left).max(1.),(r.bottom-r.top).max(1.),false,2){
             if let Ok(brush)=self.brush(rgb){self.target.DrawTextLayout(D2D_POINT_2F{x:r.left,y:r.top},&layout,&brush,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT|D2D1_DRAW_TEXT_OPTIONS_CLIP);}
         }
     }
@@ -3077,12 +3087,14 @@ impl App {
             if !(left..width-18.).contains(&x)||!(top..top+self.list_page_rows() as f32*rh).contains(&y)||(y-top)%rh>=rh-4.{return None;}
             let slot=self.scroll+((y-top)/rh) as usize;
             let &i=self.chat_filters.get(slot)?;let row=&self.rows[i];
-            if (left+6. ..left+36.).contains(&x)&&(y-top)%rh<34.{return Some(Hit::ChatIcon(row.id.clone()));}
-            if !self.settings.compact_recent && (y-top)%rh>=43. {
-                if x>=width-49.{return Some(Hit::TagEdit(row.id.clone()));}
+            let local_y=(y-top)%rh;let icon_top=if self.settings.compact_recent{4.}else{7.};
+            if (left+6. ..left+36.).contains(&x)&&(icon_top..icon_top+30.).contains(&local_y){return Some(Hit::ChatIcon(row.id.clone()));}
+            if !self.settings.compact_recent && (21. ..44.).contains(&local_y) {
+                let columns=self.recent_columns();
+                if(columns.meta_right-24. ..columns.meta_right).contains(&x){return Some(Hit::TagEdit(row.id.clone()));}
                 let (_,tags,hidden)=unsafe{self.tag_layout(row)};
                 for(tag,tx,w)in tags{if(tx..tx+w).contains(&x){return Some(Hit::TagFilter(tag.key));}}
-                if hidden>0&&x>=width-79.{return Some(Hit::TagEdit(row.id.clone()));}
+                if hidden>0&&(columns.meta_right-54. ..columns.meta_right-28.).contains(&x){return Some(Hit::TagEdit(row.id.clone()));}
             }
             return Some(Hit::Recent(row.id.clone()));
         }
@@ -3845,7 +3857,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         let _ = app.hit(Hit::Body);
         assert!(!app.search_body);
         assert_eq!(app.rows.len(), 40);
-        assert_eq!(app.popup_size, [820, RECENT_FRAME + 8 * RECENT_ROW]);
+        assert_eq!(app.popup_size, [1220, RECENT_FRAME + 8 * RECENT_ROW]);
         app.search = "huihuamingcheng 25".into();
         app.filter_fixed();
         assert_eq!(app.chat_filters, [24]);
@@ -3875,7 +3887,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             app.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
             original
         );
-        assert!(app.begin_chat_scroll(810., 382.));
+        assert!(app.begin_chat_scroll(app.popup_size[0] as f32-10., 382.));
         app.drag_chat_scroll(1000.);
         assert_eq!(app.scroll, 32);
         app.chat_scroll_drag = None;
@@ -3929,7 +3941,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            820,
+            1220,
             (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-recent-verification.png"),
         )?;
@@ -4048,7 +4060,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            820,
+            1220,
             (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-background-index-verification.png"),
         )?;
@@ -4059,7 +4071,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            820,
+            1220,
             (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-recent-search-verification.png"),
         )?;
@@ -4094,7 +4106,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            820,
+            1220,
             (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-recent-body-verification.png"),
         )?;
@@ -4260,17 +4272,17 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert_eq!(app.settings.recent_rows, 10);
         assert_eq!(app.settings.recent_shortcut.label(), "Ctrl+Alt+K");
         app.popup(Popup::Recent)?;
-        assert_eq!(app.popup_size, [820, RECENT_FRAME + 10 * RECENT_ROW]);
+        assert_eq!(app.popup_size, [1220, RECENT_FRAME + 10 * RECENT_ROW]);
         assert_eq!(app.list_page_rows(), 10);
         assert_eq!(app.fixed_hit_at(80., (RECENT_TOP + 9 * RECENT_ROW + 10) as f32), Some(Hit::Recent(rows[9].id.clone())));
-        assert!(app.begin_chat_scroll(810., 450.));
+        assert!(app.begin_chat_scroll(app.popup_size[0] as f32-10., 450.));
         app.drag_chat_scroll(10000.);
         assert_eq!(app.scroll, 30);
         app.chat_scroll_drag = None;
         let _ = ReleaseCapture();
         app.scroll = 0;
         app.chat_cursor = 0;
-        capture(&app, Some(Popup::Recent), 820, (RECENT_FRAME + 10 * RECENT_ROW) as u32, &paths.runtime.join("rust-recent-configured-verification.png"))?;
+        capture(&app, Some(Popup::Recent), 1220, (RECENT_FRAME + 10 * RECENT_ROW) as u32, &paths.runtime.join("rust-recent-configured-verification.png"))?;
         app.popup(Popup::Preferences)?;
         app.hit(Hit::ShortcutEnabled);
         app.hit(Hit::ApplyPreferences);

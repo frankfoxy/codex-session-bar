@@ -3,6 +3,16 @@
 const TAG_SIDEBAR: f32 = 236.;
 const TAG_CLOUD_TOP: f32 = RECENT_TOP as f32 + 64.;
 const TAG_REGION_MAX: f32 = 128.;
+#[derive(Clone, Copy)]
+struct RecentColumns {
+    title_left: f32,
+    title_width: f32,
+    preview_left: f32,
+    preview_width: f32,
+    meta_left: f32,
+    meta_width: f32,
+    meta_right: f32,
+}
 struct TagCloudItem {
     index: usize,
     r: D2D_RECT_F,
@@ -74,7 +84,7 @@ impl App {
         let base = if self.settings.compact_recent {
             640
         } else {
-            820
+            1220
         };
         let requested = base
             + if self.sidebar_open {
@@ -329,10 +339,31 @@ impl App {
         }
         Ok(())
     }
-    unsafe fn tag_layout(&self, row: &Row) -> (f32, Vec<(tags::Tag, f32, f32)>, usize) {
+    fn recent_columns(&self) -> RecentColumns {
         let width = self.popup_size[0] as f32;
+        let left = self.recent_left();
+        let content = (width - left - 18.).max(300.);
+        let meta_width = (content * 0.30).clamp(200., 280.);
+        let meta_right = width - 99.;
+        let meta_left = meta_right - meta_width;
+        let title_left = left + 42.;
+        let title_width = (self.settings.recent_title_width.clamp(140, 280) as f32)
+            .min((meta_left - 18. - title_left - 18. - 100.).max(80.));
+        let preview_left = title_left + title_width + 18.;
+        RecentColumns {
+            title_left,
+            title_width,
+            preview_left,
+            preview_width: (meta_left - 18. - preview_left).max(40.),
+            meta_left,
+            meta_width,
+            meta_right,
+        }
+    }
+    unsafe fn tag_layout(&self, row: &Row) -> (f32, Vec<(tags::Tag, f32, f32)>, usize) {
         let tags = self.custom_tags.for_row(row);
-        let budget = ((width - self.recent_left() - 65.) * 0.48).clamp(120., 380.);
+        let columns = self.recent_columns();
+        let budget = columns.meta_width - 26.;
         let mut used = 0.;
         let mut result = Vec::new();
         for tag in tags.iter().take(3) {
@@ -351,7 +382,7 @@ impl App {
         }
         let hidden = tags.len() - result.len();
         let extra = if hidden > 0 { 28. } else { 0. };
-        let start = width - 51. - used - extra;
+        let start = columns.meta_right - 26. - used - extra;
         let mut x = start;
         for (_, tx, w) in &mut result {
             *tx = x;
@@ -718,12 +749,13 @@ impl App {
                 );
             }
             area(Hit::Recent(row.id.clone()), r);
-            let icon_r = rect(left + 6., y + 4., 30., 30.);
+            let icon_y = y + if self.settings.compact_recent { 4. } else { 7. };
+            let icon_r = rect(left + 6., icon_y, 30., 30.);
             area(Hit::ChatIcon(row.id.clone()), icon_r);
             p.fill(icon_r, 0x303b43, 7.);
             p.label(
                 &self.catalog.icon(&row.label),
-                rect(left + 10., y + 2., 25., 34.),
+                rect(left + 10., icon_y - 2., 25., 34.),
                 17.,
                 TEXT,
                 true,
@@ -735,7 +767,7 @@ impl App {
             } else {
                 24.
             };
-            let title_width = self.settings.recent_title_width.clamp(140, 280) as f32;
+            let columns = self.recent_columns();
             if self.settings.compact_recent {
                 p.label(
                     self.catalog.strip(&row.label),
@@ -745,11 +777,9 @@ impl App {
                     false,
                 );
             } else {
-                p.wrapped_label(
+                p.centered_title(
                     self.catalog.strip(&row.label),
-                    rect(left + 42., y + 5., title_width, 32.),
-                    13.,
-                    TEXT,
+                    rect(columns.title_left, y + 6., columns.title_width, 32.),
                 );
             }
             let metrics = if busy {
@@ -768,20 +798,34 @@ impl App {
                     row.total_seconds.map(data::duration).unwrap_or("—".into())
                 )
             };
-            p.label(
-                &metrics,
-                if self.settings.compact_recent {
-                    rect(metric_x, y + 2., metric_width, line_h)
-                } else {
-                    rect(left + 42., y + 43., 225., 22.)
-                },
-                10.,
-                MUTED,
-                false,
-            );
+            if self.settings.compact_recent {
+                p.label(
+                    &metrics,
+                    rect(metric_x, y + 2., metric_width, line_h),
+                    10.,
+                    MUTED,
+                    false,
+                );
+            } else {
+                p.right_label(
+                    &metrics,
+                    rect(columns.meta_left, y + 1., columns.meta_width, 20.),
+                    10.,
+                    MUTED,
+                );
+            }
             p.label(
                 &row.status_text(),
-                rect(width - 85., y + 2., 70., line_h),
+                rect(
+                    width - 85.,
+                    y + 2.,
+                    70.,
+                    if self.settings.compact_recent {
+                        line_h
+                    } else {
+                        40.
+                    },
+                ),
                 11.,
                 match row.state.as_str() {
                     "Busy" | "Waiting" => ORANGE,
@@ -797,7 +841,7 @@ impl App {
                     y + if self.settings.compact_recent {
                         19.
                     } else {
-                        14.
+                        22.
                     },
                     3.3,
                     NEW_RESULT,
@@ -813,8 +857,7 @@ impl App {
                     && self.body_only.contains(&row.id)
             });
             let preview = snippet.unwrap_or(&row.prompt);
-            let preview_x = left + 42. + title_width + 18.;
-            let preview_r = rect(preview_x, y + 6., (width - 105. - preview_x).max(40.), 30.);
+            let preview_r = rect(columns.preview_left, y + 7., columns.preview_width, 30.);
             if snippet.is_some() {
                 p.highlighted_label(preview, preview_r, 12., &self.search, false);
             } else {
@@ -825,30 +868,31 @@ impl App {
                     MUTED,
                 );
             }
+            let edit_x = columns.meta_right - 24.;
             for (tag, x, w) in tags {
-                self.paint_tag(&tag, x, y + 45., w, self.tag_filters.contains(&tag.key));
-                area(Hit::TagFilter(tag.key), rect(x, y + 45., w, 20.));
+                self.paint_tag(&tag, x, y + 23., w, self.tag_filters.contains(&tag.key));
+                area(Hit::TagFilter(tag.key), rect(x, y + 23., w, 20.));
             }
             if hidden > 0 {
                 p.label(
                     &format!("+{hidden}"),
-                    rect(width - 79., y + 45., 26., 20.),
+                    rect(columns.meta_right - 54., y + 23., 26., 20.),
                     10.,
                     MUTED,
                     false,
                 );
                 area(
                     Hit::TagEdit(row.id.clone()),
-                    rect(width - 79., y + 45., 26., 20.),
+                    rect(columns.meta_right - 54., y + 23., 26., 20.),
                 );
             }
             area(
                 Hit::TagEdit(row.id.clone()),
-                rect(width - 49., y + 43., 30., 25.),
+                rect(edit_x, y + 21., 24., 23.),
             );
-            p.border(rect(width - 43., y + 49., 12., 10.), 0x91a8b5, 2.);
-            p.line(width - 40., y + 54., width - 34., y + 54., MUTED, 1.);
-            p.line(width - 37., y + 51., width - 37., y + 57., MUTED, 1.);
+            p.border(rect(edit_x + 6., y + 27., 12., 10.), 0x91a8b5, 2.);
+            p.line(edit_x + 9., y + 32., edit_x + 15., y + 32., MUTED, 1.);
+            p.line(edit_x + 12., y + 29., edit_x + 12., y + 35., MUTED, 1.);
         }
         if self.chat_filters.is_empty() {
             p.label(
@@ -1192,6 +1236,7 @@ impl Painter {
         w: f32,
         h: f32,
         wrap: bool,
+        align: u8,
     ) -> Result<IDWriteTextLayout> {
         let key = (
             text.to_string(),
@@ -1200,6 +1245,7 @@ impl Painter {
             h.to_bits(),
             emoji,
             wrap,
+            align,
         );
         let clock = self.layout_clock.get().wrapping_add(1);
         self.layout_clock.set(clock);
@@ -1210,6 +1256,12 @@ impl Painter {
         let f = self.format(size, emoji, text)?;
         let chars: Vec<u16> = text.encode_utf16().collect();
         let layout = self.text.CreateTextLayout(&chars, &f, w, h)?;
+        if align == 1 {
+            layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+        }
+        if align == 2 {
+            layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+        }
         if wrap {
             layout.SetWordWrapping(DWRITE_WORD_WRAPPING_CHARACTER)?;
             layout.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, size + 3., size)?;
@@ -1265,7 +1317,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     let order = app.chat_filters.clone();
     let _ = app.hit(Hit::TagSidebar);
     assert!(app.sidebar_open);
-    assert_eq!(app.popup_size[0], 1056);
+    assert_eq!(app.popup_size[0], 1456);
     assert_eq!(app.chat_filters, order);
     assert_eq!(app.scroll, 2);
     assert_eq!(app.chat_cursor, 3);
@@ -1275,7 +1327,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     app.popup_hits = capture(
         app,
         Some(Popup::Recent),
-        1056,
+        1456,
         h,
         &paths.runtime.join("rust-tags-expanded-verification.png"),
     )?;
@@ -1320,7 +1372,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     app.popup_hits = capture(
         app,
         Some(Popup::Recent),
-        1056,
+        1456,
         h,
         &paths.runtime.join("rust-tags-editor-verification.png"),
     )?;
@@ -1334,11 +1386,11 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     assert!(app.tag_editor.is_none());
     let _ = app.hit(Hit::TagSidebar);
     assert!(!app.sidebar_open);
-    assert_eq!(app.popup_size[0], 820);
+    assert_eq!(app.popup_size[0], 1220);
     app.popup_hits = capture(
         app,
         Some(Popup::Recent),
-        820,
+        1220,
         h,
         &paths.runtime.join("rust-tags-collapsed-verification.png"),
     )?;
@@ -1376,7 +1428,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     );
     let _ = app.hit(Hit::Compact);
     assert!(!app.settings.compact_recent);
-    assert_eq!(app.popup_size, [820, RECENT_FRAME + 10 * RECENT_ROW]);
+    assert_eq!(app.popup_size, [1220, RECENT_FRAME + 10 * RECENT_ROW]);
     app.search = "mingcheng 2".into();
     app.filter_fixed();
     let title_hits = app.chat_filters.clone();
@@ -1435,7 +1487,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     capture(
         app,
         Some(Popup::Recent),
-        1056,
+        1456,
         h,
         &paths.runtime.join("rust-tags-regions-verification.png"),
     )?;
@@ -1462,7 +1514,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     capture(
         app,
         Some(Popup::Recent),
-        1056,
+        1456,
         h,
         &paths.runtime.join("rust-tags-pinyin-verification.png"),
     )?;
@@ -1579,7 +1631,7 @@ unsafe fn verify_filter_controls(app: &mut App, paths: &Paths) -> Result<()> {
     capture(
         app,
         Some(Popup::Recent),
-        820,
+        1220,
         app.popup_size[1] as u32,
         &paths.runtime.join("rust-list-hover-verification.png"),
     )?;
@@ -1592,7 +1644,7 @@ unsafe fn verify_filter_controls(app: &mut App, paths: &Paths) -> Result<()> {
     capture(
         app,
         Some(Popup::Recent),
-        820,
+        1220,
         app.popup_size[1] as u32,
         &paths.runtime.join("rust-search-clear-verification.png"),
     )?;
@@ -1642,12 +1694,12 @@ unsafe fn verify_memory_cache(app: &mut App, paths: &Paths) -> Result<()> {
     app.close_popup();
     let before = private_bytes();
     let hot = "常用会话名称";
-    let hot_layout = app.painter.layout(hot, 13., false, 200., 40., true)?;
+    let hot_layout = app.painter.layout(hot, 13., false, 200., 40., true, 0)?;
     for i in 0..3000 {
         let text = format!("变化中的统计 {i} TOK · 12:{:02}", i % 60);
-        let _ = app.painter.layout(&text, 11., false, 250., 24., false)?;
+        let _ = app.painter.layout(&text, 11., false, 250., 24., false, 0)?;
         let _ = app.painter.width(&text, 11.);
-        let same = app.painter.layout(hot, 13., false, 200., 40., true)?;
+        let same = app.painter.layout(hot, 13., false, 200., 40., true, 0)?;
         assert_eq!(same, hot_layout);
         assert!(app.painter.layouts.borrow().len() <= LAYOUT_CACHE_LIMIT);
     }
@@ -1677,15 +1729,45 @@ unsafe fn verify_two_columns(app: &mut App, paths: &Paths) -> Result<()> {
     app.popup_hits = capture(
         app,
         Some(Popup::Recent),
-        820,
+        1220,
         h,
         &paths.runtime.join("rust-two-column-verification.png"),
     )?;
-    assert_eq!(app.recent_row_height(), 72);
+    assert_eq!(app.recent_row_height(), 48);
+    assert_eq!(RECENT_TOP, 48); // The list starts directly below the toolbar, without column headings.
+    let normal_size = app.popup_size;
+    for (width, sidebar) in [(1220, false), (1456, true), (900, true), (820, false)] {
+        app.popup_size[0] = width;
+        app.sidebar_open = sidebar;
+        for configured in [140, 200, 280] {
+            app.settings.recent_title_width = configured;
+            let c = app.recent_columns();
+            assert!(c.title_left + c.title_width < c.preview_left);
+            assert!(c.preview_left + c.preview_width <= c.meta_left - 17.);
+            let (_, tags, _) = app.tag_layout(&app.rows[first]);
+            assert!(tags
+                .iter()
+                .all(|(_, x, w)| *x >= c.meta_left && x + w <= c.meta_right - 26.));
+        }
+    }
+    app.sidebar_open = false;
+    app.popup_size = normal_size;
+    app.settings.recent_title_width = 200;
+    for name in ["会话名称", "较长的会话名称需要自动换成两行并保持居中"] {
+        let title = app.painter.layout(name, 13., false, 200., 32., true, 1)?;
+        assert_eq!(title.GetTextAlignment(), DWRITE_TEXT_ALIGNMENT_CENTER);
+        assert_eq!(
+            title.GetParagraphAlignment(),
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER
+        );
+        let leading = app.painter.layout(name, 13., false, 200., 32., true, 0)?;
+        assert_ne!(title, leading);
+        assert_eq!(leading.GetTextAlignment(), DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
     let (_, tags, _) = app.tag_layout(&app.rows[first]);
     if let Some((tag, x, _)) = tags.first() {
         assert_eq!(
-            app.fixed_hit_at(x + 5., RECENT_TOP as f32 + 52.),
+            app.fixed_hit_at(x + 5., RECENT_TOP as f32 + 30.),
             Some(Hit::TagFilter(tag.key.clone()))
         );
     }
@@ -1697,7 +1779,7 @@ unsafe fn verify_two_columns(app: &mut App, paths: &Paths) -> Result<()> {
     capture(
         app,
         Some(Popup::Recent),
-        820,
+        1220,
         h,
         &paths
             .runtime
@@ -1733,6 +1815,6 @@ unsafe fn verify_two_columns(app: &mut App, paths: &Paths) -> Result<()> {
     )?;
     let saved: Settings = serde_json::from_value(serde_json::to_value(&app.settings)?)?;
     assert_eq!(saved.recent_title_width, 200);
-    paths.write("rust-two-column-test.json",&json!({"two_line_title_and_prompt":true,"body_highlight":true,"tag_hit_positions":true,"width_setting_range":[140,280],"settings_roundtrip":true,"compact_unchanged":true}));
+    paths.write("rust-two-column-test.json",&json!({"two_line_title_and_prompt":true,"total_row_height":48,"column_headings":false,"name_only_column":true,"centered_single_and_double_line_titles":true,"narrow_and_sidebar_columns_do_not_overlap":true,"body_highlight":true,"tag_hit_positions":true,"width_setting_range":[140,280],"settings_roundtrip":true,"compact_unchanged":true}));
     Ok(())
 }
