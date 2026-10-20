@@ -372,7 +372,11 @@ impl Painter {
         self.circle(x + if on { 20. } else { 8. }, y + 8., 6., 0xffffff);
     }
     unsafe fn action_icon(&self, hit: &Hit, x: f32, y: f32) {
-        let c = MUTED;
+        let c = if *hit == Hit::Refresh {
+            0xaed8cc
+        } else {
+            MUTED
+        };
         match hit {
             Hit::Body => {
                 self.line(x + 1., y + 3., x + 18., y + 3., c, 1.4);
@@ -382,20 +386,32 @@ impl Painter {
                 self.line(x + 18., y + 15., x + 22., y + 19., TEXT, 1.5);
             }
             Hit::Refresh => {
-                for i in 0..28 {
-                    let a = -0.7 + i as f32 * 0.18;
-                    let b = a + 0.18;
-                    self.line(
-                        x + 11. + 8. * a.cos(),
-                        y + 10. + 8. * a.sin(),
-                        x + 11. + 8. * b.cos(),
-                        y + 10. + 8. * b.sin(),
-                        c,
-                        1.5,
-                    );
+                // Two opposing arcs and aligned arrowheads form a clear refresh
+                // glyph; the old single arc resembled a power switch.
+                for start in [-165_f32, 15.] {
+                    for i in 0..30 {
+                        let a = (start + i as f32 * 5.).to_radians();
+                        let b = (start + (i + 1) as f32 * 5.).to_radians();
+                        self.line(
+                            x + 11. + 8. * a.cos(),
+                            y + 11. + 8. * a.sin(),
+                            x + 11. + 8. * b.cos(),
+                            y + 11. + 8. * b.sin(),
+                            c,
+                            1.7,
+                        );
+                    }
                 }
-                self.line(x + 17., y + 0., x + 17., y + 6., c, 1.5);
-                self.line(x + 17., y + 6., x + 11., y + 6., c, 1.5);
+                for (ax, ay, bx, by) in [
+                    (19., 4., 19., 9.),
+                    (19., 9., 14., 9.),
+                    (3., 18., 3., 13.),
+                    (3., 13., 8., 13.),
+                ] {
+                    self.line(x + ax, y + ay, x + bx, y + by, c, 1.7);
+                    self.circle(x + ax, y + ay, 0.85, c);
+                    self.circle(x + bx, y + by, 0.85, c);
+                }
             }
             Hit::Auto => {
                 self.line(x + 3., y + 18., x + 17., y + 4., TEXT, 2.);
@@ -936,8 +952,10 @@ impl App {
                     data::compact(tokens),
                     if partial && tokens.is_some() { "*" } else { "" }
                 );
+                p.fill(rect(332., 8., 32., 32.), 0x2b3a3c, 8.);
+                p.border(rect(332., 8., 32., 32.), 0x445c5c, 8.);
                 area(Hit::Refresh, rect(332., 8., 32., 32.));
-                p.action_icon(&Hit::Refresh, 337., 14.);
+                p.action_icon(&Hit::Refresh, 337., 13.);
                 p.label(
                     &format!("{} chats", self.chat_filters.len()),
                     rect(379., 9., width - 391., 30.),
@@ -1488,6 +1506,9 @@ impl App {
                     (Hit::Dock, 58.),
                     (Hit::Quit, width - 52.),
                 ] {
+                    if hit == Hit::Refresh {
+                        p.fill(rect(x, 204., 36., 32.), 0x2b3a3c, 5.);
+                    }
                     area(hit.clone(), rect(x, 204., 36., 32.));
                     p.border(rect(x, 204., 36., 32.), 0x47535b, 5.);
                     p.action_icon(&hit, x + 6., 210.);
