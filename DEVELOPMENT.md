@@ -112,6 +112,22 @@ from `thread_turns`; gaps, missing endpoints and negative durations are excluded
 Both chat-list icon hit targets are separate from row navigation. The icon editor
 captures the target ID and label on opening; choosing an icon never changes the
 follow/fixed selection. Successful renames update all three row caches immediately.
+List editing uses a separate owned icon window with independent search/category/
+scroll and hit targets. The list HWND and child edit remain alive. Native combo
+activation is inside the popover; Escape closes the popover before its parent.
+
+List eligibility is the union of readable local rollout files and cached visible
+user/agent messages. Metadata-only records are excluded from both lists and the
+index denominator; percentages use indexed/local-chat count. The FTS cache keeps
+normalized search text plus unindexed original text for snippets. Old normalized-
+only caches rebuild once. One grouped indexed query returns the latest matching
+chunk per chat, clipped to 150 characters around the first term. Highlight ranges
+map Unicode case folds back to original UTF-8, then DirectWrite UTF-16 ranges.
+Body summaries remain stable during background index-only refreshes.
+
+Ctrl+Alt+J is a nonrepeating global hotkey registered against the bar window.
+It restores Codex when needed and toggles the list. Registration errors are
+recorded in `shortcut-status.json`; tests do not register a competing hotkey.
 
 `live-status.json` records runtime, PID, visible identity, quota, caches, font
 selection and docking bounds. Read bounded stderr excerpts for desktop errors.

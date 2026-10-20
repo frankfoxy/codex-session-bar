@@ -15,7 +15,12 @@ pub fn ranked_matches(
         .filter_map(|(i, r)| (titles.contains(&i) || bodies.contains(&r.id)).then_some(i))
         .collect();
     if searching {
-        matches.sort_by_key(|&i| (rows[i].state != "Busy", !titles.contains(&i), i));
+        matches.sort_by(|&a, &b| {
+            (rows[a].state != "Busy", !titles.contains(&a))
+                .cmp(&(rows[b].state != "Busy", !titles.contains(&b)))
+                .then_with(|| rows[b].updated_at.total_cmp(&rows[a].updated_at))
+                .then(a.cmp(&b))
+        });
     }
     matches
 }
@@ -158,6 +163,7 @@ mod tests {
             .map(|(i, s)| Row {
                 id: i.to_string(),
                 state: (*s).into(),
+                updated_at: [15., 5., 25., 35., 45.][i],
                 ..Row::default()
             })
             .collect();
@@ -166,12 +172,39 @@ mod tests {
             .collect();
         assert_eq!(
             ranked_matches(&rows, &[0, 4], &bodies, true),
-            [4, 1, 3, 0, 2]
+            [4, 3, 1, 0, 2]
         );
         assert_eq!(
             ranked_matches(&rows, &[0, 1, 2, 3, 4], &HashSet::new(), false),
             [0, 1, 2, 3, 4]
         );
+    }
+    #[test]
+    fn title_filters_remain_bound_to_ids_after_reorder_and_rename() {
+        let paths = crate::Paths::discover().unwrap();
+        let catalog = Catalog::load(&paths).unwrap();
+        let mut rows = vec![
+            Row {
+                id: "output".into(),
+                label: "输出 JPEG".into(),
+                ..Default::default()
+            },
+            Row {
+                id: "camera".into(),
+                label: "相机采集".into(),
+                ..Default::default()
+            },
+        ];
+        let mut search = ChatSearch::default();
+        search.sync(&rows, &catalog);
+        assert_eq!(search.filter(&rows, "shuchu", false), [0]);
+        rows.reverse();
+        search.sync(&rows, &catalog);
+        assert_eq!(search.filter(&rows, "shuchu", false), [1]);
+        rows[1].label = "重命名的相机".into();
+        rows[0].label = "输出新报告".into();
+        search.sync(&rows, &catalog);
+        assert_eq!(search.filter(&rows, "shuchu", false), [0]);
     }
     #[test]
     fn chinese_pinyin_initials_mixed_text_and_polyphones() {

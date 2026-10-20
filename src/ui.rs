@@ -39,6 +39,7 @@ const CLASS: PCWSTR = w!("CodexSessionBarRust");
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const QUIT_MESSAGE: u32 = WM_APP + 2;
 const HIDE_MESSAGE: u32 = WM_APP + 3;
+const RECENT_HOTKEY: i32 = 0x5342;
 const BG: u32 = 0x23272b;
 const PANEL: u32 = 0x242a2e;
 const TEXT: u32 = 0xe8eef2;
@@ -263,6 +264,45 @@ impl Painter {
             Ok(())
         })();
     }
+    unsafe fn highlighted_label(
+        &self,
+        text: &str,
+        r: D2D_RECT_F,
+        size: f32,
+        query: &str,
+        exact: bool,
+    ) {
+        let _ = (|| -> Result<()> {
+            let f = self.format(size, false, text)?;
+            let chars: Vec<u16> = text.encode_utf16().collect();
+            let layout = self.text.CreateTextLayout(
+                &chars,
+                &f,
+                (r.right - r.left).max(1.),
+                (r.bottom - r.top).max(1.),
+            )?;
+            let normal = self.target.CreateSolidColorBrush(&color(MUTED), None)?;
+            let highlight = self.target.CreateSolidColorBrush(&color(0xffd27f), None)?;
+            for (start, end) in body::match_ranges(text, query, exact) {
+                let range = DWRITE_TEXT_RANGE {
+                    startPosition: text[..start].encode_utf16().count() as u32,
+                    length: text[start..end].encode_utf16().count() as u32,
+                };
+                layout.SetDrawingEffect(&highlight, range)?;
+                layout.SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, range)?;
+            }
+            self.target.DrawTextLayout(
+                D2D_POINT_2F {
+                    x: r.left,
+                    y: r.top,
+                },
+                &layout,
+                &normal,
+                D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT | D2D1_DRAW_TEXT_OPTIONS_CLIP,
+            );
+            Ok(())
+        })();
+    }
     unsafe fn width(&self, text: &str, size: f32) -> f32 {
         (|| -> Result<f32> {
             let f = self.format(size, false, text)?;
@@ -349,6 +389,9 @@ struct App {
     tray_icon: HICON,
     popup_kind: Option<Popup>,
     icon_target: Option<(String, String)>,
+    icon_panel: Option<IconPanel>,
+    shortcut_registered: bool,
+    shortcut_error: String,
     rows: Vec<Row>,
     hits: Vec<Area>,
     popup_hits: Vec<Area>,
@@ -364,6 +407,7 @@ struct App {
     index_due: Instant,
     body_state: body::Status,
     body_hits: HashSet<String>,
+    body_previews: HashMap<String, String>,
     body_only: HashSet<String>,
     chat_scroll_drag: Option<f32>,
     chat_cursor: usize,
@@ -388,6 +432,18 @@ struct App {
     event: HANDLE,
     testing: bool,
     quit: bool,
+}
+// The list retains its window, controls, filters and scroll under the popover.
+struct IconPanel {
+    window: HWND,
+    edit: HWND,
+    combo: HWND,
+    search: String,
+    category: String,
+    filters: Vec<usize>,
+    scroll: usize,
+    hits: Vec<Area>,
+    layout: Option<[i32; 4]>,
 }
 impl App {
     unsafe fn new(
@@ -460,6 +516,9 @@ impl App {
             tray_icon: create_tray_icon()?,
             popup_kind: None,
             icon_target: None,
+            icon_panel: None,
+            shortcut_registered: false,
+            shortcut_error: String::new(),
             popup_layout: None,
             rows: Vec::new(),
             hits: Vec::new(),
@@ -476,6 +535,7 @@ impl App {
             index_due: Instant::now() + std::time::Duration::from_secs(3),
             body_state: body::Status::default(),
             body_hits: HashSet::new(),
+            body_previews: HashMap::new(),
             body_only: HashSet::new(),
             chat_scroll_drag: None,
             chat_cursor: 0,
@@ -517,6 +577,15 @@ impl App {
             w!("Microsoft YaHei UI"),
         );
         if !testing {
+            match RegisterHotKey(
+                bar,
+                RECENT_HOTKEY,
+                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+                b'J' as u32,
+            ) {
+                Ok(()) => app.shortcut_registered = true,
+                Err(error) => app.shortcut_error = error.to_string(),
+            }
             app.tray(true);
             SetTimer(bar, 1, 80, None);
         }
@@ -739,12 +808,17 @@ impl App {
                 }
                 let exact = rect(288., 14., 80., 34.);
                 area(Hit::Exact, exact);
-                p.label("Exact", rect(288., 14., 39., 34.), 12., TEXT, false);
-                p.toggle(332., 21., self.search_exact);
+                p.border(rect(292., 21., 18., 20.), MUTED, 3.);
+                p.line(296., 28., 306., 28., TEXT, 1.5);
+                p.line(296., 34., 306., 34., TEXT, 1.5);
+                p.toggle(320., 21., self.search_exact);
                 let (tokens, rate, partial) = live.recent.totals();
                 area(Hit::Body, rect(384., 14., 94., 34.));
-                p.label("Body", rect(384., 14., 34., 34.), 12., TEXT, false);
-                p.toggle(424., 21., self.search_body);
+                p.border(rect(388., 21., 16., 20.), MUTED, 2.);
+                for y in [27., 31., 35.] {
+                    p.line(392., y, 400., y, TEXT, 1.3);
+                }
+                p.toggle(414., 21., self.search_body);
                 let total = format!(
                     "Total {}{} t/s  ·  {}{} TOK",
                     rate.map(|r| format!("{r:.1}")).unwrap_or("—".into()),
@@ -753,13 +827,21 @@ impl App {
                     if partial && tokens.is_some() { "*" } else { "" }
                 );
                 area(Hit::Refresh, rect(width - 80., 14., 64., 34.));
-                p.label(
-                    "Refresh",
-                    rect(width - 74., 14., 60., 34.),
-                    11.,
-                    TEXT,
-                    false,
-                );
+                let (cx, cy) = (width - 46., 31.);
+                for i in 0..24 {
+                    let a = 0.6 + i as f32 * 0.2;
+                    let b = a + 0.2;
+                    p.line(
+                        cx + 8. * a.cos(),
+                        cy + 8. * a.sin(),
+                        cx + 8. * b.cos(),
+                        cy + 8. * b.sin(),
+                        TEXT,
+                        1.5,
+                    );
+                }
+                p.line(cx + 4., cy - 9., cx + 8., cy - 7., TEXT, 1.5);
+                p.line(cx + 8., cy - 7., cx + 8., cy - 12., TEXT, 1.5);
                 for (slot, &index) in self
                     .chat_filters
                     .iter()
@@ -807,13 +889,18 @@ impl App {
                     );
                     let label_width = if busy { width - 365. } else { width - 305. };
                     let body_only = self.body_only.contains(&row.id);
+                    let snippet = self
+                        .body_previews
+                        .get(&row.id)
+                        .filter(|_| self.search_body && !self.search.trim().is_empty());
+                    let line_height = if snippet.is_some() { 18. } else { 34. };
                     p.label(
                         self.catalog.strip(&row.label),
                         rect(
                             49.,
                             y + 2.,
                             label_width - if body_only { 39. } else { 0. },
-                            34.,
+                            line_height,
                         ),
                         13.,
                         TEXT,
@@ -822,7 +909,7 @@ impl App {
                     if body_only {
                         p.label(
                             "Body",
-                            rect(49. + label_width - 34., y + 2., 34., 34.),
+                            rect(49. + label_width - 34., y + 2., 34., line_height),
                             10.,
                             0x81b5d1,
                             false,
@@ -839,7 +926,7 @@ impl App {
                         );
                         p.label(
                             &metrics,
-                            rect(width - 310., y + 2., 220., 34.),
+                            rect(width - 310., y + 2., 220., line_height),
                             11.,
                             MUTED,
                             false,
@@ -851,10 +938,19 @@ impl App {
                                 data::compact(row.tokens),
                                 row.total_seconds.map(data::duration).unwrap_or("—".into())
                             ),
-                            rect(width - 250., y + 2., 160., 34.),
+                            rect(width - 250., y + 2., 160., line_height),
                             11.,
                             MUTED,
                             false,
+                        );
+                    }
+                    if let Some(snippet) = snippet {
+                        p.highlighted_label(
+                            snippet,
+                            rect(49., y + 20., width - 145., 17.),
+                            11.,
+                            &self.search,
+                            self.search_exact,
                         );
                     }
                     p.label(
@@ -907,7 +1003,8 @@ impl App {
                 p.line(16., height - 38., width - 16., height - 38., 0x354148, 1.);
                 let count = if self.index_pending || self.body_pending {
                     format!(
-                        "Indexing {} / {} · {:.0} MiB",
+                        "Index {:.0}% · {} / {} · {:.0} MiB",
+                        self.body_state.progress_percent(),
                         self.body_state.indexed,
                         self.body_state.available,
                         self.body_state.bytes_read as f64 / 1048576.
@@ -916,11 +1013,10 @@ impl App {
                     "Index unavailable · retry pending".into()
                 } else if self.body_state.complete {
                     format!(
-                        "{} / {} chats · Indexed {}/{}{}",
+                        "{} / {} chats · Index {:.0}%{}",
                         self.chat_filters.len(),
                         self.rows.len(),
-                        self.body_state.available,
-                        self.rows.len(),
+                        self.body_state.progress_percent(),
                         if self.body_state.skipped > 0 {
                             " · partial"
                         } else {
@@ -933,6 +1029,12 @@ impl App {
                         self.chat_filters.len(),
                         self.rows.len()
                     )
+                };
+                let count = match self.hover {
+                    Some(Hit::Exact) => "Exact · full chat title / body phrase".to_string(),
+                    Some(Hit::Body) => "Body · include message text in search".to_string(),
+                    Some(Hit::Refresh) => "Refresh · reload account limits".to_string(),
+                    _ => count,
                 };
                 p.label(
                     &count,
@@ -951,6 +1053,18 @@ impl App {
                 );
             }
             Some(Popup::Icons) => {
+                let (search, category, filters, scroll) = self
+                    .icon_panel
+                    .as_ref()
+                    .map(|panel| {
+                        (
+                            panel.search.as_str(),
+                            panel.category.as_str(),
+                            &panel.filters,
+                            panel.scroll,
+                        )
+                    })
+                    .unwrap_or((&self.search, &self.category, &self.filters, self.scroll));
                 area(Hit::Random, rect(12., 9., 36., 32.));
                 p.label("🎲", rect(17., 9., 30., 32.), 20., TEXT, true);
                 let icon_title = self
@@ -966,22 +1080,22 @@ impl App {
                     p.border(r, 0x47535b, 3.);
                 }
                 p.label(
-                    if self.search.is_empty() {
+                    if search.is_empty() {
                         "Search emoji…"
                     } else {
-                        &self.search
+                        search
                     },
                     rect(21., 49., 180., 29.),
                     13.,
                     MUTED,
                     false,
                 );
-                p.label(&self.category, rect(222., 49., 131., 29.), 13., TEXT, false);
+                p.label(category, rect(222., 49., 131., 29.), 13., TEXT, false);
                 p.label("⌄", rect(350., 49., 16., 29.), 13., MUTED, false);
                 let columns = 10;
                 let cell = 36.;
-                let start = self.scroll * columns;
-                for (slot, index) in self.filters.iter().skip(start).take(90).enumerate() {
+                let start = scroll * columns;
+                for (slot, index) in filters.iter().skip(start).take(90).enumerate() {
                     let x = 12. + (slot % columns) as f32 * cell;
                     let y = 98. + (slot / columns) as f32 * cell;
                     area(Hit::Emoji(*index), rect(x, y, cell - 2., cell - 2.));
@@ -994,7 +1108,7 @@ impl App {
                     );
                 }
                 p.label(
-                    &format!("{} icons · scroll for more", self.filters.len()),
+                    &format!("{} icons · scroll for more", filters.len()),
                     rect(16., height - 26., width - 32., 22.),
                     11.,
                     MUTED,
@@ -1293,7 +1407,7 @@ impl App {
                     false,
                 );
                 p.label(
-                    "× hides to tray · Ask Codex: 打开会话条",
+                    "Ctrl+Alt+J: recent chats · × hides to tray",
                     rect(16., 274., width - 32., 25.),
                     11.,
                     MUTED,
@@ -1311,6 +1425,8 @@ impl App {
         let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.;
         let kind = if hwnd == self.bar {
             None
+        } else if self.icon_panel.as_ref().is_some_and(|p| p.window == hwnd) {
+            Some(Popup::Icons)
         } else {
             self.popup_kind
         };
@@ -1325,6 +1441,8 @@ impl App {
             let _ = self.painter.target.EndDraw(None, None);
             if hwnd == self.bar {
                 self.hits = hits;
+            } else if let Some(panel) = self.icon_panel.as_mut().filter(|p| p.window == hwnd) {
+                panel.hits = hits;
             } else {
                 self.popup_hits = hits;
             }
@@ -1433,6 +1551,7 @@ impl App {
                         if self.body_pending {
                             self.body_pending = false;
                             self.body_hits = self.body_state.hits.clone();
+                            self.body_previews = self.body_state.previews.clone();
                             self.update_body_only();
                             self.chat_filters = self.filtered_chats();
                             self.chat_cursor = 0;
@@ -1531,6 +1650,7 @@ impl App {
                 self.host_hidden = false;
                 if self.popup_kind.is_some() {
                     self.place_popup();
+                    self.place_icon_panel();
                 }
             }
         }
@@ -1573,7 +1693,297 @@ impl App {
         data.szTip[..tip.len()].copy_from_slice(&tip);
         let _ = Shell_NotifyIconW(if add { NIM_ADD } else { NIM_DELETE }, &data);
     }
+    unsafe fn open_icon_panel(&mut self) -> Result<()> {
+        let window = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            CLASS,
+            w!("Codex Session Icon"),
+            WS_POPUP | WS_CLIPCHILDREN,
+            0,
+            0,
+            384,
+            450,
+            self.popup,
+            None,
+            GetModuleHandleW(None)?,
+            None,
+        )?;
+        let controls = (|| -> Result<(HWND, HWND)> {
+            let edit = CreateWindowExW(
+                WS_EX_CLIENTEDGE,
+                w!("EDIT"),
+                w!(""),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+                14,
+                49,
+                190,
+                29,
+                window,
+                HMENU(100isize as *mut _),
+                GetModuleHandleW(None)?,
+                None,
+            )?;
+            let combo = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("COMBOBOX"),
+                w!(""),
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WS_TABSTOP
+                    | WINDOW_STYLE(CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0),
+                214,
+                49,
+                155,
+                350,
+                window,
+                HMENU(101isize as *mut _),
+                GetModuleHandleW(None)?,
+                None,
+            )?;
+            for group in &self.groups {
+                let _ = SendMessageW(
+                    combo,
+                    CB_ADDSTRING,
+                    WPARAM(0),
+                    LPARAM(wide(group).as_ptr() as isize),
+                );
+            }
+            let _ = SendMessageW(combo, CB_SETCURSEL, WPARAM(0), LPARAM(0));
+            let _ = SendMessageW(
+                edit,
+                EM_SETCUEBANNER,
+                WPARAM(1),
+                LPARAM(w!("Search emoji…").as_ptr() as isize),
+            );
+            for child in [edit, combo] {
+                let _ = SendMessageW(
+                    child,
+                    WM_SETFONT,
+                    WPARAM(self.edit_font.0 as usize),
+                    LPARAM(1),
+                );
+                let _ = SetWindowTheme(child, w!("DarkMode_CFD"), PCWSTR::null());
+            }
+            Ok((edit, combo))
+        })();
+        let (edit, combo) = match controls {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = DestroyWindow(window);
+                return Err(error);
+            }
+        };
+        self.icon_panel = Some(IconPanel {
+            window,
+            edit,
+            combo,
+            search: String::new(),
+            category: "默认集合".into(),
+            filters: self.catalog.filter("", "默认集合"),
+            scroll: 0,
+            hits: Vec::new(),
+            layout: None,
+        });
+        self.place_icon_panel();
+        if !self.testing {
+            let _ = ShowWindow(window, SW_SHOW);
+            let _ = SetForegroundWindow(window);
+            let _ = SetFocus(edit);
+        }
+        Ok(())
+    }
+    unsafe fn place_icon_panel(&mut self) {
+        let Some(panel) = self.icon_panel.as_mut() else {
+            return;
+        };
+        if SendMessageW(panel.combo, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0 != 0 {
+            return;
+        }
+        let Some(parent) = host::bounds(self.popup.0 as isize) else {
+            return;
+        };
+        let scale = self.dpi;
+        let (w, h, gap) = (
+            (384. * scale).round() as i32,
+            (450. * scale).round() as i32,
+            (6. * scale).round() as i32,
+        );
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let _ = GetMonitorInfoW(
+            MonitorFromWindow(self.popup, MONITOR_DEFAULTTONEAREST),
+            &mut info,
+        );
+        let bounds = info.rcWork;
+        let x = if parent[2] + gap + w <= bounds.right {
+            parent[2] + gap
+        } else if parent[0] - gap - w >= bounds.left {
+            parent[0] - gap - w
+        } else {
+            (parent[2] - w)
+                .max(bounds.left)
+                .min((bounds.right - w).max(bounds.left))
+        };
+        let y = parent[1]
+            .max(bounds.top)
+            .min((bounds.bottom - h).max(bounds.top));
+        let layout = [x, y, w, h];
+        if panel.layout == Some(layout) {
+            return;
+        }
+        panel.layout = Some(layout);
+        let _ = SetWindowPos(panel.window, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+        Self::round_window(panel.window, w, h, (10. * scale) as i32);
+        for (child, x, y, cw, ch) in [
+            (panel.edit, 14, 49, 190, 29),
+            (panel.combo, 214, 49, 155, 350),
+        ] {
+            let _ = MoveWindow(
+                child,
+                (x as f32 * scale) as i32,
+                (y as f32 * scale) as i32,
+                (cw as f32 * scale) as i32,
+                (ch as f32 * scale) as i32,
+                true,
+            );
+        }
+    }
+    unsafe fn close_icon_panel(&mut self) {
+        if let Some(panel) = self.icon_panel.take() {
+            let _ = DestroyWindow(panel.window);
+            self.icon_target = None;
+            self.hover = None;
+            let _ = InvalidateRect(self.popup, None, false);
+            if !self.testing {
+                let _ = SetFocus(self.edit);
+            }
+        }
+    }
+    unsafe fn update_icon_panel_filter(&mut self) {
+        let Some(panel) = self.icon_panel.as_mut() else {
+            return;
+        };
+        let mut text = [0u16; 256];
+        let len = GetWindowTextW(panel.edit, &mut text);
+        panel.search = String::from_utf16_lossy(&text[..len as usize]);
+        let index = SendMessageW(panel.combo, CB_GETCURSEL, WPARAM(0), LPARAM(0))
+            .0
+            .max(0) as usize;
+        panel.category = self.groups.get(index).cloned().unwrap_or("默认集合".into());
+        panel.filters = self.catalog.filter(&panel.search, &panel.category);
+        panel.scroll = 0;
+        let _ = InvalidateRect(panel.window, None, false);
+    }
+    unsafe fn icon_owns(&self, hwnd: HWND) -> bool {
+        let Some(panel) = &self.icon_panel else {
+            return false;
+        };
+        if hwnd == panel.window || IsChild(panel.window, hwnd).as_bool() {
+            return true;
+        }
+        let mut info = COMBOBOXINFO {
+            cbSize: size_of::<COMBOBOXINFO>() as u32,
+            ..Default::default()
+        };
+        GetComboBoxInfo(panel.combo, &mut info).is_ok()
+            && (hwnd == info.hwndList || IsChild(info.hwndList, hwnd).as_bool())
+    }
+    unsafe fn icon_message(
+        &mut self,
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> Option<LRESULT> {
+        let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.;
+        let (x, y) = (
+            (lparam.0 as i16) as f32 / scale,
+            ((lparam.0 >> 16) as i16) as f32 / scale,
+        );
+        match message {
+            WM_PAINT => {
+                self.paint(hwnd);
+            }
+            WM_ERASEBKGND => return Some(LRESULT(1)),
+            WM_MOUSEMOVE | WM_LBUTTONUP => {
+                let hit = self
+                    .icon_panel
+                    .as_ref()?
+                    .hits
+                    .iter()
+                    .find(|a| a.contains(x, y))
+                    .map(|a| a.hit.clone());
+                if message == WM_MOUSEMOVE {
+                    if self.hover != hit {
+                        self.hover = hit;
+                        let _ = InvalidateRect(hwnd, None, false);
+                    }
+                } else if let Some(action) = hit.and_then(|hit| self.hit(hit)) {
+                    ACTIONS.with(|sender| {
+                        if let Some(sender) = sender.borrow().as_ref() {
+                            let _ = sender.send(action);
+                        }
+                    });
+                }
+            }
+            WM_SETCURSOR => {
+                SetCursor(
+                    LoadCursorW(
+                        None,
+                        if self.hover.is_some() {
+                            IDC_HAND
+                        } else {
+                            IDC_ARROW
+                        },
+                    )
+                    .unwrap_or_default(),
+                );
+                return Some(LRESULT(1));
+            }
+            WM_MOUSEWHEEL => {
+                let panel = self.icon_panel.as_mut()?;
+                let max = panel.filters.len().div_ceil(10).saturating_sub(9);
+                panel.scroll = if ((wparam.0 >> 16) as i16) < 0 {
+                    (panel.scroll + 3).min(max)
+                } else {
+                    panel.scroll.saturating_sub(3)
+                };
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+            WM_COMMAND => {
+                let (id, code) = (
+                    (wparam.0 & 0xffff) as u32,
+                    ((wparam.0 >> 16) & 0xffff) as u32,
+                );
+                if (id == 100 && code == EN_CHANGE) || (id == 101 && code == CBN_SELCHANGE) {
+                    self.update_icon_panel_filter();
+                }
+            }
+            WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORLISTBOX => {
+                let dc = HDC(wparam.0 as *mut _);
+                SetTextColor(dc, COLORREF(0xf2eee8));
+                SetBkColor(dc, COLORREF(0x25211c));
+                return Some(LRESULT(self.child_brush.0 as isize));
+            }
+            WM_ACTIVATE if (wparam.0 & 0xffff) == WA_INACTIVE as usize => {
+                let target = HWND(lparam.0 as *mut _);
+                if !self.icon_owns(target) {
+                    if self.owns_popup_window(target) || target == self.bar {
+                        self.close_icon_panel();
+                    } else {
+                        self.close_popup();
+                    }
+                }
+            }
+            WM_CLOSE => self.close_icon_panel(),
+            _ => return None,
+        }
+        Some(LRESULT(0))
+    }
     unsafe fn close_popup(&mut self) {
+        self.close_icon_panel();
         if self.body_pending {
             if let Some(service) = &self.body_service {
                 service.cancel();
@@ -1598,7 +2008,22 @@ impl App {
         if hwnd == self.popup || IsChild(self.popup, hwnd).as_bool() {
             return true;
         }
-        [self.combo].iter().any(|&combo| {
+        if self
+            .icon_panel
+            .as_ref()
+            .is_some_and(|p| hwnd == p.window || IsChild(p.window, hwnd).as_bool())
+        {
+            return true;
+        }
+        [
+            self.combo,
+            self.icon_panel
+                .as_ref()
+                .map(|p| p.combo)
+                .unwrap_or_default(),
+        ]
+        .iter()
+        .any(|&combo| {
             let mut info = COMBOBOXINFO {
                 cbSize: size_of::<COMBOBOXINFO>() as u32,
                 ..Default::default()
@@ -1619,6 +2044,7 @@ impl App {
         true
     }
     unsafe fn popup(&mut self, kind: Popup) -> Result<()> {
+        self.close_icon_panel();
         if self.popup_kind == Some(kind) && IsWindowVisible(self.popup).as_bool() {
             self.close_popup();
             return Ok(());
@@ -1798,7 +2224,15 @@ impl App {
     unsafe fn place_popup(&mut self) {
         // Token/TPS text can change the bar's width and anchor while the user
         // is choosing. Let native combo tracking finish before moving its panel.
-        if [self.combo].iter().any(|&combo| {
+        if [
+            self.combo,
+            self.icon_panel
+                .as_ref()
+                .map(|p| p.combo)
+                .unwrap_or_default(),
+        ]
+        .iter()
+        .any(|&combo| {
             !combo.is_invalid()
                 && SendMessageW(combo, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0 != 0
         }) {
@@ -1877,11 +2311,14 @@ impl App {
         }
     }
     fn diagnostic(&self) {
+        self.paths.write(if self.testing { "rust-test-shortcut-status.json" } else { "shortcut-status.json" },
+            &json!({"binding":"Ctrl+Alt+J","registered":self.shortcut_registered,"error":self.shortcut_error}));
         self.paths.write(if self.testing { "rust-test-body-status.json" } else { "body-search-status.json" },
             &json!({"enabled":self.search_body,"pending":self.body_pending,"indexing":self.index_pending,"complete":self.body_state.complete,
+                "local_only":true,"progress_percent":self.body_state.progress_percent(),
                 "indexed":self.body_state.indexed,"available_local":self.body_state.available,"total_chats":self.body_state.total,
                 "bytes_read":self.body_state.bytes_read,"skipped_oversized_messages":self.body_state.skipped,"error":self.body_state.error,
-                "cache_exists":self.paths.runtime.join("body-search.sqlite").exists(),"on_demand":true}));
+                "cache_exists":self.paths.runtime.join("body-search.sqlite").exists(),"on_demand":false}));
         let live = self.snapshot();
         let current = self.current(&live);
         let (_, title, status, _, _) = unsafe { self.bar_text(&live) };
@@ -1893,6 +2330,7 @@ impl App {
                 let _ = self.popup(Popup::Recent);
             }
             Hit::Icon => {
+                self.close_icon_panel();
                 let live = self.snapshot();
                 if let Some(current) = self.current(&live) {
                     self.icon_target = Some((current.id.clone(), current.label.clone()));
@@ -1902,9 +2340,9 @@ impl App {
             Hit::ChatIcon(id) => {
                 if let Some(row) = self.rows.iter().find(|r| r.id == id) {
                     let target = (row.id.clone(), row.label.clone());
-                    self.close_popup();
+                    self.close_icon_panel();
                     self.icon_target = Some(target);
-                    let _ = self.popup(Popup::Icons);
+                    let _ = self.open_icon_panel();
                 }
             }
             Hit::Details => {
@@ -1962,7 +2400,11 @@ impl App {
                     }
                 };
                 self.state.lock().unwrap().action_pending = true;
-                self.close_popup();
+                if self.icon_panel.is_some() {
+                    self.close_icon_panel();
+                } else {
+                    self.close_popup();
+                }
                 return Some(Action::Icon(id, icon));
             }
             Hit::Refresh => {
@@ -2009,6 +2451,24 @@ impl App {
         }
         None
     }
+    unsafe fn recent_shortcut(&mut self) {
+        self.hidden = false;
+        if !self.testing {
+            let host = HWND(self.snapshot().host as *mut _);
+            if !host.is_invalid() && IsWindow(host).as_bool() {
+                if IsIconic(host).as_bool() {
+                    let _ = ShowWindow(host, SW_RESTORE);
+                }
+                let _ = SetForegroundWindow(host);
+                self.tick();
+            }
+        }
+        if self.popup_kind == Some(Popup::Recent) {
+            self.close_popup();
+        } else {
+            let _ = self.hit(Hit::Title);
+        }
+    }
     unsafe fn update_filter(&mut self) {
         let mut text = [0u16; 256];
         let len = GetWindowTextW(self.edit, &mut text);
@@ -2032,6 +2492,7 @@ impl App {
             self.index_due = Instant::now();
         }
         self.body_hits.clear();
+        self.body_previews.clear();
         self.body_only.clear();
         self.body_pending = false;
         if self.search_body
@@ -2136,6 +2597,9 @@ impl App {
         })
     }
     unsafe fn fixed_key(&mut self, key: u32) -> bool {
+        if self.icon_panel.is_some() {
+            return false;
+        }
         if !matches!(self.popup_kind, Some(Popup::Fixed | Popup::Recent)) {
             return false;
         }
@@ -2241,11 +2705,22 @@ unsafe extern "system" fn wndproc(
         let Some(app) = state.as_mut() else {
             return None;
         };
+        if app
+            .icon_panel
+            .as_ref()
+            .is_some_and(|panel| panel.window == hwnd)
+        {
+            return app.icon_message(hwnd, message, wparam, lparam);
+        }
         let is_bar = hwnd == app.bar;
         let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.;
         let x = (lparam.0 as i16) as f32 / scale;
         let y = ((lparam.0 >> 16) as i16) as f32 / scale;
         match message {
+            WM_HOTKEY if is_bar && wparam.0 == RECENT_HOTKEY as usize => {
+                app.recent_shortcut();
+                Some(LRESULT(0))
+            }
             WM_MOUSEACTIVATE if is_bar => Some(LRESULT(MA_NOACTIVATE as isize)),
             WM_SETCURSOR => {
                 let cursor = match app.hover {
@@ -2531,7 +3006,13 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
                     slot.try_borrow().ok().and_then(|a| {
                         a.as_ref()
                             .filter(|app| app.owns_popup_window(msg.hwnd))
-                            .map(|app| app.popup)
+                            .map(|app| {
+                                if app.icon_owns(msg.hwnd) {
+                                    app.icon_panel.as_ref().unwrap().window
+                                } else {
+                                    app.popup
+                                }
+                            })
                     })
                 }) {
                     msg.hwnd = popup;
@@ -2553,7 +3034,11 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
                 APP.with(|slot| {
                     if let Ok(mut app) = slot.try_borrow_mut() {
                         if let Some(app) = app.as_mut() {
-                            app.close_popup();
+                            if app.icon_panel.is_some() {
+                                app.close_icon_panel();
+                            } else {
+                                app.close_popup();
+                            }
                         }
                     }
                 });
@@ -2571,6 +3056,9 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
             if let Some(app) = a.borrow_mut().take() {
                 app.settings();
                 app.tray(false);
+                if app.shortcut_registered {
+                    let _ = UnregisterHotKey(app.bar, RECENT_HOTKEY);
+                }
                 let _ = DestroyWindow(app.popup);
                 let _ = DestroyWindow(app.bar);
                 let _ = DeleteObject(app.edit_font);
@@ -2818,27 +3306,93 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         );
         let identity_before_icon = app.identity(&app.snapshot());
         let follow_before_icon = app.snapshot().auto_thread;
+        app.last_identity = identity_before_icon.clone();
+        app.search = "mingcheng".into();
+        app.filter_fixed();
+        app.move_fixed_cursor(12);
+        let list_before_icon = (
+            app.popup,
+            app.edit,
+            app.search.clone(),
+            app.scroll,
+            app.chat_cursor,
+            app.chat_filters.clone(),
+        );
         assert!(app.hit(Hit::ChatIcon(rows[7].id.clone())).is_none());
-        assert_eq!(app.popup_kind, Some(Popup::Icons));
+        assert_eq!(app.popup_kind, Some(Popup::Recent));
+        assert!(app.icon_panel.is_some());
         assert_eq!(app.identity(&app.snapshot()), identity_before_icon);
         assert_eq!(app.snapshot().auto_thread, follow_before_icon);
         assert_eq!(app.icon_target.as_ref().unwrap().0, rows[7].id);
-        capture(
+        let panel_hits = capture(
             &app,
             Some(Popup::Icons),
             384,
             450,
             &paths.runtime.join("rust-chat-icon-verification.png"),
         )?;
-        let chosen = app.filters[0];
+        app.icon_panel.as_mut().unwrap().hits = panel_hits;
+        let chosen = app.icon_panel.as_ref().unwrap().filters[0];
+        let panel_window = app.icon_panel.as_ref().unwrap().window;
+        let panel_combo = app.icon_panel.as_ref().unwrap().combo;
+        assert!(app.owns_popup_window(panel_window));
+        assert!(app.icon_owns(app.icon_panel.as_ref().unwrap().edit));
+        let _ = SendMessageW(panel_combo, CB_SHOWDROPDOWN, WPARAM(1), LPARAM(0));
+        for _ in 0..100 {
+            app.tick();
+            app.place_icon_panel();
+        }
+        assert_ne!(
+            SendMessageW(panel_combo, CB_GETDROPPEDSTATE, WPARAM(0), LPARAM(0)).0,
+            0
+        );
+        let _ = SendMessageW(panel_combo, CB_SHOWDROPDOWN, WPARAM(0), LPARAM(0));
+        let chosen_area = app
+            .icon_panel
+            .as_ref()
+            .unwrap()
+            .hits
+            .iter()
+            .find(|a| a.hit == Hit::Emoji(chosen))
+            .unwrap()
+            .r;
+        let scale = GetDpiForWindow(panel_window).max(96) as f32 / 96.;
+        let (px, py) = (
+            ((chosen_area.left + 8.) * scale) as u16,
+            ((chosen_area.top + 8.) * scale) as u16,
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        ACTIONS.with(|actions| *actions.borrow_mut() = Some(sender));
+        app.icon_message(
+            panel_window,
+            WM_LBUTTONUP,
+            WPARAM(0),
+            LPARAM((px as u32 | ((py as u32) << 16)) as isize),
+        );
         assert!(
-            matches!(app.hit(Hit::Emoji(chosen)), Some(Action::Icon(id, icon)) if id == rows[7].id && icon == app.catalog.entries[chosen].emoji)
+            matches!(receiver.try_recv().unwrap(), Action::Icon(id, icon) if id == rows[7].id && icon == app.catalog.entries[chosen].emoji)
+        );
+        ACTIONS.with(|actions| *actions.borrow_mut() = None);
+        assert!(app.icon_panel.is_none());
+        assert_eq!(app.popup_kind, Some(Popup::Recent));
+        assert_eq!(
+            (
+                app.popup,
+                app.edit,
+                app.search.clone(),
+                app.scroll,
+                app.chat_cursor,
+                app.chat_filters.clone()
+            ),
+            list_before_icon
         );
         assert!(app.hit(Hit::ChatIcon(rows[7].id.clone())).is_none());
         assert!(
             matches!(app.hit(Hit::Random), Some(Action::Icon(id, icon)) if id == rows[7].id && icon != app.catalog.icon(&rows[7].label))
         );
-        app.popup(Popup::Recent)?;
+        assert_eq!(app.popup_kind, Some(Popup::Recent));
+        app.search.clear();
+        app.filter_fixed();
         app.index_pending = true;
         app.body_state = body::Status {
             indexed: 17,
@@ -2870,6 +3424,18 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         app.body_hits = [rows[0].id.clone(), rows[39].id.clone()]
             .into_iter()
             .collect();
+        app.body_previews = [
+            (
+                rows[0].id.clone(),
+                "支持 Mingcheng 2 匹配，并在会话名称下方高亮正文。".into(),
+            ),
+            (
+                rows[39].id.clone(),
+                "讨论过 mingcheng 2 的正文索引和相机采集。".into(),
+            ),
+        ]
+        .into_iter()
+        .collect();
         app.body_state = body::Status {
             complete: true,
             available: 40,
@@ -2962,11 +3528,15 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         );
         let pinned_before_icon = app.snapshot().fixed_thread;
         assert!(app.hit(Hit::ChatIcon(rows[3].id.clone())).is_none());
+        assert_eq!(app.popup_kind, Some(Popup::Fixed));
+        assert!(app.icon_panel.is_some());
         assert_eq!(app.snapshot().fixed_thread, pinned_before_icon);
         assert!(!app.snapshot().auto_thread);
         assert!(
             matches!(app.hit(Hit::Clear), Some(Action::Icon(id, icon)) if id == rows[3].id && icon.is_empty())
         );
+        assert_eq!(app.popup_kind, Some(Popup::Fixed));
+        assert!(app.icon_panel.is_none());
         app.popup(Popup::Details)?;
         capture(
             &app,
@@ -3003,6 +3573,13 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             }
             _ => anyhow::bail!("Random action did not bind its chat"),
         }
+        app.hidden = true;
+        app.recent_shortcut();
+        assert!(!app.hidden);
+        assert_eq!(app.popup_kind, Some(Popup::Recent));
+        app.recent_shortcut();
+        assert!(app.popup_kind.is_none());
+        paths.write("rust-popover-shortcut-test.json", &json!({"list_window_preserved":true,"list_search_scroll_selection_preserved":true,"native_icon_click_routed":true,"icon_combo_survives_100_refreshes":true,"recent_shortcut_toggle":true,"index_percent_local_only":true,"body_snippet_highlight":true}));
         let _ = app.hit(Hit::Hide);
         assert!(app.hidden);
         app.hidden = false;

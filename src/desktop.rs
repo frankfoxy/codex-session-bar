@@ -433,7 +433,7 @@ pub fn inspect(paths: &Paths) -> Result<()> {
         .tool("list_threads", json!({"limit":50}), &context)
         .and_then(|p| store.recent(&p))?;
     let sorted = recent.rows.windows(2).all(|w| w[0].updated_at >= w[1].updated_at);
-    let local_count = store.sessions()?.len();
+    let local_count = recent.rows.len();
     let quota = quotas(&rpc.tool("get_usage_limits", json!({}), &context)?);
     paths.write("rust-inspect.json",&json!({"time":now(),"rows":recent.rows.len(),"local_chats":local_count,"sorted_by_recency":sorted,"busy":recent.busy_count,"quota":quota,"runtime":"rust","mutations":false}));
     println!(

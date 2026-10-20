@@ -4,7 +4,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Seek, SeekFrom},
     os::windows::fs::{MetadataExt, OpenOptionsExt},
@@ -30,7 +30,21 @@ pub struct Status {
     pub bytes_read: u64,
     pub skipped: usize,
     pub hits: HashSet<String>,
+    pub previews: HashMap<String, String>,
     pub error: String,
+}
+impl Status {
+    pub fn progress_percent(&self) -> f64 {
+        if self.total == 0 {
+            if self.complete {
+                100.
+            } else {
+                0.
+            }
+        } else {
+            (100. * self.indexed as f64 / self.total as f64).min(100.)
+        }
+    }
 }
 struct Request {
     generation: u64,
@@ -129,6 +143,10 @@ impl Service {
                         state.hits = index.search(&request.query, request.exact, &control)?;
                     }
                     state.hits.retain(|id| request.ids.contains(id));
+                    if !request.query.trim().is_empty() {
+                        state.previews =
+                            index.previews(&request.query, request.exact, &state.hits, &control)?;
+                    }
                     index.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
                     Ok(())
                 })();
@@ -210,6 +228,20 @@ fn publish(output: &Mutex<Status>, state: &Status, control: &Control) {
         *output.lock().unwrap() = state.clone();
     }
 }
+pub fn local_ids(paths: &Paths, ids: HashSet<String>) -> Result<HashSet<String>> {
+    let mut local: HashSet<_> = sources(paths, &ids)?
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    if let Some(history) = History::open(paths)? {
+        for id in ids {
+            if !local.contains(&id) && history.has_messages(&id)? {
+                local.insert(id);
+            }
+        }
+    }
+    Ok(local)
+}
 fn sources(paths: &Paths, ids: &HashSet<String>) -> Result<Vec<(String, PathBuf)>> {
     let db = Connection::open_with_flags(
         paths.home.join("state_5.sqlite"),
@@ -283,7 +315,19 @@ impl Index {
             CREATE TABLE IF NOT EXISTS sources(id TEXT PRIMARY KEY,path TEXT NOT NULL,identity INTEGER NOT NULL,size INTEGER NOT NULL,modified INTEGER NOT NULL,offset INTEGER NOT NULL,skipped INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS history_sources(id TEXT PRIMARY KEY,identity INTEGER NOT NULL,cursor INTEGER NOT NULL,skipped INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS history_items(chat TEXT NOT NULL,item TEXT NOT NULL,first_row INTEGER NOT NULL,last_row INTEGER NOT NULL,PRIMARY KEY(chat,item));
-            CREATE VIRTUAL TABLE IF NOT EXISTS messages USING fts5(chat UNINDEXED,body,tokenize='trigram',detail=none);")?;
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages USING fts5(chat UNINDEXED,body,original UNINDEXED,tokenize='trigram',detail=none);")?;
+        let has_original = db
+            .prepare("PRAGMA table_info(messages)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == "original");
+        if !has_original {
+            // A disposable local cache: rebuild once to retain original-case
+            // snippets. The authoritative Codex databases are never modified.
+            db.execute_batch("BEGIN; DROP TABLE messages; DELETE FROM sources; DELETE FROM history_sources; DELETE FROM history_items;
+                CREATE VIRTUAL TABLE messages USING fts5(chat UNINDEXED,body,original UNINDEXED,tokenize='trigram',detail=none); COMMIT;")?;
+        }
         Ok(Self { db })
     }
     fn update_history(
@@ -370,7 +414,6 @@ impl Index {
                 if let Some(json) = json {
                     state.bytes_read += json.len() as u64;
                     if let Some(text) = history_text(&json) {
-                        let text = text.to_lowercase();
                         let (mut at, mut first, mut last) = (0, 0, 0);
                         while at < text.len() {
                             control.check()?;
@@ -379,8 +422,8 @@ impl Index {
                                 end -= 1;
                             }
                             tx.execute(
-                                "INSERT INTO messages(chat,body) VALUES(?,?)",
-                                params![id, &text[at..end]],
+                                "INSERT INTO messages(chat,body,original) VALUES(?,?,?)",
+                                params![id, text[at..end].to_lowercase(), &text[at..end]],
                             )?;
                             last = tx.last_insert_rowid();
                             if first == 0 {
@@ -495,7 +538,6 @@ impl Index {
                 }
                 if let Some(line) = line {
                     if let Some(text) = visible_text(&line) {
-                        let text = text.to_lowercase();
                         let mut at = 0;
                         while at < text.len() {
                             control.check()?;
@@ -504,8 +546,8 @@ impl Index {
                                 end -= 1;
                             }
                             tx.execute(
-                                "INSERT INTO messages(chat,body) VALUES(?,?)",
-                                params![id, &text[at..end]],
+                                "INSERT INTO messages(chat,body,original) VALUES(?,?,?)",
+                                params![id, text[at..end].to_lowercase(), &text[at..end]],
                             )?;
                             if end == text.len() {
                                 break;
@@ -542,6 +584,48 @@ impl Index {
         }
         state.skipped += skipped;
         Ok(())
+    }
+    fn previews(
+        &self,
+        query: &str,
+        exact: bool,
+        hits: &HashSet<String>,
+        control: &Control,
+    ) -> Result<HashMap<String, String>> {
+        let mut previews = HashMap::new();
+        let query = query.trim().to_lowercase();
+        let term = if exact {
+            query.as_str()
+        } else {
+            query.split_whitespace().next().unwrap_or("")
+        };
+        if term.is_empty() || hits.is_empty() {
+            return Ok(previews);
+        }
+        let literal = term.contains(['%', '_']);
+        // One indexed query, not one full-cache scan per matching chat. SQLite
+        // associates original with the row selected by max(rowid) in each group.
+        let sql = if literal {
+            "SELECT chat,original,max(rowid) FROM messages WHERE instr(body,?)>0 GROUP BY chat"
+        } else {
+            "SELECT chat,original,max(rowid) FROM messages WHERE body LIKE ? GROUP BY chat"
+        };
+        let mut stmt = self.db.prepare(sql)?;
+        let pattern = if literal {
+            term.to_string()
+        } else {
+            format!("%{term}%")
+        };
+        let mut rows = stmt.query([pattern])?;
+        while let Some(row) = rows.next()? {
+            control.check()?;
+            let id: String = row.get(0)?;
+            if hits.contains(&id) {
+                let text: String = row.get(1)?;
+                previews.insert(id, preview(&text, term));
+            }
+        }
+        Ok(previews)
     }
     fn search(&self, query: &str, exact: bool, control: &Control) -> Result<HashSet<String>> {
         let query = query.trim().to_lowercase();
@@ -581,6 +665,64 @@ impl Index {
     }
 }
 
+// Ranges are original UTF-8 byte offsets, including case folds that change
+// length (e.g. İ) and emoji preceding a hit. Rendering converts them to UTF-16.
+pub fn match_ranges(text: &str, query: &str, exact: bool) -> Vec<(usize, usize)> {
+    let mut folded = String::new();
+    let mut map = Vec::new();
+    for (at, c) in text.char_indices() {
+        let start = folded.len();
+        folded.extend(c.to_lowercase());
+        map.push((start, folded.len(), at, at + c.len_utf8()));
+    }
+    let query = query.trim().to_lowercase();
+    let terms: Vec<&str> = if exact {
+        vec![query.as_str()]
+    } else {
+        query.split_whitespace().collect()
+    };
+    let mut result = Vec::new();
+    for term in terms.into_iter().filter(|term| !term.is_empty()) {
+        for (at, _) in folded.match_indices(term) {
+            let end = at + term.len();
+            if let (Some(a), Some(b)) = (
+                map.iter().find(|v| v.0 <= at && at < v.1),
+                map.iter().find(|v| v.0 < end && end <= v.1),
+            ) {
+                result.push((a.2, b.3));
+            }
+        }
+    }
+    result.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in result {
+        if let Some(last) = merged.last_mut().filter(|last| a <= last.1) {
+            last.1 = last.1.max(b);
+        } else {
+            merged.push((a, b));
+        }
+    }
+    merged
+}
+fn preview(text: &str, term: &str) -> String {
+    let hit = match_ranges(text, term, true)
+        .first()
+        .map(|r| r.0)
+        .unwrap_or(0);
+    let start = text[..hit].chars().count().saturating_sub(22);
+    let excerpt: String = text.chars().skip(start).take(150).collect();
+    let excerpt = excerpt.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        excerpt,
+        if text.chars().count() > start + 150 {
+            "…"
+        } else {
+            ""
+        }
+    )
+}
 fn candidate(prefix: &[u8]) -> Option<bool> {
     let prefix: String = String::from_utf8_lossy(prefix)
         .chars()
@@ -720,6 +862,55 @@ fn history_text(json: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn previews_keep_original_case_and_highlight_unicode_boundaries() {
+        let text = "🚀 İ Camera 相机";
+        let ranges = match_ranges(text, "camera 相机", true);
+        assert_eq!(&text[ranges[0].0..ranges[0].1], "Camera 相机");
+        let ranges = match_ranges(text, "i", true);
+        assert_eq!(&text[ranges[0].0..ranges[0].1], "İ");
+        let long = format!("{} Camera 相机 {}", "前文".repeat(200), "后文".repeat(200));
+        let excerpt = preview(&long, "camera");
+        assert!(excerpt.starts_with('…'));
+        assert!(excerpt.contains("Camera 相机"));
+        assert!(excerpt.chars().count() <= 152);
+    }
+    #[test]
+    fn old_normalized_cache_migrates_to_original_text_snippets() {
+        let f = Fixture::new("old-schema");
+        let path = f.file.with_file_name("old.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE VIRTUAL TABLE messages USING fts5(chat UNINDEXED,body,tokenize='trigram',detail=none); INSERT INTO messages VALUES('old','obsolete');").unwrap();
+        drop(db);
+        let mut index = Index::open(&path).unwrap();
+        assert_eq!(
+            index
+                .db
+                .query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        fs::write(&f.file, line("user", "Camera 相机")).unwrap();
+        let control = Control {
+            generation: &f.generation,
+            expected: 1,
+            stop: &f.stop,
+        };
+        index
+            .update(
+                "chat",
+                &f.file,
+                &control,
+                &mut Status::default(),
+                &Mutex::default(),
+            )
+            .unwrap();
+        let hits = index.search("camera", false, &control).unwrap();
+        assert_eq!(
+            index.previews("camera", false, &hits, &control).unwrap()["chat"],
+            "Camera 相机"
+        );
+    }
     use std::{io::Write, sync::atomic::AtomicBool};
     struct Fixture {
         file: PathBuf,
@@ -860,7 +1051,7 @@ mod tests {
     #[test]
     fn async_latest_query_wins_and_warm_query_reads_no_logs() {
         let f = Fixture::new("service");
-        fs::write(&f.file, line("user", "memory 相机")).unwrap();
+        fs::write(&f.file, line("user", "Memory 相机")).unwrap();
         let dir = f.file.parent().unwrap().to_path_buf();
         let db = Connection::open(dir.join("state_5.sqlite")).unwrap();
         db.execute_batch(
@@ -898,6 +1089,7 @@ mod tests {
         let cold = wait(latest);
         assert!(cold.error.is_empty(), "{}", cold.error);
         assert!(cold.hits.contains("chat"));
+        assert!(cold.previews["chat"].contains("Memory"));
         assert_eq!(cold.bytes_read, 0);
         let warm = wait(service.submit("相机", false, ["chat".to_string()].into_iter()));
         assert!(warm.hits.contains("chat"));

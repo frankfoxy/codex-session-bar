@@ -54,6 +54,8 @@ pub struct Row {
     pub id: String,
     #[serde(default)]
     pub label: String,
+    #[serde(skip)]
+    pub fallback_title: bool,
     #[serde(default = "unknown")]
     pub state: String,
     #[serde(default)]
@@ -71,6 +73,39 @@ pub struct Row {
 }
 fn unknown() -> String {
     "Unknown".into()
+}
+fn display_title(name: Option<&str>, title: &str) -> String {
+    if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
+        return name.to_string();
+    }
+    let title = title.trim();
+    let envelope = title.starts_with("# Files")
+        || title.starts_with("## Referenced chats")
+        || title.starts_with("<environment_context>");
+    let request = match title.split_once("## My request:") {
+        Some((_, request)) => request.trim(),
+        None if envelope => return "Untitled chat".into(),
+        None => title,
+    };
+    for line in request.lines() {
+        let mut line = line.trim();
+        // A leading attachment/chat mention is context, not the user's title.
+        while line.starts_with('[') {
+            let Some(link) = line.find("](") else {
+                break;
+            };
+            let Some(end) = line[link + 2..].find(')') else {
+                break;
+            };
+            line = line[link + 2 + end + 1..].trim();
+        }
+        if line.is_empty() || line.starts_with("<image") || line.starts_with("Image attachment:") {
+            continue;
+        }
+        let text: String = line.chars().take(96).collect();
+        return format!("{text}{}", if line.chars().count() > 96 { "…" } else { "" });
+    }
+    "Untitled chat".into()
 }
 impl Row {
     pub fn rate(&self) -> Option<f64> {
@@ -335,12 +370,18 @@ impl Store {
     }
     pub fn sessions(&self) -> Result<Vec<Row>> {
         let db = self.db("state_5.sqlite")?;
-        let mut query=db.prepare("SELECT id,coalesce(nullif(name,''),title),updated_at,tokens_used FROM threads WHERE archived=0 AND agent_path IS NULL ORDER BY updated_at DESC,id")?;
+        let mut query=db.prepare("SELECT id,title,updated_at,tokens_used,name FROM threads WHERE archived=0 AND agent_path IS NULL ORDER BY updated_at DESC,id")?;
         let rows = query
             .query_map([], |r| {
                 Ok(Row {
                     id: r.get(0)?,
-                    label: r.get(1)?,
+                    label: display_title(
+                        r.get::<_, Option<String>>(4)?.as_deref(),
+                        &r.get::<_, String>(1)?,
+                    ),
+                    fallback_title: r
+                        .get::<_, Option<String>>(4)?
+                        .is_none_or(|v| v.trim().is_empty()),
                     updated_at: r.get(2)?,
                     tokens: r.get(3)?,
                     state: unknown(),
@@ -364,16 +405,36 @@ impl Store {
     }
     pub fn label(&self, id: &str) -> Result<String> {
         self.db("state_5.sqlite")?
-            .query_row(
-                "SELECT coalesce(nullif(name,''),title) FROM threads WHERE id=?",
-                [id],
-                |r| r.get(0),
-            )
+            .query_row("SELECT name,title FROM threads WHERE id=?", [id], |r| {
+                Ok(display_title(
+                    r.get::<_, Option<String>>(0)?.as_deref(),
+                    &r.get::<_, String>(1)?,
+                ))
+            })
             .context("Chat not found")
     }
     pub fn read(&mut self, id: &str) -> Result<Snapshot> {
         let db = self.db("state_5.sqlite")?;
-        let (mut snap,path)=db.query_row("SELECT id,coalesce(nullif(name,''),title),rollout_path,tokens_used,model,cwd FROM threads WHERE id=?",[id],|r|Ok((Snapshot{id:r.get(0)?,label:r.get(1)?,tokens_used:r.get(3)?,model:r.get::<_,Option<String>>(4)?.unwrap_or_default(),cwd:r.get(5)?,..Snapshot::default()},r.get::<_,String>(2)?)))?;
+        let (mut snap, path) = db.query_row(
+            "SELECT id,title,rollout_path,tokens_used,model,cwd,name FROM threads WHERE id=?",
+            [id],
+            |r| {
+                Ok((
+                    Snapshot {
+                        id: r.get(0)?,
+                        label: display_title(
+                            r.get::<_, Option<String>>(6)?.as_deref(),
+                            &r.get::<_, String>(1)?,
+                        ),
+                        tokens_used: r.get(3)?,
+                        model: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                        cwd: r.get(5)?,
+                        ..Snapshot::default()
+                    },
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )?;
         snap.turn=self.db("thread_history_1.sqlite")?.query_row("SELECT status,started_at,completed_at FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1",[id],|r|Ok(Turn{status:r.get(0)?,started_at:r.get(1)?,completed_at:r.get(2)?})).optional()?.unwrap_or_default();
         if let Ok(tokens) = self.tokens(&path) {
             snap.usage = tokens.usage;
@@ -471,6 +532,9 @@ impl Store {
         // Local metadata supplies the complete list even when the app's status
         // snapshot is bounded. Fetch token logs only for confirmed busy chats.
         let mut rows = self.sessions()?;
+        let local =
+            crate::body::local_ids(&self.paths, rows.iter().map(|r| r.id.clone()).collect())?;
+        rows.retain(|row| local.contains(&row.id));
         let mut turns = history.prepare("SELECT status FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1")?;
         let mut durations = history.prepare("SELECT SUM(CASE WHEN started_at IS NOT NULL AND completed_at >= started_at THEN completed_at-started_at END) FROM thread_turns WHERE thread_id=?")?;
         for row in &mut rows {
@@ -479,6 +543,14 @@ impl Store {
                 .get(row.id.as_str())
                 .copied()
                 .unwrap_or(&Value::Null);
+            if row.fallback_title {
+                if let Some(title) = entry["title"]
+                    .as_str()
+                    .filter(|title| !title.trim().is_empty())
+                {
+                    row.label = display_title(None, title);
+                }
+            }
             let turn = turns
                 .query_row([&row.id], |r| r.get::<_, String>(0))
                 .optional()?
@@ -541,6 +613,16 @@ pub fn load_recent(paths: &Paths) -> Recent {
     ))
     .unwrap_or_default();
     recent.stale = true;
+    for row in recent
+        .rows
+        .iter_mut()
+        .chain(&mut recent.all_rows)
+        .chain(&mut recent.busy_metrics)
+    {
+        if row.label.starts_with("# Files") || row.label.starts_with("## Referenced chats") {
+            row.label = display_title(None, &row.label);
+        }
+    }
     // Upgrade old caches, whose `rows` contained only ten busy-first entries.
     if !recent.all_rows.is_empty() {
         recent.rows = recent.all_rows.clone();
@@ -548,12 +630,37 @@ pub fn load_recent(paths: &Paths) -> Recent {
     recent
         .rows
         .sort_by(|a, b| b.updated_at.total_cmp(&a.updated_at).then(a.id.cmp(&b.id)));
+    if let Ok(local) =
+        crate::body::local_ids(paths, recent.rows.iter().map(|r| r.id.clone()).collect())
+    {
+        recent.rows.retain(|r| local.contains(&r.id));
+        recent.all_rows.retain(|r| local.contains(&r.id));
+        recent.busy_metrics.retain(|r| local.contains(&r.id));
+        if recent.busy_count.is_some() {
+            recent.busy_count = Some(recent.busy_metrics.len());
+        }
+    }
     recent
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn named_titles_win_and_attachment_envelopes_do_not_become_names() {
+        let prompt = "# Files mentioned by the user:\n输出报告.png\n## Referenced chats with Codex:\ncontext\n## My request:\n[@Reference](thread://ref)\n做一个 3D 模型\n放到工程目录";
+        assert_eq!(display_title(Some("📷 我的会话"), prompt), "📷 我的会话");
+        assert_eq!(display_title(None, prompt), "做一个 3D 模型");
+        assert!(!display_title(None, prompt).contains("输出"));
+        assert_eq!(
+            display_title(None, "## Referenced chats with Codex:\nmetadata"),
+            "Untitled chat"
+        );
+        assert_eq!(
+            display_title(None, "[top.v](D:/project/top.v) 输出接口设计\n详细正文"),
+            "输出接口设计"
+        );
+    }
     fn fixture(name: &str) -> (Paths, std::path::PathBuf) {
         let paths = Paths::discover().unwrap();
         let directory = paths
@@ -647,14 +754,33 @@ mod tests {
         tx.commit().unwrap();
         db.execute_batch("ALTER TABLE threads ADD COLUMN tokens_used INTEGER DEFAULT 27190000;")
             .unwrap();
+        db.execute_batch("ALTER TABLE threads ADD COLUMN rollout_path TEXT;
+            INSERT INTO threads(id,title,archived,updated_at) VALUES('metadata-only','not on this device',0,50000);").unwrap();
         let history = Connection::open(dir.join("thread_history_1.sqlite")).unwrap();
         history.execute_batch("CREATE TABLE thread_turns(thread_id TEXT,status TEXT,rollout_ordinal INTEGER); INSERT INTO thread_turns VALUES('chat-0','completed',1);").unwrap();
         history.execute_batch("ALTER TABLE thread_turns ADD COLUMN started_at REAL; ALTER TABLE thread_turns ADD COLUMN completed_at REAL;
             UPDATE thread_turns SET started_at=100,completed_at=160;
             INSERT INTO thread_turns VALUES('chat-0','completed',2,10000,10120),('chat-0','failed',3,20000,20030),('chat-0','interrupted',4,30000,NULL),('chat-0','completed',5,40000,39999);").unwrap();
+        history.execute_batch("CREATE TABLE thread_items(thread_id TEXT,item_id TEXT,item_type TEXT,updated_at_ordinal INTEGER,item_json TEXT);").unwrap();
+        for i in 0..79 {
+            history
+                .execute(
+                    "INSERT INTO thread_items VALUES(?,'m','userMessage',1,'{}')",
+                    [format!("chat-{i}")],
+                )
+                .unwrap();
+        }
+        let rollout = dir.join("local-chat.jsonl");
+        std::fs::write(&rollout, b"{}\n").unwrap();
+        db.execute(
+            "UPDATE threads SET rollout_path=? WHERE id='chat-79'",
+            [rollout.to_str().unwrap()],
+        )
+        .unwrap();
         let mut store = Store::new(&paths);
         let recent = store.recent(&serde_json::json!({"threads":[{"kind":"codex","hostId":"local","id":"chat-79","status":"active"}]})).unwrap();
         assert_eq!(recent.rows.len(), 80);
+        assert!(recent.rows.iter().all(|row| row.id != "metadata-only"));
         assert_eq!(recent.rows[0].id, "chat-0");
         assert_eq!(recent.rows[0].state, "Done");
         assert_eq!(recent.rows[0].tokens, Some(27190000));
