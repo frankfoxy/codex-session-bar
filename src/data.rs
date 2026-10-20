@@ -308,6 +308,39 @@ impl Catalog {
     pub fn rename(&self, title: &str, icon: &str) -> String {
         format!("{} {}", icon, self.strip(title)).trim().into()
     }
+    pub fn suggest(&self, title: &str) -> String {
+        let title = self.strip(title).to_lowercase();
+        let rules: &[(&[&str], &str)] = &[
+            (&["无人机", "drone", "uav"], "🚁"),
+            (&["session bar", "悬浮条", "工具条"], "🎛️"),
+            (
+                &["死机", "蓝屏", "系统问题", "crash", "修复", "debug"],
+                "🛠️",
+            ),
+            (&["memory", "内存", "sram", "ddr", "ram_"], "💾"),
+            (&["yolo", "神经", "识别", "ai 模块"], "🤖"),
+            (&["vllm", "大模型", "llm"], "🧠"),
+            (&["相机", "camera", "图像", "jpeg", "vision", "条码"], "📷"),
+            (&["drc", "pcb", "altium", "电路", "原理图"], "📐"),
+            (&["usb", "mipi", "接口", "串口"], "🔌"),
+            (&["gige", "网络", "socket", "隧道", "以太网"], "🌐"),
+            (&["rtl", "fpga", "verilog", "仿真"], "🧩"),
+            (&["python", "脚本"], "🐍"),
+            (&["文档", "readme", "spec", "说明"], "📝"),
+            (&["部署", "安装", "deploy", "install"], "🚀"),
+            (&["统计", "分析", "report", "数据"], "📊"),
+        ];
+        let icon = rules
+            .iter()
+            .find(|(keys, _)| keys.iter().any(|k| title.contains(k)))
+            .map(|(_, icon)| *icon)
+            .unwrap_or("💬");
+        self.entries
+            .iter()
+            .find(|e| e.emoji == icon)
+            .map(|e| e.emoji.clone())
+            .unwrap_or_else(|| "💬".into())
+    }
     pub fn filter(&self, query: &str, group: &str) -> Vec<usize> {
         let q = query.to_lowercase();
         let include = |entry: &Emoji| {

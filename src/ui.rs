@@ -20,7 +20,7 @@ use std::{
     time::Instant,
 };
 use windows::{
-    core::{w, PCWSTR},
+    core::{w, PCWSTR, PWSTR},
     Win32::{
         Foundation::*,
         Graphics::{Direct2D::Common::*, Direct2D::*, DirectWrite::*, Dxgi::Common::*, Gdi::*},
@@ -139,6 +139,7 @@ enum Hit {
     Fixed(String),
     Back,
     Random,
+    Auto,
     Clear,
     Emoji(usize),
     Refresh,
@@ -365,11 +366,83 @@ impl Painter {
     }
     unsafe fn toggle(&self, x: f32, y: f32, on: bool) {
         self.fill(
-            rect(x, y, 34., 20.),
+            rect(x, y, 28., 16.),
             if on { 0x30c777 } else { 0x4b555e },
-            10.,
+            8.,
         );
-        self.circle(x + if on { 24. } else { 10. }, y + 10., 8., 0xffffff);
+        self.circle(x + if on { 20. } else { 8. }, y + 8., 6., 0xffffff);
+    }
+    unsafe fn action_icon(&self, hit: &Hit, x: f32, y: f32) {
+        let c = MUTED;
+        match hit {
+            Hit::Exact => {
+                self.label("ab", rect(x + 3., y - 2., 16., 22.), 12., TEXT, false);
+                for (a, b) in [(x, x + 3.), (x + 22., x + 19.)] {
+                    self.line(a, y + 2., a, y + 16., c, 1.3);
+                    self.line(a, y + 2., b, y + 2., c, 1.3);
+                    self.line(a, y + 16., b, y + 16., c, 1.3);
+                }
+            }
+            Hit::Body => {
+                self.line(x + 1., y + 3., x + 18., y + 3., c, 1.4);
+                self.line(x + 1., y + 8., x + 10., y + 8., c, 1.4);
+                self.line(x + 1., y + 13., x + 7., y + 13., c, 1.4);
+                self.border(rect(x + 12., y + 9., 7., 7.), TEXT, 3.5);
+                self.line(x + 18., y + 15., x + 22., y + 19., TEXT, 1.5);
+            }
+            Hit::Refresh => {
+                for i in 0..28 {
+                    let a = -0.7 + i as f32 * 0.18;
+                    let b = a + 0.18;
+                    self.line(
+                        x + 11. + 8. * a.cos(),
+                        y + 10. + 8. * a.sin(),
+                        x + 11. + 8. * b.cos(),
+                        y + 10. + 8. * b.sin(),
+                        c,
+                        1.5,
+                    );
+                }
+                self.line(x + 17., y + 0., x + 17., y + 6., c, 1.5);
+                self.line(x + 17., y + 6., x + 11., y + 6., c, 1.5);
+            }
+            Hit::Auto => {
+                self.line(x + 3., y + 18., x + 17., y + 4., TEXT, 2.);
+                self.line(x + 10., y + 11., x + 13., y + 14., TEXT, 2.);
+                for (cx, cy) in [(4., 4.), (20., 14.)] {
+                    self.line(x + cx - 3., y + cy, x + cx + 3., y + cy, ORANGE, 1.4);
+                    self.line(x + cx, y + cy - 3., x + cx, y + cy + 3., ORANGE, 1.4);
+                }
+            }
+            Hit::Clear => {
+                for (a, b, cx, d) in [
+                    (3., 12., 12., 3.),
+                    (12., 3., 20., 11.),
+                    (20., 11., 12., 19.),
+                    (12., 19., 3., 12.),
+                    (8., 7., 16., 15.),
+                ] {
+                    self.line(x + a, y + b, x + cx, y + d, c, 1.5);
+                }
+                self.line(x + 12., y + 19., x + 22., y + 19., c, 1.5);
+            }
+            Hit::Back => {
+                self.line(x + 14., y + 3., x + 6., y + 10., c, 1.5);
+                self.line(x + 6., y + 10., x + 14., y + 17., c, 1.5);
+            }
+            Hit::Dock => {
+                self.border(rect(x + 1., y + 2., 21., 17.), c, 2.);
+                self.line(x + 1., y + 7., x + 22., y + 7., c, 1.4);
+                self.fill(rect(x + 12., y + 3., 8., 3.), GREEN, 1.);
+            }
+            Hit::Quit => {
+                self.border(rect(x + 2., y + 3., 13., 17.), c, 2.);
+                self.line(x + 9., y + 11., x + 23., y + 11., c, 1.5);
+                self.line(x + 19., y + 7., x + 23., y + 11., c, 1.5);
+                self.line(x + 19., y + 15., x + 23., y + 11., c, 1.5);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -387,6 +460,7 @@ struct App {
     edit_font: HFONT,
     child_brush: HBRUSH,
     tray_icon: HICON,
+    tips: Vec<Tips>,
     popup_kind: Option<Popup>,
     icon_target: Option<(String, String)>,
     icon_panel: Option<IconPanel>,
@@ -445,6 +519,49 @@ struct IconPanel {
     hits: Vec<Area>,
     layout: Option<[i32; 4]>,
 }
+// Stable tool rectangles/text let hover delays finish despite frequent repaints.
+struct Tips {
+    owner: HWND,
+    window: HWND,
+    entries: Vec<(RECT, Vec<u16>)>,
+}
+impl Drop for Tips {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyWindow(self.window);
+        }
+    }
+}
+fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
+    match hit {
+        Hit::Icon | Hit::ChatIcon(_) => "Change chat icon",
+        Hit::Title => "Recent chats · Ctrl+Alt+J",
+        Hit::Grip => "Drag session bar",
+        Hit::Hide => "Hide to tray · Ctrl+Alt+J to reopen",
+        Hit::Details => "Session settings",
+        Hit::Recent(_) => "Open chat in Codex",
+        Hit::Fixed(_) => "Use this fixed chat",
+        Hit::ChooseFixed => "Choose a fixed chat",
+        Hit::Back => "Back to session settings",
+        Hit::Random => "Random icon",
+        Hit::Auto => "Suggest icon from chat title · local matching",
+        Hit::Clear => "Remove chat icon",
+        Hit::Refresh => "Refresh account limits and chat list",
+        Hit::Dock => "Dock in the blank title bar area",
+        Hit::Follow => "Follow the current Codex chat",
+        Hit::Exact => "Exact match · whole title or body phrase",
+        Hit::Body => "Search message text · off by default",
+        Hit::Quit => "Quit Session Bar",
+        Hit::Emoji(i) => {
+            return catalog
+                .entries
+                .get(*i)
+                .map(|e| e.name.clone())
+                .unwrap_or_default()
+        }
+    }
+    .into()
+}
 impl App {
     unsafe fn new(
         paths: Paths,
@@ -453,6 +570,10 @@ impl App {
         stop: Stop,
         testing: bool,
     ) -> Result<Self> {
+        let _ = InitCommonControlsEx(&INITCOMMONCONTROLSEX {
+            dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_WIN95_CLASSES,
+        });
         let catalog = Catalog::load(&paths)?;
         let painter = Painter::new()?;
         let mut groups = vec!["默认集合".into(), "All emoji".into()];
@@ -514,6 +635,7 @@ impl App {
             edit_font: HFONT::default(),
             child_brush: CreateSolidBrush(COLORREF(0x25211c)),
             tray_icon: create_tray_icon()?,
+            tips: Vec::new(),
             popup_kind: None,
             icon_target: None,
             icon_panel: None,
@@ -791,8 +913,8 @@ impl App {
                 p.line(x + 16., 13., x + 8., 21., MUTED, 1.3);
             }
             Some(Popup::Recent) => {
-                p.fill(rect(16., 13., 260., 36.), 0x1c2125, 6.);
-                p.border(rect(16., 13., 260., 36.), 0x43515a, 6.);
+                p.fill(rect(12., 9., 244., 30.), 0x1c2125, 6.);
+                p.border(rect(12., 9., 244., 30.), 0x43515a, 6.);
                 if self.testing {
                     p.label(
                         if self.search.is_empty() {
@@ -800,25 +922,19 @@ impl App {
                         } else {
                             &self.search
                         },
-                        rect(27., 14., 238., 34.),
-                        13.,
+                        rect(23., 9., 222., 30.),
+                        12.,
                         MUTED,
                         false,
                     );
                 }
-                let exact = rect(288., 14., 80., 34.);
-                area(Hit::Exact, exact);
-                p.border(rect(292., 21., 18., 20.), MUTED, 3.);
-                p.line(296., 28., 306., 28., TEXT, 1.5);
-                p.line(296., 34., 306., 34., TEXT, 1.5);
-                p.toggle(320., 21., self.search_exact);
+                area(Hit::Exact, rect(264., 8., 60., 32.));
+                p.action_icon(&Hit::Exact, 266., 14.);
+                p.toggle(293., 16., self.search_exact);
+                area(Hit::Body, rect(330., 8., 60., 32.));
+                p.action_icon(&Hit::Body, 332., 14.);
+                p.toggle(359., 16., self.search_body);
                 let (tokens, rate, partial) = live.recent.totals();
-                area(Hit::Body, rect(384., 14., 94., 34.));
-                p.border(rect(388., 21., 16., 20.), MUTED, 2.);
-                for y in [27., 31., 35.] {
-                    p.line(392., y, 400., y, TEXT, 1.3);
-                }
-                p.toggle(414., 21., self.search_body);
                 let total = format!(
                     "Total {}{} t/s  ·  {}{} TOK",
                     rate.map(|r| format!("{r:.1}")).unwrap_or("—".into()),
@@ -826,22 +942,15 @@ impl App {
                     data::compact(tokens),
                     if partial && tokens.is_some() { "*" } else { "" }
                 );
-                area(Hit::Refresh, rect(width - 80., 14., 64., 34.));
-                let (cx, cy) = (width - 46., 31.);
-                for i in 0..24 {
-                    let a = 0.6 + i as f32 * 0.2;
-                    let b = a + 0.2;
-                    p.line(
-                        cx + 8. * a.cos(),
-                        cy + 8. * a.sin(),
-                        cx + 8. * b.cos(),
-                        cy + 8. * b.sin(),
-                        TEXT,
-                        1.5,
-                    );
-                }
-                p.line(cx + 4., cy - 9., cx + 8., cy - 7., TEXT, 1.5);
-                p.line(cx + 8., cy - 7., cx + 8., cy - 12., TEXT, 1.5);
+                area(Hit::Refresh, rect(398., 8., 32., 32.));
+                p.action_icon(&Hit::Refresh, 403., 14.);
+                p.label(
+                    &format!("{} chats", self.chat_filters.len()),
+                    rect(443., 9., width - 455., 30.),
+                    11.,
+                    MUTED,
+                    false,
+                );
                 for (slot, &index) in self
                     .chat_filters
                     .iter()
@@ -850,7 +959,7 @@ impl App {
                     .enumerate()
                 {
                     let row = &self.rows[index];
-                    let y = 60. + slot as f32 * 43.;
+                    let y = 48. + slot as f32 * 43.;
                     let busy = row.state == "Busy";
                     let current = row.id == self.identity(&live);
                     let r = rect(12., y, width - 30., 39.);
@@ -992,8 +1101,8 @@ impl App {
                     let thumb = (337. * 8. / self.chat_filters.len() as f32).max(20.);
                     let offset =
                         (337. - thumb) * self.scroll as f32 / (self.chat_filters.len() - 8) as f32;
-                    p.fill(rect(width - 11., 62., 4., 337.), 0x303c44, 2.);
-                    p.fill(rect(width - 11., 62. + offset, 4., thumb), 0x6f8b9d, 2.);
+                    p.fill(rect(width - 11., 50., 4., 337.), 0x303c44, 2.);
+                    p.fill(rect(width - 11., 50. + offset, 4., thumb), 0x6f8b9d, 2.);
                 }
                 let hint = if live.recent.stale || now() - live.recent.loaded_at > 10. {
                     " · Cached"
@@ -1030,20 +1139,14 @@ impl App {
                         self.rows.len()
                     )
                 };
-                let count = match self.hover {
-                    Some(Hit::Exact) => "Exact · full chat title / body phrase".to_string(),
-                    Some(Hit::Body) => "Body · include message text in search".to_string(),
-                    Some(Hit::Refresh) => "Refresh · reload account limits".to_string(),
-                    _ => count,
-                };
                 p.label(
                     &count,
-                    rect(16., height - 29., 350., 24.),
+                    rect(16., height - 29., 235., 24.),
                     11.,
                     MUTED,
                     false,
                 );
-                let tw = p.width(&total, 11.).min(width - 380.);
+                let tw = p.width(&total, 11.).min(width - 265.);
                 p.label(
                     &total,
                     rect(width - 16. - tw, height - 29., tw + 1., 24.),
@@ -1067,14 +1170,16 @@ impl App {
                     .unwrap_or((&self.search, &self.category, &self.filters, self.scroll));
                 area(Hit::Random, rect(12., 9., 36., 32.));
                 p.label("🎲", rect(17., 9., 30., 32.), 20., TEXT, true);
+                area(Hit::Auto, rect(50., 9., 34., 32.));
+                p.action_icon(&Hit::Auto, 56., 14.);
                 let icon_title = self
                     .icon_target
                     .as_ref()
                     .map(|(_, label)| self.catalog.strip(label))
                     .unwrap_or("Session icon");
-                p.label(icon_title, rect(57., 9., 250., 32.), 14., TEXT, false);
-                area(Hit::Clear, rect(width - 68., 10., 54., 30.));
-                p.label("Clear", rect(width - 62., 10., 48., 30.), 12., MUTED, false);
+                p.label(icon_title, rect(92., 9., 235., 32.), 14., TEXT, false);
+                area(Hit::Clear, rect(width - 46., 10., 32., 30.));
+                p.action_icon(&Hit::Clear, width - 41., 15.);
                 for r in [rect(14., 49., 190., 29.), rect(214., 49., 155., 29.)] {
                     p.fill(r, 0x1c2125, 3.);
                     p.border(r, 0x47535b, 3.);
@@ -1124,13 +1229,7 @@ impl App {
                     false,
                 );
                 area(Hit::Back, rect(width - 74., 9., 58., 30.));
-                p.label(
-                    "‹  Back",
-                    rect(width - 68., 9., 54., 30.),
-                    12.,
-                    MUTED,
-                    false,
-                );
+                p.action_icon(&Hit::Back, width - 48., 14.);
                 p.fill(rect(16., 49., width - 32., 35.), 0x1c2125, 6.);
                 p.border(rect(16., 49., width - 32., 35.), 0x43515a, 6.);
                 if self.testing {
@@ -1386,14 +1485,14 @@ impl App {
                         .join("   ")
                 };
                 p.label(&quota, rect(16., 167., width - 32., 25.), 12., MUTED, false);
-                for (hit, text, x, w) in [
-                    (Hit::Refresh, "Refresh limits", 16., 122.),
-                    (Hit::Dock, "Dock in title bar", 148., 140.),
-                    (Hit::Quit, "Quit session bar", width - 151., 134.),
+                for (hit, x) in [
+                    (Hit::Refresh, 16.),
+                    (Hit::Dock, 58.),
+                    (Hit::Quit, width - 52.),
                 ] {
-                    area(hit, rect(x, 204., w, 30.));
-                    p.border(rect(x, 204., w, 30.), 0x47535b, 5.);
-                    p.label(text, rect(x + 8., 204., w - 12., 30.), 12., TEXT, false);
+                    area(hit.clone(), rect(x, 204., 36., 32.));
+                    p.border(rect(x, 204., 36., 32.), 0x47535b, 5.);
+                    p.action_icon(&hit, x + 6., 210.);
                 }
                 p.label(
                     &live.action_note,
@@ -1439,6 +1538,7 @@ impl App {
                 (bounds.bottom - bounds.top) as f32 / scale,
             );
             let _ = self.painter.target.EndDraw(None, None);
+            self.sync_tips(hwnd, &hits, scale);
             if hwnd == self.bar {
                 self.hits = hits;
             } else if let Some(panel) = self.icon_panel.as_mut().filter(|p| p.window == hwnd) {
@@ -1448,6 +1548,90 @@ impl App {
             }
         }
         let _ = EndPaint(hwnd, &paint);
+    }
+    unsafe fn sync_tips(&mut self, owner: HWND, hits: &[Area], scale: f32) {
+        let entries: Vec<_> = hits
+            .iter()
+            .map(|a| {
+                (
+                    RECT {
+                        left: (a.r.left * scale).round() as i32,
+                        top: (a.r.top * scale).round() as i32,
+                        right: (a.r.right * scale).round() as i32,
+                        bottom: (a.r.bottom * scale).round() as i32,
+                    },
+                    wide(&tip_text(&a.hit, &self.catalog)),
+                )
+            })
+            .collect();
+        if self
+            .tips
+            .iter()
+            .any(|t| t.owner == owner && t.entries == entries)
+        {
+            return;
+        }
+        self.tips.retain(|t| t.owner != owner);
+        let Ok(window) = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            TOOLTIPS_CLASSW,
+            PCWSTR::null(),
+            WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX),
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            owner,
+            None,
+            GetModuleHandleW(None).unwrap_or_default(),
+            None,
+        ) else {
+            return;
+        };
+        let mut tips = Tips {
+            owner,
+            window,
+            entries,
+        };
+        let _ = SetWindowTheme(window, w!("DarkMode_Explorer"), PCWSTR::null());
+        let _ = SendMessageW(window, TTM_SETMAXTIPWIDTH, WPARAM(0), LPARAM(360));
+        let _ = SendMessageW(
+            window,
+            TTM_SETDELAYTIME,
+            WPARAM(TTDT_INITIAL as usize),
+            LPARAM(400),
+        );
+        let _ = SendMessageW(
+            window,
+            TTM_SETDELAYTIME,
+            WPARAM(TTDT_AUTOPOP as usize),
+            LPARAM(6000),
+        );
+        let _ = SendMessageW(
+            window,
+            WM_SETFONT,
+            WPARAM(self.edit_font.0 as usize),
+            LPARAM(0),
+        );
+        for (i, (bounds, text)) in tips.entries.iter_mut().enumerate() {
+            let info = TTTOOLINFOW {
+                // V2 size also works without a common-controls v6 manifest.
+                cbSize: std::mem::offset_of!(TTTOOLINFOW, lpReserved) as u32,
+                uFlags: TTF_SUBCLASS,
+                hwnd: owner,
+                uId: i + 1,
+                rect: *bounds,
+                lpszText: PWSTR(text.as_mut_ptr()),
+                ..Default::default()
+            };
+            let _ = SendMessageW(
+                window,
+                TTM_ADDTOOLW,
+                WPARAM(0),
+                LPARAM(&info as *const _ as isize),
+            );
+        }
+        self.tips.push(tips);
     }
     unsafe fn measure_bar(&self) -> i32 {
         let live = self.snapshot();
@@ -1817,10 +2001,10 @@ impl App {
             &mut info,
         );
         let bounds = info.rcWork;
-        let x = if parent[2] + gap + w <= bounds.right {
-            parent[2] + gap
-        } else if parent[0] - gap - w >= bounds.left {
+        let x = if parent[0] - gap - w >= bounds.left {
             parent[0] - gap - w
+        } else if parent[2] + gap + w <= bounds.right {
+            parent[2] + gap
         } else {
             (parent[2] - w)
                 .max(bounds.left)
@@ -1852,6 +2036,7 @@ impl App {
     }
     unsafe fn close_icon_panel(&mut self) {
         if let Some(panel) = self.icon_panel.take() {
+            self.tips.retain(|t| t.owner != panel.window);
             let _ = DestroyWindow(panel.window);
             self.icon_target = None;
             self.hover = None;
@@ -1984,6 +2169,7 @@ impl App {
     }
     unsafe fn close_popup(&mut self) {
         self.close_icon_panel();
+        self.tips.retain(|t| t.owner != self.popup);
         if self.body_pending {
             if let Some(service) = &self.body_service {
                 service.cancel();
@@ -2045,6 +2231,7 @@ impl App {
     }
     unsafe fn popup(&mut self, kind: Popup) -> Result<()> {
         self.close_icon_panel();
+        self.tips.retain(|t| t.owner != self.popup);
         if self.popup_kind == Some(kind) && IsWindowVisible(self.popup).as_bool() {
             self.close_popup();
             return Ok(());
@@ -2076,7 +2263,7 @@ impl App {
         self.popup_size = match kind {
             Popup::Recent => {
                 self.rows = live.recent.rows.clone();
-                [650, 448]
+                [560, 436]
             }
             Popup::Icons => [384, 450],
             Popup::Details => [560, 310],
@@ -2166,8 +2353,8 @@ impl App {
                 w!(""),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
                 27,
-                if kind == Popup::Recent { 19 } else { 55 },
-                if kind == Popup::Recent { 238 } else { 506 },
+                if kind == Popup::Recent { 13 } else { 55 },
+                if kind == Popup::Recent { 218 } else { 506 },
                 24,
                 self.popup,
                 HMENU(103isize as *mut _),
@@ -2182,6 +2369,7 @@ impl App {
             );
         }
         let previous_font = self.edit_font;
+        self.tips.clear();
         self.edit_font = CreateFontW(
             (-14.0 * self.dpi).round() as i32,
             0,
@@ -2276,7 +2464,7 @@ impl App {
             if self.popup_kind == Some(Popup::Fixed) {
                 (self.edit, 27, 55, 506, 24)
             } else if self.popup_kind == Some(Popup::Recent) {
-                (self.edit, 27, 19, 238, 24)
+                (self.edit, 23, 13, 218, 22)
             } else {
                 (self.edit, 14, 49, 190, 29)
             },
@@ -2376,7 +2564,7 @@ impl App {
                 self.close_popup();
                 return Some(Action::Navigate(id));
             }
-            Hit::Random | Hit::Clear | Hit::Emoji(_) => {
+            Hit::Random | Hit::Auto | Hit::Clear | Hit::Emoji(_) => {
                 let live = self.snapshot();
                 let Some((id, label)) = self
                     .icon_target
@@ -2387,6 +2575,7 @@ impl App {
                 };
                 let icon = match hit {
                     Hit::Clear => String::new(),
+                    Hit::Auto => self.catalog.suggest(&label),
                     Hit::Emoji(index) => self.catalog.entries[index].emoji.clone(),
                     _ => {
                         let current_icon = self.catalog.icon(&label);
@@ -2554,22 +2743,22 @@ impl App {
     fn fixed_hit_at(&self, x: f32, y: f32) -> Option<Hit> {
         let width = self.popup_size[0] as f32;
         if self.popup_kind == Some(Popup::Recent) {
-            if (384. ..478.).contains(&x) && (14. ..48.).contains(&y) {
+            if (330. ..390.).contains(&x) && (8. ..40.).contains(&y) {
                 return Some(Hit::Body);
             }
-            if (288. ..368.).contains(&x) && (14. ..48.).contains(&y) {
+            if (264. ..324.).contains(&x) && (8. ..40.).contains(&y) {
                 return Some(Hit::Exact);
             }
-            if (width - 80. ..width - 16.).contains(&x) && (14. ..48.).contains(&y) {
+            if (398. ..430.).contains(&x) && (8. ..40.).contains(&y) {
                 return Some(Hit::Refresh);
             }
             if !(12. ..width - 18.).contains(&x)
-                || !(60. ..404.).contains(&y)
-                || (y - 60.) % 43. >= 39.
+                || !(48. ..392.).contains(&y)
+                || (y - 48.) % 43. >= 39.
             {
                 return None;
             }
-            let slot = self.scroll + ((y - 60.) / 43.) as usize;
+            let slot = self.scroll + ((y - 48.) / 43.) as usize;
             return self.chat_filters.get(slot).map(|&index| {
                 if (18. ..48.).contains(&x) {
                     Hit::ChatIcon(self.rows[index].id.clone())
@@ -2650,7 +2839,7 @@ impl App {
             return None;
         }
         let (top, height) = match self.popup_kind {
-            Some(Popup::Recent) => (62., 337.),
+            Some(Popup::Recent) => (50., 337.),
             Some(Popup::Fixed) => (100., 350.),
             _ => return None,
         };
@@ -3192,17 +3381,48 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert!(app.current(&app.snapshot()).is_none());
         assert_eq!(app.catalog.defaults.len(), 90);
         assert!(app.catalog.entries.len() > 3900);
+        assert_eq!(app.catalog.suggest("🚧 条码智能相机纯RTL"), "📷");
+        assert_eq!(app.catalog.suggest("codex session bar"), "🎛️");
+        assert_eq!(app.catalog.suggest("系统问题修复。"), "🛠️");
+        assert_eq!(app.catalog.suggest("调研无人机 AI 模块"), "🚁");
         app.popup(Popup::Recent)?;
+        let tip_areas: Vec<_> = [Hit::Exact, Hit::Body, Hit::Refresh, Hit::Auto]
+            .into_iter()
+            .enumerate()
+            .map(|(i, hit)| Area {
+                hit,
+                r: rect(i as f32 * 40., 8., 32., 32.),
+            })
+            .collect();
+        app.sync_tips(app.popup, &tip_areas, 1.);
+        let tip_window = app
+            .tips
+            .iter()
+            .find(|t| t.owner == app.popup)
+            .unwrap()
+            .window;
+        assert!(SendMessageW(tip_window, TTM_GETTOOLCOUNT, WPARAM(0), LPARAM(0)).0 > 3);
+        for _ in 0..100 {
+            app.sync_tips(app.popup, &tip_areas, 1.);
+        }
+        assert_eq!(
+            app.tips
+                .iter()
+                .find(|t| t.owner == app.popup)
+                .unwrap()
+                .window,
+            tip_window
+        );
         assert!(!app.search_body);
         assert!(app.body_service.is_none());
-        assert_eq!(app.fixed_hit_at(420., 30.), Some(Hit::Body));
+        assert_eq!(app.fixed_hit_at(360., 25.), Some(Hit::Body));
         let _ = app.hit(Hit::Body);
         assert!(app.search_body);
         assert!(app.body_service.is_none());
         let _ = app.hit(Hit::Body);
         assert!(!app.search_body);
         assert_eq!(app.rows.len(), 40);
-        assert_eq!(app.popup_size, [650, 448]);
+        assert_eq!(app.popup_size, [560, 436]);
         app.search = "huihuamingcheng 25".into();
         app.filter_fixed();
         assert_eq!(app.chat_filters, [24]);
@@ -3239,7 +3459,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             app.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
             original
         );
-        assert!(app.begin_chat_scroll(640., 394.));
+        assert!(app.begin_chat_scroll(550., 382.));
         app.drag_chat_scroll(1000.);
         assert_eq!(app.scroll, 32);
         app.chat_scroll_drag = None;
@@ -3292,8 +3512,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            650,
-            448,
+            560,
+            436,
             &paths.runtime.join("rust-recent-verification.png"),
         )?;
         assert_eq!(
@@ -3392,6 +3612,12 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         );
         assert_eq!(app.popup_kind, Some(Popup::Recent));
         app.search.clear();
+        assert!(app.hit(Hit::ChatIcon(rows[7].id.clone())).is_none());
+        let expected_icon = app.catalog.suggest(&rows[7].label);
+        assert!(
+            matches!(app.hit(Hit::Auto), Some(Action::Icon(id, icon)) if id == rows[7].id && icon == expected_icon)
+        );
+        assert_eq!(app.popup_kind, Some(Popup::Recent));
         app.filter_fixed();
         app.index_pending = true;
         app.body_state = body::Status {
@@ -3405,8 +3631,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            650,
-            448,
+            560,
+            436,
             &paths.runtime.join("rust-background-index-verification.png"),
         )?;
         app.index_pending = false;
@@ -3416,8 +3642,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            650,
-            448,
+            560,
+            436,
             &paths.runtime.join("rust-recent-search-verification.png"),
         )?;
         app.search_body = true;
@@ -3451,8 +3677,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            650,
-            448,
+            560,
+            436,
             &paths.runtime.join("rust-recent-body-verification.png"),
         )?;
         app.paths.write("rust-body-ui-test.json",&json!({"default_off":true,"background_prewarm":true,"ios_switches":true,"busy_title_body_ranking":true,"body_match_badge":true}));

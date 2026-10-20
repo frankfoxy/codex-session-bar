@@ -139,3 +139,9 @@ The first page is the original 90-item 默认集合. The full catalog is filtere
 virtualized as a 90-cell viewport with scroll, category and search controls.
 Random selection excludes the current icon. Prefix matching is longest-first
 so flags, skin tones, keycaps and ZWJ sequences remain intact during renames.
+
+## UI interaction notes · 2026-10-20
+
+- Recent panel: 560 × 436 logical pixels, compact icon switches and native Win32 tooltips. Tool rectangles and text are compared before updating, so the timer does not restart the hover delay on every paint.
+- Icon popovers prefer the left side of the list, then the right side, then a monitor-bounded position. Title suggestions run locally using deterministic keyword rules and share the captured target ID used by random/clear actions.
+- Native self-test verifies tooltip registration survives repeated refreshes and suggested icons remain bound to the selected list row.
