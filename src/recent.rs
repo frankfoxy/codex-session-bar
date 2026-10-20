@@ -1,7 +1,7 @@
 // Recent-list layout and tag interactions. Included in ui so all native hit tests
 // share the same geometry as the renderer.
 const TAG_SIDEBAR: f32 = 236.;
-const TAG_CLOUD_TOP: f32 = RECENT_TOP as f32 + 64.;
+const TAG_CLOUD_TOP: f32 = RECENT_TOP as f32 + 20.;
 const TAG_REGION_MAX: f32 = 128.;
 #[derive(Clone, Copy)]
 struct RecentColumns {
@@ -97,12 +97,15 @@ impl App {
             self.shortcut_registered = false;
         }
     }
-    fn recent_left(&self) -> f32 {
+    fn recent_toolbar_left(&self) -> f32 {
         if self.sidebar_open {
-            TAG_SIDEBAR + 12.
+            TAG_SIDEBAR
         } else {
-            12.
+            0.
         }
+    }
+    fn recent_left(&self) -> f32 {
+        self.recent_toolbar_left() + 12.
     }
     fn recent_row_height(&self) -> i32 {
         if self.settings.compact_recent {
@@ -321,10 +324,10 @@ impl App {
         let _ = MoveWindow(
             self.tag_search_input,
             (46. * self.dpi) as i32,
-            ((RECENT_TOP as f32 + 9.) * self.dpi) as i32,
+            (14. * self.dpi) as i32,
             ((TAG_SIDEBAR - 97.) * self.dpi) as i32,
             (22. * self.dpi) as i32,
-            true,
+            !self.popup_layout_batch,
         );
     }
     unsafe fn ensure_tag_search(&mut self) -> Result<()> {
@@ -358,12 +361,7 @@ impl App {
                 WPARAM(self.edit_font.0 as usize),
                 LPARAM(1),
             );
-            SendMessageW(
-                self.tag_search_input,
-                EM_SETCUEBANNER,
-                WPARAM(1),
-                LPARAM(w!("Tags / pinyin…").as_ptr() as isize),
-            );
+            install_search_cue(self.tag_search_input, 2)?;
             let _ = SetWindowTheme(self.tag_search_input, w!("DarkMode_CFD"), PCWSTR::null());
         }
         self.place_tag_search();
@@ -548,13 +546,13 @@ impl App {
     }
     fn chat_clear_rect(&self) -> D2D_RECT_F {
         if self.popup_kind == Some(Popup::Recent) {
-            rect(273., 13., 24., 24.)
+            rect(self.recent_toolbar_left() + 273., 13., 24., 24.)
         } else {
             rect(self.popup_size[0] as f32 - 47., 54., 24., 24.)
         }
     }
     fn tag_clear_rect() -> D2D_RECT_F {
-        rect(TAG_SIDEBAR - 43., RECENT_TOP as f32 + 8., 24., 24.)
+        rect(TAG_SIDEBAR - 43., 13., 24., 24.)
     }
     fn emoji_clear_rect() -> D2D_RECT_F {
         rect(176., 51.5, 24., 24.)
@@ -610,26 +608,28 @@ impl App {
         let live = self.snapshot();
         let mut hits = Vec::new();
         let mut area = |hit, r| hits.push(Area { hit, r });
-        area(Hit::TagSidebar, rect(12., 9., 30., 30.));
+        let toolbar = self.recent_toolbar_left();
+        area(Hit::TagSidebar, rect(toolbar + 12., 9., 30., 30.));
         if self.sidebar_open {
-            p.fill(rect(12., 9., 30., 30.), 0x334750, 6.);
+            p.fill(rect(toolbar + 12., 9., 30., 30.), 0x334750, 6.);
         }
         p.tag_icon(
-            16.,
+            toolbar + 16.,
             12.,
             if self.sidebar_open { 0x92c8f3 } else { MUTED },
             0.85,
         );
-        p.fill(rect(51., 9., 250., 32.), 0x1c2125, 6.);
-        p.border(rect(51., 9., 250., 32.), 0x43515a, 6.);
+        p.fill(rect(toolbar + 51., 9., 250., 32.), 0x1c2125, 6.);
+        p.border(rect(toolbar + 51., 9., 250., 32.), 0x43515a, 6.);
+        p.search_icon(toolbar + 66., 23., MUTED);
         if self.testing {
             p.label(
                 if self.search.is_empty() {
-                    "Search chats / pinyin…"
+                    search_cue(1)
                 } else {
                     &self.search
                 },
-                rect(61., 9., 206., 32.),
+                rect(toolbar + 83., 9., 184., 32.),
                 12.,
                 MUTED,
                 false,
@@ -640,17 +640,24 @@ impl App {
             area(Hit::ClearChatSearch, r);
             p.search_clear(r, self.hover == Some(Hit::ClearChatSearch));
         }
-        area(Hit::Body, rect(310., 8., 60., 32.));
-        p.action_icon(&Hit::Body, 312., 14.);
-        p.toggle(339., 16., self.search_body);
-        area(Hit::Compact, rect(382., 8., 60., 32.));
+        area(Hit::Body, rect(toolbar + 310., 8., 60., 32.));
+        p.action_icon(&Hit::Body, toolbar + 312., 14.);
+        p.toggle(toolbar + 339., 16., self.search_body);
+        area(Hit::Compact, rect(toolbar + 382., 8., 60., 32.));
         for offset in [0., 6., 12.] {
-            p.line(385., 17. + offset, 401., 17. + offset, MUTED, 1.3);
+            p.line(
+                toolbar + 385.,
+                17. + offset,
+                toolbar + 401.,
+                17. + offset,
+                MUTED,
+                1.3,
+            );
         }
-        p.toggle(411., 16., self.settings.compact_recent);
-        area(Hit::Refresh, rect(454., 8., 32., 32.));
-        p.fill(rect(454., 8., 32., 32.), 0x2b3a3c, 8.);
-        p.action_icon(&Hit::Refresh, 459., 13.);
+        p.toggle(toolbar + 411., 16., self.settings.compact_recent);
+        area(Hit::Refresh, rect(toolbar + 454., 8., 32., 32.));
+        p.fill(rect(toolbar + 454., 8., 32., 32.), 0x2b3a3c, 8.);
+        p.action_icon(&Hit::Refresh, toolbar + 459., 13.);
         let fresh = self
             .chat_filters
             .iter()
@@ -672,9 +679,10 @@ impl App {
                 }
             ),
             rect(
-                499.,
+                toolbar + 499.,
                 9.,
                 width
+                    - toolbar
                     - if self.tag_filters.is_empty() {
                         512.
                     } else {
@@ -693,33 +701,18 @@ impl App {
         }
         let left = self.recent_left();
         if self.sidebar_open {
-            p.line(
-                TAG_SIDEBAR,
-                RECENT_TOP as f32,
-                TAG_SIDEBAR,
-                height - 40.,
-                0x3a484f,
-                1.,
-            );
-            p.fill(
-                rect(16., RECENT_TOP as f32 + 4., TAG_SIDEBAR - 32., 32.),
-                0x1c2125,
-                5.,
-            );
-            p.border(
-                rect(16., RECENT_TOP as f32 + 4., TAG_SIDEBAR - 32., 32.),
-                0x43515a,
-                5.,
-            );
-            p.tag_icon(23., RECENT_TOP as f32 + 11., MUTED, 0.66);
+            p.line(TAG_SIDEBAR, 8., TAG_SIDEBAR, height - 40., 0x3a484f, 1.);
+            p.fill(rect(16., 9., TAG_SIDEBAR - 32., 32.), 0x1c2125, 5.);
+            p.border(rect(16., 9., TAG_SIDEBAR - 32., 32.), 0x43515a, 5.);
+            p.tag_icon(23., 16., MUTED, 0.66);
             if self.testing {
                 p.label(
                     if self.tag_query.is_empty() {
-                        "Tags / pinyin…"
+                        search_cue(2)
                     } else {
                         &self.tag_query
                     },
-                    rect(46., RECENT_TOP as f32 + 5., TAG_SIDEBAR - 97., 29.),
+                    rect(46., 9., TAG_SIDEBAR - 97., 32.),
                     11.,
                     TEXT,
                     false,
@@ -732,7 +725,7 @@ impl App {
             }
             p.label(
                 "Name · pinyin · initials",
-                rect(18., RECENT_TOP as f32 + 39., TAG_SIDEBAR - 34., 19.),
+                rect(18., 46., TAG_SIDEBAR - 34., 19.),
                 9.,
                 MUTED,
                 false,
@@ -1557,9 +1550,24 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     );
     app.place_popup();
     let before_panel = host::bounds(app.popup.0 as isize).unwrap();
+    let before_search = host::bounds(app.edit.0 as isize).unwrap();
+    let before_toolbar = capture(
+        app,
+        Some(Popup::Recent),
+        1040,
+        app.popup_size[1] as u32,
+        &paths
+            .runtime
+            .join("rust-toolbar-collapsed-verification.png"),
+    )?;
     let before_chat_x = before_panel[0] + (app.recent_left() * scale).round() as i32;
     let _ = app.hit(Hit::TagSidebar);
     let expanded_panel = host::bounds(app.popup.0 as isize).unwrap();
+    assert_eq!(
+        host::bounds(app.edit.0 as isize).unwrap(),
+        before_search,
+        "Chat search must not move when tags expand"
+    );
     assert_eq!(
         before_chat_x,
         expanded_panel[0] + (app.recent_left() * scale).round() as i32
@@ -1596,6 +1604,34 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
         h,
         &paths.runtime.join("rust-tags-expanded-verification.png"),
     )?;
+    for hit in [Hit::TagSidebar, Hit::Body, Hit::Compact, Hit::Refresh] {
+        let before = before_toolbar
+            .iter()
+            .find(|area| area.hit == hit)
+            .unwrap()
+            .r;
+        let after = app
+            .popup_hits
+            .iter()
+            .find(|area| area.hit == hit)
+            .unwrap()
+            .r;
+        assert_eq!(
+            before_panel[0] + (before.left * scale).round() as i32,
+            expanded_panel[0] + (after.left * scale).round() as i32
+        );
+        assert_eq!(
+            before_panel[1] + (before.top * scale).round() as i32,
+            expanded_panel[1] + (after.top * scale).round() as i32
+        );
+        assert_eq!(
+            app.fixed_hit_at(
+                (after.left + after.right) / 2.,
+                (after.top + after.bottom) / 2.
+            ),
+            Some(hit)
+        );
+    }
     assert!(app
         .popup_hits
         .iter()
@@ -1653,6 +1689,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     assert!(!app.sidebar_open);
     assert_eq!(app.popup_size[0], 1040);
     assert_eq!(host::bounds(app.popup.0 as isize).unwrap(), before_panel);
+    assert_eq!(host::bounds(app.edit.0 as isize).unwrap(), before_search);
     let _ = SetWindowPos(
         app.bar,
         HWND_TOPMOST,
@@ -1798,6 +1835,24 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     app.ensure_tag_search()?;
     assert!(!app.tag_search_input.is_invalid());
     assert_eq!(GetDlgCtrlID(app.tag_search_input), 106);
+    let tag_search = host::bounds(app.tag_search_input.0 as isize).unwrap();
+    let chat_search = host::bounds(app.edit.0 as isize).unwrap();
+    assert_eq!(tag_search[1], chat_search[1]);
+    assert!(
+        tag_search[2] < chat_search[0],
+        "Tag search belongs to the left of chat search"
+    );
+    verify_native_search_cue(
+        app.edit,
+        1,
+        &paths.runtime.join("rust-native-chat-search-cue.png"),
+    )?;
+    verify_native_search_cue(
+        app.tag_search_input,
+        2,
+        &paths.runtime.join("rust-native-tag-search-cue.png"),
+    )?;
+    assert!(!app.popup_layout_batch);
     app.close_tag_search();
     app.testing = true;
     app.tag_query.clear();
@@ -1854,8 +1909,8 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     app.shortcut_foreground = HWND::default();
     app.settings.recent_shortcut = shortcut;
     app.state.lock().unwrap().host = old_host;
-    paths.write("rust-tags-ui-test.json",&json!({"collapsed_by_default":true,"sidebar_grows_left_keeps_chat_screen_position":true,"icon_popup_overlays_parent_without_resizing":true,"sidebar_scroll_and_multitag_filter":true,"source_tags_locked":true,"editor_keeps_list_window_and_scroll":true,
-        "custom_add_color_toggle_and_enter":true,"three_capped_regions_scroll_independently":true,"tag_scrollbars_drag_to_end":true,"tag_name_pinyin_initials_match":true,"tag_search_preserves_selections":true,"native_tag_search_control":true,
+    paths.write("rust-tags-ui-test.json",&json!({"collapsed_by_default":true,"sidebar_grows_left_keeps_chat_screen_position":true,"toolbar_and_native_chat_search_keep_screen_position":true,"toolbar_hit_targets_follow_geometry":true,"tag_search_aligned_to_left_of_chat_search":true,"icon_popup_overlays_parent_without_resizing":true,"sidebar_scroll_and_multitag_filter":true,"source_tags_locked":true,"editor_keeps_list_window_and_scroll":true,
+        "custom_add_color_toggle_and_enter":true,"three_capped_regions_scroll_independently":true,"tag_scrollbars_drag_to_end":true,"tag_name_pinyin_initials_match":true,"tag_search_preserves_selections":true,"native_tag_search_control":true,"native_placeholders_paint_and_hide_after_input":true,"sidebar_layout_batched_without_intermediate_paints":true,
         "compact_hides_tags_and_preview_preserves_filter_scroll":true,"title_results_immediate_during_body_search":true,"shortcut_released_and_available_to_other_apps":true,"render_cache_limit":LAYOUT_CACHE_LIMIT}));
     Ok(())
 }

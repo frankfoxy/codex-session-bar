@@ -54,6 +54,46 @@ const RECENT_ROW: i32 = 48;
 const LAYOUT_CACHE_LIMIT: usize = 256;
 const RECENT_TOP: i32 = 48;
 const RECENT_FRAME: i32 = 92;
+const SEARCH_CUE_SUBCLASS: usize = 0x5343;
+fn search_cue(kind: usize) -> &'static str {
+    if kind == 2 { "搜索标签 / 拼音…" } else { "搜索会话 / 拼音…" }
+}
+unsafe fn paint_search_cue(hwnd: HWND, dc: HDC, kind: usize) {
+    if GetWindowTextLengthW(hwnd) != 0 || dc.is_invalid() { return; }
+    let saved = SaveDC(dc);
+    let font = SendMessageW(hwnd, WM_GETFONT, WPARAM(0), LPARAM(0));
+    if font.0 != 0 { SelectObject(dc, HGDIOBJ(font.0 as *mut _)); }
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, COLORREF(0xc4b8a8));
+    let mut bounds = RECT::default();
+    let _ = GetClientRect(hwnd, &mut bounds);
+    bounds.left += 2;
+    let mut text: Vec<u16> = search_cue(kind).encode_utf16().collect();
+    DrawTextW(dc, &mut text, &mut bounds, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    let _ = RestoreDC(dc, saved);
+}
+unsafe extern "system" fn search_cue_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM, id: usize, kind: usize) -> LRESULT {
+    let result = DefSubclassProc(hwnd, message, wparam, lparam);
+    match message {
+        WM_PAINT => {
+            let dc = GetDC(hwnd);
+            paint_search_cue(hwnd, dc, kind);
+            let _ = ReleaseDC(hwnd, dc);
+        }
+        WM_PRINTCLIENT => paint_search_cue(hwnd, HDC(wparam.0 as *mut _), kind),
+        WM_SETTEXT | WM_CHAR | WM_IME_COMPOSITION | WM_PASTE | WM_CUT | WM_CLEAR | WM_UNDO | WM_SETFOCUS | WM_KILLFOCUS | WM_THEMECHANGED => {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+        WM_NCDESTROY => { let _ = RemoveWindowSubclass(hwnd, Some(search_cue_proc), id); }
+        _ => {}
+    }
+    result
+}
+unsafe fn install_search_cue(hwnd: HWND, kind: usize) -> Result<()> {
+    anyhow::ensure!(SetWindowSubclass(hwnd, Some(search_cue_proc), SEARCH_CUE_SUBCLASS, kind).as_bool(), "Cannot install search placeholder");
+    let _ = InvalidateRect(hwnd, None, false);
+    Ok(())
+}
 thread_local! {static APP:RefCell<Option<App>>=const{RefCell::new(None)};}
 fn private_bytes()->u64{unsafe{
     let mut counters=PROCESS_MEMORY_COUNTERS_EX::default();counters.cb=size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
@@ -427,6 +467,15 @@ impl Painter {
             );
         }
     }
+    unsafe fn search_icon(&self, x: f32, y: f32, rgb: u32) {
+        if let Ok(brush) = self.brush(rgb) {
+            self.target.DrawEllipse(
+                &D2D1_ELLIPSE { point: D2D_POINT_2F { x, y }, radiusX: 5.5, radiusY: 5.5 },
+                &brush, 1.4, None,
+            );
+        }
+        self.line(x + 4., y + 4., x + 9., y + 9., rgb, 1.4);
+    }
     unsafe fn toggle(&self, x: f32, y: f32, on: bool) {
         self.fill(
             rect(x, y, 28., 16.),
@@ -629,6 +678,7 @@ struct App {
     height: i32,
     popup_size: [i32; 2],
     popup_layout: Option<([i32; 4], u32)>,
+    popup_layout_batch: bool,
     dpi: f32,
     last_draw: Instant,
     last_diag: Instant,
@@ -815,6 +865,7 @@ impl App {
             guard_events: Vec::new(),
             guard_log_error: String::new(),
             popup_layout: None,
+            popup_layout_batch: false,
             rows: Vec::new(),
             recent_rows_at: -1.,
             hits: Vec::new(),
@@ -2602,12 +2653,7 @@ impl App {
                 GetModuleHandleW(None)?,
                 None,
             )?;
-            let _ = SendMessageW(
-                self.edit,
-                EM_SETCUEBANNER,
-                WPARAM(1),
-                LPARAM(w!("Search chats / pinyin…").as_ptr() as isize),
-            );
+            install_search_cue(self.edit, 1)?;
         }
         let previous_font = self.edit_font;
         self.tips.clear();
@@ -2701,14 +2747,20 @@ impl App {
             return;
         }
         self.popup_layout = Some(layout);
-        let _ = SetWindowPos(self.popup, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
-        Self::round_window(self.popup, w, h, (18. * scale) as i32);
+        let flags = if self.popup_layout_batch { SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS } else { SWP_NOACTIVATE };
+        let _ = SetWindowPos(self.popup, HWND_TOPMOST, x, y, w, h, flags);
+        if self.popup_layout_batch {
+            let region = CreateRoundRectRgn(0, 0, w + 1, h + 1, (18. * scale) as i32, (18. * scale) as i32);
+            if SetWindowRgn(self.popup, region, false) == 0 { let _ = DeleteObject(region); }
+        } else {
+            Self::round_window(self.popup, w, h, (18. * scale) as i32);
+        }
         // Child controls stay in physical pixels, matching the parent DPI.
         for (child, x, y, cw, ch) in [
             if self.popup_kind == Some(Popup::Fixed) {
                 (self.edit, 27, 55, 480, 24)
             } else if self.popup_kind == Some(Popup::Recent) {
-                (self.edit, 61, 14, 206, 22)
+                (self.edit, self.recent_toolbar_left() as i32 + 83, 14, 184, 22)
             } else if self.popup_kind == Some(Popup::Preferences) {
                 (self.edit, 258, 198, 278, 24)
             } else {
@@ -2723,7 +2775,7 @@ impl App {
                     (y as f32 * scale) as i32,
                     (cw as f32 * scale) as i32,
                     (ch as f32 * scale) as i32,
-                    true,
+                    !self.popup_layout_batch,
                 );
             }
         }
@@ -2939,11 +2991,31 @@ impl App {
                 let _ = InvalidateRect(self.popup, None, false);
             }
             Hit::TagSidebar => {
+                // Suppress Windows' intermediate copy/move paints; present the
+                // completed parent and child layout together in one repaint.
+                let frozen: Vec<_> = [self.edit, self.tag_search_input, self.popup].into_iter()
+                    .filter(|&hwnd| !hwnd.is_invalid() && IsWindowVisible(hwnd).as_bool()).collect();
+                for &hwnd in &frozen { SendMessageW(hwnd, WM_SETREDRAW, WPARAM(0), LPARAM(0)); }
+                self.popup_layout_batch=true;
                 self.close_tag_editor();self.sidebar_open=!self.sidebar_open;
                 self.popup_size=[self.recent_width(),self.recent_panel_height()];self.popup_layout=None;
                 for i in 0..3{self.tag_scroll[i]=self.tag_scroll[i].min(self.tag_scroll_max(i));}
                 self.scroll=self.scroll.min(self.chat_filters.len().saturating_sub(self.list_page_rows()));self.place_popup();
                 let _=self.ensure_tag_search();
+                self.popup_layout_batch=false;
+                for &hwnd in &frozen {
+                    // A collapsed tag search stays hidden; WM_SETREDRAW(TRUE)
+                    // would otherwise restore its WS_VISIBLE style.
+                    if hwnd!=self.tag_search_input || self.sidebar_open {
+                        SendMessageW(hwnd, WM_SETREDRAW, WPARAM(1), LPARAM(0));
+                    } else {
+                        SendMessageW(hwnd, WM_SETREDRAW, WPARAM(1), LPARAM(0));
+                        let _=ShowWindow(hwnd, SW_HIDE);
+                    }
+                }
+                // Queue the paint after this input callback releases App's
+                // borrow, rather than dispatching a reentrant WM_PAINT.
+                let _=RedrawWindow(self.popup, None, HRGN::default(), RDW_INVALIDATE | RDW_ALLCHILDREN);
             }
             Hit::Compact => {
                 self.close_tag_editor();self.close_icon_panel();
@@ -3097,11 +3169,13 @@ impl App {
                 return Some(Hit::TagClose);
             }
             if !self.search.is_empty() && Self::contains_rect(self.chat_clear_rect(),x,y){return Some(Hit::ClearChatSearch);}
+            if self.sidebar_open && !self.tag_query.is_empty() && Self::contains_rect(Self::tag_clear_rect(),x,y){return Some(Hit::ClearTagSearch);}
             if y < RECENT_TOP as f32 {
-                if (12. ..42.).contains(&x)&&(9. ..39.).contains(&y){return Some(Hit::TagSidebar);}
-                if (310. ..370.).contains(&x)&&(8. ..40.).contains(&y){return Some(Hit::Body);}
-                if (382. ..442.).contains(&x)&&(8. ..40.).contains(&y){return Some(Hit::Compact);}
-                if (454. ..486.).contains(&x)&&(8. ..40.).contains(&y){return Some(Hit::Refresh);}
+                let toolbar_x=x-self.recent_toolbar_left();
+                if (12. ..42.).contains(&toolbar_x)&&(9. ..39.).contains(&y){return Some(Hit::TagSidebar);}
+                if (310. ..370.).contains(&toolbar_x)&&(8. ..40.).contains(&y){return Some(Hit::Body);}
+                if (382. ..442.).contains(&toolbar_x)&&(8. ..40.).contains(&y){return Some(Hit::Compact);}
+                if (454. ..486.).contains(&toolbar_x)&&(8. ..40.).contains(&y){return Some(Hit::Refresh);}
                 return self.popup_hits.iter().rev().find(|a|a.contains(x,y)&&matches!(a.hit,Hit::TagFilter(_)|Hit::TagClear)).map(|a|a.hit.clone());
             }
             if self.sidebar_open && x<TAG_SIDEBAR {
@@ -3742,6 +3816,47 @@ unsafe fn capture(
     let _ = DeleteObject(bitmap);
     let _ = DeleteDC(dc);
     Ok(hits)
+}
+unsafe fn verify_native_search_cue(hwnd: HWND, kind: usize, path: &std::path::Path) -> Result<()> {
+    let mut registered = 0;
+    assert!(GetWindowSubclass(hwnd, Some(search_cue_proc), SEARCH_CUE_SUBCLASS, Some(&mut registered)).as_bool());
+    assert_eq!(registered, kind);
+    let mut bounds = RECT::default();
+    GetClientRect(hwnd, &mut bounds)?;
+    let (width, height) = (bounds.right.max(1), bounds.bottom.max(1));
+    let dc = CreateCompatibleDC(None);
+    let mut info = BITMAPINFO::default();
+    info.bmiHeader = BITMAPINFOHEADER { biSize: size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width, biHeight: -height, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() };
+    let mut bits = std::ptr::null_mut();
+    let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0)?;
+    let previous = SelectObject(dc, bitmap);
+    let brush = CreateSolidBrush(COLORREF(0x25211c));
+    let original = {
+        let mut text = [0u16; 256];
+        let count = GetWindowTextW(hwnd, &mut text);
+        String::from_utf16_lossy(&text[..count as usize])
+    };
+    let _ = SetWindowTextW(hwnd, w!(""));
+    FillRect(dc, &bounds, brush);
+    SendMessageW(hwnd, WM_PRINTCLIENT, WPARAM(dc.0 as usize), LPARAM(PRF_CLIENT as isize));
+    let raw = std::slice::from_raw_parts(bits as *const u8, (width * height * 4) as usize);
+    let cue_pixels = raw.chunks_exact(4).filter(|p| (p[0] as i32-196).abs()<8 && (p[1] as i32-184).abs()<8 && (p[2] as i32-168).abs()<8).count();
+    assert!(cue_pixels>20, "Native empty search field did not paint its cue: {cue_pixels}");
+    let mut rgba = Vec::with_capacity(raw.len());
+    for p in raw.chunks_exact(4) { rgba.extend([p[2],p[1],p[0],255]); }
+    image::save_buffer(path, &rgba, width as u32, height as u32, image::ColorType::Rgba8)?;
+    let _ = SetWindowTextW(hwnd, w!("typed"));
+    FillRect(dc, &bounds, brush);
+    paint_search_cue(hwnd, dc, kind);
+    let raw = std::slice::from_raw_parts(bits as *const u8, (width * height * 4) as usize);
+    assert!(raw.chunks_exact(4).all(|p| p[0]==37 && p[1]==33 && p[2]==28), "Cue must disappear after typing");
+    let _ = SetWindowTextW(hwnd, PCWSTR(wide(&original).as_ptr()));
+    SelectObject(dc, previous);
+    let _ = DeleteObject(bitmap);
+    let _ = DeleteObject(brush);
+    let _ = DeleteDC(dc);
+    Ok(())
 }
 pub fn self_test(paths: &Paths) -> Result<()> {
     unsafe {
