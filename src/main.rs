@@ -4,6 +4,7 @@ mod body;
 mod data;
 mod desktop;
 mod host;
+mod naming;
 mod search;
 mod ui;
 
@@ -163,6 +164,9 @@ fn run() -> Result<()> {
     }
     if args.iter().any(|s| s == "--inspect") {
         return desktop::inspect(&paths);
+    }
+    if args.iter().any(|s| s == "--name-smoke-test") {
+        return naming::smoke(&paths);
     }
     if args.iter().any(|s| s == "--observe") {
         return host::inspect(&paths);

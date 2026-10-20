@@ -308,6 +308,11 @@ impl Catalog {
     pub fn rename(&self, title: &str, icon: &str) -> String {
         format!("{} {}", icon, self.strip(title)).trim().into()
     }
+    pub fn retitle(&self, old: &str, title: &str) -> String {
+        let old = old.trim();
+        let prefix = old[..old.len() - self.strip(old).len()].trim();
+        format!("{} {}", prefix, self.strip(title)).trim().into()
+    }
     pub fn suggest(&self, title: &str) -> String {
         let title = self.strip(title).to_lowercase();
         let rules: &[(&[&str], &str)] = &[
@@ -342,7 +347,7 @@ impl Catalog {
             .unwrap_or_else(|| "💬".into())
     }
     pub fn filter(&self, query: &str, group: &str) -> Vec<usize> {
-        let q = query.to_lowercase();
+        let q = query.trim().to_lowercase();
         let include = |entry: &Emoji| {
             q.is_empty()
                 || format!(
@@ -352,7 +357,7 @@ impl Catalog {
                 .to_lowercase()
                 .contains(&q)
         };
-        if group == "默认集合" {
+        if q.is_empty() && group == "默认集合" {
             return self
                 .defaults
                 .iter()
@@ -363,7 +368,9 @@ impl Catalog {
         self.entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| (group == "All emoji" || e.group == group) && include(e))
+            .filter(|(_, e)| {
+                (!q.is_empty() || group == "All emoji" || e.group == group) && include(e)
+            })
             .map(|(i, _)| i)
             .collect()
     }

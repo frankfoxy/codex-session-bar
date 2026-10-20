@@ -2,7 +2,7 @@ use crate::{
     body,
     data::{self, Catalog, Row},
     desktop::{Action, Workers},
-    host, now,
+    host, naming, now,
     search::{ranked_matches, ChatSearch},
     Paths, Settings, State, Stop,
 };
@@ -140,12 +140,15 @@ enum Hit {
     Back,
     Random,
     Auto,
+    Rename,
+    NameRegenerate,
+    NameApply,
+    NameCancel,
     Clear,
     Emoji(usize),
     Refresh,
     Dock,
     Follow,
-    Exact,
     Body,
     Quit,
 }
@@ -165,6 +168,7 @@ enum Popup {
     Icons,
     Details,
     Fixed,
+    Rename,
 }
 
 struct Painter {
@@ -375,14 +379,6 @@ impl Painter {
     unsafe fn action_icon(&self, hit: &Hit, x: f32, y: f32) {
         let c = MUTED;
         match hit {
-            Hit::Exact => {
-                self.label("ab", rect(x + 3., y - 2., 16., 22.), 12., TEXT, false);
-                for (a, b) in [(x, x + 3.), (x + 22., x + 19.)] {
-                    self.line(a, y + 2., a, y + 16., c, 1.3);
-                    self.line(a, y + 2., b, y + 2., c, 1.3);
-                    self.line(a, y + 16., b, y + 16., c, 1.3);
-                }
-            }
             Hit::Body => {
                 self.line(x + 1., y + 3., x + 18., y + 3., c, 1.4);
                 self.line(x + 1., y + 8., x + 10., y + 8., c, 1.4);
@@ -413,6 +409,21 @@ impl Painter {
                     self.line(x + cx - 3., y + cy, x + cx + 3., y + cy, ORANGE, 1.4);
                     self.line(x + cx, y + cy - 3., x + cx, y + cy + 3., ORANGE, 1.4);
                 }
+            }
+            Hit::Rename | Hit::NameRegenerate => {
+                self.label("Aa", rect(x, y + 1., 17., 20.), 12., TEXT, false);
+                self.line(x + 20., y, x + 20., y + 8., ORANGE, 1.4);
+                self.line(x + 16., y + 4., x + 24., y + 4., ORANGE, 1.4);
+                self.line(x + 16., y + 11., x + 16., y + 15., c, 1.2);
+                self.line(x + 14., y + 13., x + 18., y + 13., c, 1.2);
+            }
+            Hit::NameApply => {
+                self.line(x + 3., y + 11., x + 9., y + 17., GREEN, 2.);
+                self.line(x + 9., y + 17., x + 22., y + 4., GREEN, 2.);
+            }
+            Hit::NameCancel => {
+                self.line(x + 5., y + 4., x + 19., y + 18., c, 1.5);
+                self.line(x + 19., y + 4., x + 5., y + 18., c, 1.5);
             }
             Hit::Clear => {
                 for (a, b, cx, d) in [
@@ -464,6 +475,10 @@ struct App {
     popup_kind: Option<Popup>,
     icon_target: Option<(String, String)>,
     icon_panel: Option<IconPanel>,
+    name_target: Option<(String, String)>,
+    name_service: Option<naming::Service>,
+    name_status: naming::Status,
+    name_text: String,
     shortcut_registered: bool,
     shortcut_error: String,
     rows: Vec<Row>,
@@ -472,7 +487,6 @@ struct App {
     filters: Vec<usize>,
     chat_filters: Vec<usize>,
     chat_search: ChatSearch,
-    search_exact: bool,
     search_body: bool,
     body_service: Option<body::Service>,
     body_generation: u64,
@@ -545,11 +559,14 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::Back => "Back to session settings",
         Hit::Random => "Random icon",
         Hit::Auto => "Suggest icon from chat title · local matching",
+        Hit::Rename => "Regenerate chat name from message text",
+        Hit::NameRegenerate => "Generate another chat name",
+        Hit::NameApply => "Apply this name · keep the chat icon",
+        Hit::NameCancel => "Cancel and return to session settings",
         Hit::Clear => "Remove chat icon",
         Hit::Refresh => "Refresh account limits and chat list",
         Hit::Dock => "Dock in the blank title bar area",
         Hit::Follow => "Follow the current Codex chat",
-        Hit::Exact => "Exact match · whole title or body phrase",
         Hit::Body => "Search message text · off by default",
         Hit::Quit => "Quit Session Bar",
         Hit::Emoji(i) => {
@@ -639,6 +656,10 @@ impl App {
             popup_kind: None,
             icon_target: None,
             icon_panel: None,
+            name_target: None,
+            name_service: None,
+            name_status: naming::Status::default(),
+            name_text: String::new(),
             shortcut_registered: false,
             shortcut_error: String::new(),
             popup_layout: None,
@@ -648,7 +669,6 @@ impl App {
             filters,
             chat_filters: Vec::new(),
             chat_search: ChatSearch::default(),
-            search_exact: false,
             search_body: false,
             body_service: None,
             body_generation: 0,
@@ -928,12 +948,9 @@ impl App {
                         false,
                     );
                 }
-                area(Hit::Exact, rect(264., 8., 60., 32.));
-                p.action_icon(&Hit::Exact, 266., 14.);
-                p.toggle(293., 16., self.search_exact);
-                area(Hit::Body, rect(330., 8., 60., 32.));
-                p.action_icon(&Hit::Body, 332., 14.);
-                p.toggle(359., 16., self.search_body);
+                area(Hit::Body, rect(264., 8., 60., 32.));
+                p.action_icon(&Hit::Body, 266., 14.);
+                p.toggle(293., 16., self.search_body);
                 let (tokens, rate, partial) = live.recent.totals();
                 let total = format!(
                     "Total {}{} t/s  ·  {}{} TOK",
@@ -942,11 +959,11 @@ impl App {
                     data::compact(tokens),
                     if partial && tokens.is_some() { "*" } else { "" }
                 );
-                area(Hit::Refresh, rect(398., 8., 32., 32.));
-                p.action_icon(&Hit::Refresh, 403., 14.);
+                area(Hit::Refresh, rect(332., 8., 32., 32.));
+                p.action_icon(&Hit::Refresh, 337., 14.);
                 p.label(
                     &format!("{} chats", self.chat_filters.len()),
-                    rect(443., 9., width - 455., 30.),
+                    rect(379., 9., width - 391., 30.),
                     11.,
                     MUTED,
                     false,
@@ -1059,7 +1076,7 @@ impl App {
                             rect(49., y + 20., width - 145., 17.),
                             11.,
                             &self.search,
-                            self.search_exact,
+                            false,
                         );
                     }
                     p.label(
@@ -1186,7 +1203,7 @@ impl App {
                 }
                 p.label(
                     if search.is_empty() {
-                        "Search emoji…"
+                        "Search all emoji…"
                     } else {
                         search
                     },
@@ -1213,7 +1230,11 @@ impl App {
                     );
                 }
                 p.label(
-                    &format!("{} icons · scroll for more", filters.len()),
+                    &if search.trim().is_empty() {
+                        format!("{} icons · scroll for more", filters.len())
+                    } else {
+                        format!("{} results · all emoji", filters.len())
+                    },
                     rect(16., height - 26., width - 32., 22.),
                     11.,
                     MUTED,
@@ -1367,6 +1388,76 @@ impl App {
                     false,
                 );
             }
+            Some(Popup::Rename) => {
+                p.label(
+                    "Regenerate chat name",
+                    rect(16., 10., width - 32., 28.),
+                    14.,
+                    TEXT,
+                    false,
+                );
+                let old = self
+                    .name_target
+                    .as_ref()
+                    .map(|(_, label)| label.as_str())
+                    .unwrap_or("");
+                p.label(
+                    &format!("Current: {old}"),
+                    rect(16., 43., width - 32., 25.),
+                    12.,
+                    MUTED,
+                    false,
+                );
+                p.label(
+                    "Based on message text · uses your Codex account",
+                    rect(16., 72., width - 32., 24.),
+                    11.,
+                    MUTED,
+                    false,
+                );
+                p.fill(rect(16., 104., width - 32., 38.), 0x1c2125, 6.);
+                p.border(rect(16., 104., width - 32., 38.), 0x527b69, 6.);
+                if self.testing {
+                    p.label(
+                        &self.name_text,
+                        rect(26., 105., width - 52., 36.),
+                        13.,
+                        TEXT,
+                        false,
+                    );
+                }
+                p.label(
+                    if self.name_status.busy {
+                        "Generating from chat messages…"
+                    } else if !self.name_status.error.is_empty() {
+                        &self.name_status.error
+                    } else {
+                        "Edit the suggestion if needed, then apply."
+                    },
+                    rect(16., 151., width - 32., 34.),
+                    12.,
+                    if self.name_status.error.is_empty() {
+                        MUTED
+                    } else {
+                        0xf87171
+                    },
+                    false,
+                );
+                for (hit, x) in [
+                    (Hit::NameRegenerate, 16.),
+                    (Hit::NameApply, width - 94.),
+                    (Hit::NameCancel, width - 52.),
+                ] {
+                    if hit == Hit::NameCancel
+                        || (!self.name_status.busy
+                            && (hit != Hit::NameApply || !self.name_text.trim().is_empty()))
+                    {
+                        area(hit.clone(), rect(x, 204., 36., 32.));
+                        p.border(rect(x, 204., 36., 32.), 0x47535b, 5.);
+                        p.action_icon(&hit, x + 6., 210.);
+                    }
+                }
+            }
             Some(Popup::Details) => {
                 let field = rect(16., 77., width - 32., 32.);
                 p.fill(field, 0x1c2125, 6.);
@@ -1414,11 +1505,15 @@ impl App {
                 p.line(width - 33., 95., width - 28., 90., MUTED, 1.4);
                 p.label(
                     "Session details",
-                    rect(16., 8., width - 32., 28.),
+                    rect(16., 8., width - 80., 28.),
                     14.,
                     TEXT,
                     false,
                 );
+                if self.current(&live).is_some() {
+                    area(Hit::Rename, rect(width - 50., 7., 34., 30.));
+                    p.action_icon(&Hit::Rename, width - 45., 13.);
+                }
                 area(Hit::Follow, rect(16., 42., width - 32., 27.));
                 p.border(rect(19., 49., 14., 14.), MUTED, 3.);
                 if live.auto_thread {
@@ -1684,6 +1779,7 @@ impl App {
         }
     }
     unsafe fn tick(&mut self) {
+        self.poll_name();
         if !self.event.is_invalid() && WaitForSingleObject(self.event, 0) == WAIT_OBJECT_0 {
             self.hidden = false;
         }
@@ -1852,7 +1948,10 @@ impl App {
             let _ = InvalidateRect(self.bar, None, false);
             if matches!(
                 self.popup_kind,
-                Some(Popup::Recent) | Some(Popup::Details) | Some(Popup::Fixed)
+                Some(Popup::Recent)
+                    | Some(Popup::Details)
+                    | Some(Popup::Fixed)
+                    | Some(Popup::Rename)
             ) {
                 let _ = InvalidateRect(self.popup, None, false);
             }
@@ -1937,7 +2036,7 @@ impl App {
                 edit,
                 EM_SETCUEBANNER,
                 WPARAM(1),
-                LPARAM(w!("Search emoji…").as_ptr() as isize),
+                LPARAM(w!("Search all emoji…").as_ptr() as isize),
             );
             for child in [edit, combo] {
                 let _ = SendMessageW(
@@ -2169,6 +2268,7 @@ impl App {
     }
     unsafe fn close_popup(&mut self) {
         self.close_icon_panel();
+        self.name_service.take();
         self.tips.retain(|t| t.owner != self.popup);
         if self.body_pending {
             if let Some(service) = &self.body_service {
@@ -2231,6 +2331,10 @@ impl App {
     }
     unsafe fn popup(&mut self, kind: Popup) -> Result<()> {
         self.close_icon_panel();
+        if kind != Popup::Rename {
+            self.name_service.take();
+            self.name_target = None;
+        }
         self.tips.retain(|t| t.owner != self.popup);
         if self.popup_kind == Some(kind) && IsWindowVisible(self.popup).as_bool() {
             self.close_popup();
@@ -2268,7 +2372,25 @@ impl App {
             Popup::Icons => [384, 450],
             Popup::Details => [560, 310],
             Popup::Fixed => [560, 500],
+            Popup::Rename => [560, 252],
         };
+        if kind == Popup::Rename {
+            self.edit = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("EDIT"),
+                PCWSTR(wide(&self.name_text).as_ptr()),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+                26,
+                112,
+                508,
+                22,
+                self.popup,
+                HMENU(104isize as *mut _),
+                GetModuleHandleW(None)?,
+                None,
+            )?;
+            let _ = SendMessageW(self.edit, EM_SETLIMITTEXT, WPARAM(120), LPARAM(0));
+        }
         if kind == Popup::Icons {
             self.scroll = 0;
             self.search.clear();
@@ -2318,7 +2440,7 @@ impl App {
                 self.edit,
                 EM_SETCUEBANNER,
                 WPARAM(0),
-                LPARAM(w!("Search emoji…").as_ptr() as isize),
+                LPARAM(w!("Search all emoji…").as_ptr() as isize),
             );
         }
         if matches!(kind, Popup::Recent | Popup::Fixed) {
@@ -2336,7 +2458,6 @@ impl App {
                 self.rows.sort_by_key(|r| r.state != "Busy");
             }
             self.search.clear();
-            self.search_exact = false;
             self.scroll = 0;
             self.filter_fixed();
             if kind == Popup::Fixed && !live.auto_thread {
@@ -2403,7 +2524,10 @@ impl App {
         if !self.testing {
             let _ = ShowWindow(self.popup, SW_SHOW);
             let _ = SetForegroundWindow(self.popup);
-            if matches!(kind, Popup::Icons | Popup::Fixed | Popup::Recent) {
+            if matches!(
+                kind,
+                Popup::Icons | Popup::Fixed | Popup::Recent | Popup::Rename
+            ) {
                 let _ = SetFocus(self.edit);
             }
         }
@@ -2465,6 +2589,8 @@ impl App {
                 (self.edit, 27, 55, 506, 24)
             } else if self.popup_kind == Some(Popup::Recent) {
                 (self.edit, 23, 13, 218, 22)
+            } else if self.popup_kind == Some(Popup::Rename) {
+                (self.edit, 26, 112, 508, 22)
             } else {
                 (self.edit, 14, 49, 190, 29)
             },
@@ -2535,6 +2661,41 @@ impl App {
             }
             Hit::Details => {
                 let _ = self.popup(Popup::Details);
+            }
+            Hit::Rename => {
+                let live = self.snapshot();
+                if let Some(chat) = self.current(&live) {
+                    self.name_target = Some((chat.id.clone(), chat.label.clone()));
+                    self.name_text = self.catalog.strip(&chat.label).into();
+                    self.name_status = naming::Status::default();
+                    if self.popup(Popup::Rename).is_ok() {
+                        self.request_name();
+                    }
+                }
+            }
+            Hit::NameRegenerate => {
+                if !self.name_status.busy {
+                    self.request_name();
+                }
+            }
+            Hit::NameCancel => {
+                let _ = self.popup(Popup::Details);
+            }
+            Hit::NameApply => {
+                if !self.name_status.busy {
+                    if let Some((id, _)) = self.name_target.clone() {
+                        match naming::validate(self.catalog.strip(&self.name_text)) {
+                            Ok(title) => {
+                                self.state.lock().unwrap().action_pending = true;
+                                let _ = self.popup(Popup::Details);
+                                return Some(Action::Rename(id, title));
+                            }
+                            Err(e) => {
+                                self.name_status.error = e.to_string();
+                            }
+                        }
+                    }
+                }
             }
             Hit::ChooseFixed => {
                 let _ = self.popup(Popup::Fixed);
@@ -2619,12 +2780,6 @@ impl App {
                 self.settings();
                 let _ = InvalidateRect(self.popup, None, false);
             }
-            Hit::Exact => {
-                self.search_exact = !self.search_exact;
-                self.filter_fixed();
-                let _ = InvalidateRect(self.popup, None, false);
-                let _ = SetFocus(self.edit);
-            }
             Hit::Body => {
                 self.search_body = !self.search_body;
                 self.filter_fixed();
@@ -2657,6 +2812,56 @@ impl App {
         } else {
             let _ = self.hit(Hit::Title);
         }
+    }
+    unsafe fn request_name(&mut self) {
+        self.name_service.take();
+        if let Some((id, _)) = &self.name_target {
+            if self.testing {
+                self.name_text = "优化 GigE 图像采集与丢帧恢复".into();
+                self.name_status = naming::Status {
+                    title: self.name_text.clone(),
+                    ..Default::default()
+                };
+                let _ = SetWindowTextW(self.edit, PCWSTR(wide(&self.name_text).as_ptr()));
+            } else {
+                self.name_service = Some(naming::Service::start(
+                    self.paths.clone(),
+                    id.clone(),
+                    self.stop.clone(),
+                ));
+                self.name_status = naming::Status {
+                    busy: true,
+                    ..Default::default()
+                };
+                let _ = SendMessageW(self.edit, EM_SETREADONLY, WPARAM(1), LPARAM(0));
+            }
+        }
+        let _ = InvalidateRect(self.popup, None, false);
+    }
+    unsafe fn poll_name(&mut self) {
+        if self.popup_kind != Some(Popup::Rename) {
+            return;
+        }
+        let Some(service) = &self.name_service else {
+            return;
+        };
+        let status = service.status();
+        if status == self.name_status {
+            return;
+        }
+        if !status.busy {
+            let _ = SendMessageW(self.edit, EM_SETREADONLY, WPARAM(0), LPARAM(0));
+            if !status.title.is_empty() {
+                self.name_text = status.title.clone();
+                let _ = SetWindowTextW(self.edit, PCWSTR(wide(&self.name_text).as_ptr()));
+                let _ = SendMessageW(self.edit, EM_SETSEL, WPARAM(0), LPARAM(-1));
+                if GetForegroundWindow() == self.popup {
+                    let _ = SetFocus(self.edit);
+                }
+            }
+        }
+        self.name_status = status;
+        let _ = InvalidateRect(self.popup, None, false);
     }
     unsafe fn update_filter(&mut self) {
         let mut text = [0u16; 256];
@@ -2692,11 +2897,8 @@ impl App {
             let service = self
                 .body_service
                 .get_or_insert_with(|| body::Service::new(self.paths.clone(), self.stop.clone()));
-            self.body_generation = service.submit(
-                &self.search,
-                self.search_exact,
-                self.rows.iter().map(|r| r.id.clone()),
-            );
+            self.body_generation =
+                service.submit(&self.search, false, self.rows.iter().map(|r| r.id.clone()));
             self.body_pending = true;
             self.index_pending = true;
             self.body_state = service.status();
@@ -2709,9 +2911,7 @@ impl App {
         if self.body_pending {
             return Vec::new();
         }
-        let titles = self
-            .chat_search
-            .filter(&self.rows, &self.search, self.search_exact);
+        let titles = self.chat_search.filter(&self.rows, &self.search, false);
         ranked_matches(
             &self.rows,
             &titles,
@@ -2722,7 +2922,7 @@ impl App {
     fn update_body_only(&mut self) {
         let titles: HashSet<_> = self
             .chat_search
-            .filter(&self.rows, &self.search, self.search_exact)
+            .filter(&self.rows, &self.search, false)
             .into_iter()
             .map(|i| self.rows[i].id.clone())
             .collect();
@@ -2743,13 +2943,10 @@ impl App {
     fn fixed_hit_at(&self, x: f32, y: f32) -> Option<Hit> {
         let width = self.popup_size[0] as f32;
         if self.popup_kind == Some(Popup::Recent) {
-            if (330. ..390.).contains(&x) && (8. ..40.).contains(&y) {
+            if (264. ..324.).contains(&x) && (8. ..40.).contains(&y) {
                 return Some(Hit::Body);
             }
-            if (264. ..324.).contains(&x) && (8. ..40.).contains(&y) {
-                return Some(Hit::Exact);
-            }
-            if (398. ..430.).contains(&x) && (8. ..40.).contains(&y) {
+            if (332. ..364.).contains(&x) && (8. ..40.).contains(&y) {
                 return Some(Hit::Refresh);
             }
             if !(12. ..width - 18.).contains(&x)
@@ -3063,6 +3260,11 @@ unsafe extern "system" fn wndproc(
                     let len = GetWindowTextW(app.edit, &mut text);
                     app.search = String::from_utf16_lossy(&text[..len as usize]);
                     app.filter_fixed();
+                    let _ = InvalidateRect(app.popup, None, false);
+                } else if id == 104 && code == EN_CHANGE {
+                    let mut text = [0u16; 256];
+                    let len = GetWindowTextW(app.edit, &mut text);
+                    app.name_text = String::from_utf16_lossy(&text[..len as usize]);
                     let _ = InvalidateRect(app.popup, None, false);
                 }
                 Some(LRESULT(0))
@@ -3381,12 +3583,32 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert!(app.current(&app.snapshot()).is_none());
         assert_eq!(app.catalog.defaults.len(), 90);
         assert!(app.catalog.entries.len() > 3900);
+        let avocado = app
+            .catalog
+            .entries
+            .iter()
+            .position(|e| e.emoji == "🥑")
+            .unwrap();
+        assert!(app.catalog.filter("avocado", "默认集合").contains(&avocado));
+        assert!(app
+            .catalog
+            .filter("avocado", "Smileys & Emotion")
+            .contains(&avocado));
+        assert_eq!(app.catalog.filter("", "默认集合").len(), 90);
+        assert_eq!(
+            app.catalog.retitle("🧪 旧会话", "新的内容名称"),
+            "🧪 新的内容名称"
+        );
+        assert_eq!(
+            app.catalog.retitle("旧会话", "新的内容名称"),
+            "新的内容名称"
+        );
         assert_eq!(app.catalog.suggest("🚧 条码智能相机纯RTL"), "📷");
         assert_eq!(app.catalog.suggest("codex session bar"), "🎛️");
         assert_eq!(app.catalog.suggest("系统问题修复。"), "🛠️");
         assert_eq!(app.catalog.suggest("调研无人机 AI 模块"), "🚁");
         app.popup(Popup::Recent)?;
-        let tip_areas: Vec<_> = [Hit::Exact, Hit::Body, Hit::Refresh, Hit::Auto]
+        let tip_areas: Vec<_> = [Hit::Title, Hit::Body, Hit::Refresh, Hit::Auto]
             .into_iter()
             .enumerate()
             .map(|(i, hit)| Area {
@@ -3415,7 +3637,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         );
         assert!(!app.search_body);
         assert!(app.body_service.is_none());
-        assert_eq!(app.fixed_hit_at(360., 25.), Some(Hit::Body));
+        assert_eq!(app.fixed_hit_at(290., 25.), Some(Hit::Body));
         let _ = app.hit(Hit::Body);
         assert!(app.search_body);
         assert!(app.body_service.is_none());
@@ -3426,13 +3648,6 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         app.search = "huihuamingcheng 25".into();
         app.filter_fixed();
         assert_eq!(app.chat_filters, [24]);
-        app.search_exact = true;
-        app.filter_fixed();
-        assert!(app.chat_filters.is_empty());
-        app.search = "xxx 会话名称 25".into();
-        app.filter_fixed();
-        assert_eq!(app.chat_filters, [24]);
-        app.search_exact = false;
         app.search.clear();
         app.filter_fixed();
         app.move_fixed_cursor(24);
@@ -3704,6 +3919,38 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         )?
         .iter()
         .any(|a| a.hit == Hit::ChooseFixed));
+        let rename_id = app.current(&app.snapshot()).unwrap().id.clone();
+        assert!(capture(
+            &app,
+            Some(Popup::Details),
+            560,
+            310,
+            &paths.runtime.join("rust-name-entry-verification.png")
+        )?
+        .iter()
+        .any(|a| a.hit == Hit::Rename));
+        assert!(app.hit(Hit::Rename).is_none());
+        assert_eq!(app.popup_kind, Some(Popup::Rename));
+        assert_eq!(app.name_target.as_ref().unwrap().0, rename_id);
+        assert!(app.name_service.is_none());
+        capture(
+            &app,
+            Some(Popup::Rename),
+            560,
+            252,
+            &paths.runtime.join("rust-name-verification.png"),
+        )?;
+        let before_name_switch = app.snapshot();
+        state.lock().unwrap().snapshot = Some(data::Snapshot {
+            id: "different-chat".into(),
+            label: "Other chat".into(),
+            ..Default::default()
+        });
+        assert!(
+            matches!(app.hit(Hit::NameApply), Some(Action::Rename(id, title)) if id == rename_id && title == "优化 GigE 图像采集与丢帧恢复")
+        );
+        assert_eq!(app.popup_kind, Some(Popup::Details));
+        *state.lock().unwrap() = before_name_switch;
         let before = app.snapshot();
         app.last_identity = app.identity(&before);
         app.popup(Popup::Fixed)?;
@@ -3810,7 +4057,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert!(app.hidden);
         app.hidden = false;
         app.diagnostic();
-        paths.write("rust-ui-test.json",&json!({"ui":"pass","runtime":"rust","emoji_count":app.catalog.entries.len(),"default_collection":90,"recent_rows":40,"recent_search_pinyin":true,"recent_search_exact":true,"recent_scroll_drag":true,"recent_scroll_survives_100_refreshes":true,"recent_keyboard_navigation":true,"startup_home_quota":true,"open_list_order_fixed":true,"random_icon_bound":true,"drag_grip_separate":true,"fixed_chat_picker_survives_100_refreshes":true,"fixed_chat_search":true,"fixed_chat_keyboard_scroll":true,"fixed_chat_color_icons":true,"emoji_dropdown_survives_100_refreshes":true,"fixed_chat_selection":true,"font_chinese":app.painter.chinese,"renderer":"DirectWrite + software Direct2D"}));
+        paths.write("rust-ui-test.json",&json!({"ui":"pass","runtime":"rust","emoji_count":app.catalog.entries.len(),"default_collection":90,"recent_rows":40,"recent_search_pinyin":true,"recent_scroll_drag":true,"recent_scroll_survives_100_refreshes":true,"recent_keyboard_navigation":true,"startup_home_quota":true,"open_list_order_fixed":true,"random_icon_bound":true,"drag_grip_separate":true,"fixed_chat_picker_survives_100_refreshes":true,"fixed_chat_search":true,"fixed_chat_keyboard_scroll":true,"fixed_chat_color_icons":true,"emoji_dropdown_survives_100_refreshes":true,"fixed_chat_selection":true,"font_chinese":app.painter.chinese,"renderer":"DirectWrite + software Direct2D"}));
         println!(
             "{}",
             json!({"ui":"pass","emoji":app.catalog.entries.len(),"font":app.painter.chinese,"screenshots":paths.runtime.to_string_lossy()})

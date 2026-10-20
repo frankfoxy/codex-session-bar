@@ -19,6 +19,7 @@ use std::{
 pub enum Action {
     Navigate(String),
     Icon(String, String),
+    Rename(String, String),
     Refresh,
 }
 pub struct Rpc {
@@ -375,8 +376,13 @@ impl Workers {
                             );
                             Ok("Chat opened in Codex".into())
                         }
-                        Action::Icon(ref id, ref icon) => {
-                            let label = cat.rename(&store.label(id)?, icon);
+                        Action::Icon(ref id, _) | Action::Rename(ref id, _) => {
+                            let old = store.label(id)?;
+                            let (label, note) = match &action {
+                                Action::Icon(_, icon) => (cat.rename(&old, icon), "Icon synced to Codex"),
+                                Action::Rename(_, title) => (cat.retitle(&old, &crate::naming::validate(cat.strip(title))?), "Chat name synced to Codex"),
+                                _ => unreachable!(),
+                            };
                             let value = rpc.tool(
                                 "set_thread_title",
                                 json!({"threadId":id,"title":label}),
@@ -396,7 +402,7 @@ impl Workers {
                                     row.label = label.clone();
                                 }
                             }
-                            Ok("Icon synced to Codex".into())
+                            Ok(note.into())
                         }
                     }
                 })();

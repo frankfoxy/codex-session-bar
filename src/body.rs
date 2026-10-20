@@ -810,7 +810,7 @@ fn next_message_line(
     // Do not consume an incomplete last event durably: retry it after append.
     Ok((start, None, false))
 }
-fn visible_text(bytes: &[u8]) -> Option<String> {
+pub(crate) fn visible_text(bytes: &[u8]) -> Option<String> {
     let event: Value = serde_json::from_slice(bytes).ok()?;
     let payload = &event["payload"];
     if event["type"] != "response_item"
@@ -836,7 +836,7 @@ fn visible_text(bytes: &[u8]) -> Option<String> {
         Some(text)
     }
 }
-fn history_text(json: &str) -> Option<String> {
+pub(crate) fn history_text(json: &str) -> Option<String> {
     let item: Value = serde_json::from_str(json).ok()?;
     let text = match item["type"].as_str()? {
         "userMessage" => item["content"]

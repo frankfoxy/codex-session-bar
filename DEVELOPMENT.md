@@ -2,8 +2,9 @@
 
 The default runtime is the Rust executable in `bin/codex-session-bar.exe`.
 The earlier Python sources remain as migration reference; launchers and the
-scheduled task use Rust and do not start Python, Qt, a WebView or an independent
-Codex app-server.
+scheduled task use Rust and do not start Python, Qt or a WebView. Normal status
+polling does not start an independent Codex app-server; content-based naming
+invokes a bounded, ephemeral CLI request only when the user clicks Generate.
 
 ## Build and verification
 
@@ -145,3 +146,9 @@ so flags, skin tones, keycaps and ZWJ sequences remain intact during renames.
 - Recent panel: 560 × 436 logical pixels, compact icon switches and native Win32 tooltips. Tool rectangles and text are compared before updating, so the timer does not restart the hover delay on every paint.
 - Icon popovers prefer the left side of the list, then the right side, then a monitor-bounded position. Title suggestions run locally using deterministic keyword rules and share the captured target ID used by random/clear actions.
 - Native self-test verifies tooltip registration survives repeated refreshes and suggested icons remain bound to the selected list row.
+
+## Content-based chat names
+
+`naming.rs` reads bounded visible-message excerpts from the first and latest history items, excluding tools and analysis. Older logs have a bounded rollout fallback. A user-triggered CLI request uses existing Codex authentication, `--no-daemon`, `--ephemeral`, no user config, disabled shell/search, and a structured JSON response. Conversation content is passed on stdin. Runtime state and artifacts live in a private per-request directory below workspace `tmp`; authentication is not copied.
+
+The worker has a 75-second timeout and a Windows job that limits its own process tree to 16 processes and 2 GiB, closing the job on cancellation. It does not resume or send input to the target chat. The UI captures the target ID, previews the result, and applies the edited name through the existing desktop title API, retaining the current emoji. `--name-smoke-test` checks real generation using a synthetic transcript without renaming a chat.
