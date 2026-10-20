@@ -302,7 +302,11 @@ impl Workers {
             while !done.load(Ordering::Relaxed) {
                 let ctx=context(&s.lock().unwrap());
                 match rpc.tool("list_threads",json!({"limit":50}),&ctx).and_then(|payload|store.recent(&payload)) {
-                    Ok(recent)=>{p.write("recent-cache.json",&json!({"schema":1,"rows":recent.rows,"all_rows":recent.all_rows,"busy_count":recent.busy_count,"busy_metrics":recent.busy_metrics,"loaded_at":recent.loaded_at,"stale":false}));s.lock().unwrap().recent=recent;},
+                    Ok(mut recent)=>{
+                        recent.carry_read_state(&s.lock().unwrap().recent);
+                        p.write("recent-cache.json",&json!({"schema":1,"rows":recent.rows,"all_rows":recent.all_rows,"busy_count":recent.busy_count,"busy_metrics":recent.busy_metrics,"loaded_at":recent.loaded_at,"stale":false}));
+                        s.lock().unwrap().recent=recent;
+                    },
                     Err(e)=>{let mut live=s.lock().unwrap();live.recent.stale=true;live.recent.error=format!("{e:#}");}
                 }
                 wait(&done,2000);

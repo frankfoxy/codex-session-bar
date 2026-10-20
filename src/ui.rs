@@ -46,6 +46,7 @@ const TEXT: u32 = 0xe8eef2;
 const MUTED: u32 = 0xa8b8c4;
 const ORANGE: u32 = 0xf5a34b;
 const GREEN: u32 = 0x65d69b;
+const NEW_RESULT: u32 = 0x70b7ff;
 const DETAILS_HEIGHT: i32 = 408;
 thread_local! {static APP:RefCell<Option<App>>=const{RefCell::new(None)};}
 fn wide(text: &str) -> Vec<u16> {
@@ -131,6 +132,7 @@ unsafe fn create_tray_icon() -> Result<HICON> {
 enum Hit {
     Icon,
     Title,
+    NewResults(usize),
     Grip,
     Hide,
     Details,
@@ -544,11 +546,14 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
     match hit {
         Hit::Icon | Hit::ChatIcon(_) => "Change chat icon",
         Hit::Title => "Recent chats · Ctrl+Alt+J",
+        Hit::NewResults(count) => {
+            return format!("{count} newly completed chats · blue dot = unread result · open chat to mark as read")
+        }
         Hit::Grip => "Drag session bar",
         Hit::Hide => "Hide to tray · Ctrl+Alt+J to reopen",
         Hit::Details => "Session settings",
-        Hit::Recent(_) => "Open chat in Codex",
-        Hit::Fixed(_) => "Use this fixed chat",
+        Hit::Recent(_) => "Open chat in Codex · blue dot = newly completed, unread result",
+        Hit::Fixed(_) => "Use this fixed chat · blue dot = newly completed, unread result",
         Hit::ChooseFixed => "Choose a fixed chat",
         Hit::Back => "Back to session settings",
         Hit::Random => "Random icon",
@@ -813,7 +818,14 @@ impl App {
                 let tw = (p.width(&title, 12.) + 4.).clamp(64., 190.);
                 area(Hit::Title, rect(x, 2., tw, 30.));
                 p.label(&title, rect(x, 2., tw, 30.), 12., TEXT, false);
-                x += tw + 6.;
+                x += tw;
+                let new_results = live.recent.new_result_count();
+                if new_results > 0 {
+                    area(Hit::NewResults(new_results), rect(x, 2., 14., 30.));
+                    p.circle(x + 7., 17., 3.3, NEW_RESULT);
+                    x += 14.;
+                }
+                x += 6.;
                 let sw = p.width(&busy, 12.) + 2.;
                 p.label(
                     &busy,
@@ -959,8 +971,18 @@ impl App {
                 p.border(rect(332., 8., 32., 32.), 0x445c5c, 8.);
                 area(Hit::Refresh, rect(332., 8., 32., 32.));
                 p.action_icon(&Hit::Refresh, 337., 13.);
+                let new_results = self.chat_filters.iter()
+                    .filter(|&&index| self.rows[index].newly_completed()).count();
                 p.label(
-                    &format!("{} chats", self.chat_filters.len()),
+                    &format!(
+                        "{} chats{}",
+                        self.chat_filters.len(),
+                        if new_results > 0 {
+                            format!(" · {new_results} new")
+                        } else {
+                            String::new()
+                        }
+                    ),
                     rect(379., 9., width - 391., 30.),
                     11.,
                     MUTED,
@@ -1094,6 +1116,9 @@ impl App {
                         },
                         false,
                     );
+                    if row.newly_completed() {
+                        p.circle(width - 29., y + 19., 3.3, NEW_RESULT);
+                    }
                 }
                 if self.chat_filters.is_empty() {
                     p.label(
@@ -1357,6 +1382,9 @@ impl App {
                     );
                     if selected {
                         p.label("✓", rect(width - 39., y + 3., 20., 34.), 14., GREEN, false);
+                    }
+                    if row.newly_completed() {
+                        p.circle(width - 57., y + 20., 3.3, NEW_RESULT);
                     }
                 }
                 if self.chat_filters.is_empty() {
@@ -1712,6 +1740,7 @@ impl App {
         let mut width = 6.
             + 34.
             + (p.width(&title, 12.) + 4.).clamp(64., 190.)
+            + if live.recent.new_result_count() > 0 { 14. } else { 0. }
             + 6.
             + p.width(&busy, 12.)
             + 10.
@@ -2577,7 +2606,7 @@ impl App {
     }
     unsafe fn hit(&mut self, hit: Hit) -> Option<Action> {
         match hit {
-            Hit::Title => {
+            Hit::Title | Hit::NewResults(_) => {
                 let _ = self.popup(Popup::Recent);
             }
             Hit::Icon => {
@@ -3431,6 +3460,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
                     i + 1
                 ),
                 state: if i < 3 { "Busy".into() } else { "Done".into() },
+                is_unread: Some(i == 3 || i == 5),
                 tokens: Some(27190000),
                 tps: Some(42.3),
                 rate_at: Some(now()),
@@ -3600,6 +3630,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             34,
             &paths.runtime.join("rust-bar-verification.png"),
         )?;
+        assert!(bar_hits.iter().any(|area| area.hit == Hit::NewResults(2)));
         app.popup_kind = Some(Popup::Recent);
         app.rows = rows.clone();
         app.search.clear();

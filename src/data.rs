@@ -58,6 +58,9 @@ pub struct Row {
     pub fallback_title: bool,
     #[serde(default = "unknown")]
     pub state: String,
+    // None means the bounded desktop list did not include this chat.
+    #[serde(default)]
+    pub is_unread: Option<bool>,
     #[serde(default)]
     pub updated_at: f64,
     #[serde(default)]
@@ -116,6 +119,9 @@ pub fn visible_chat_title(label: &str) -> Option<String> {
     }
 }
 impl Row {
+    pub fn newly_completed(&self) -> bool {
+        self.state == "Done" && self.is_unread == Some(true)
+    }
     pub fn rate(&self) -> Option<f64> {
         self.tps.filter(|v| {
             v.is_finite()
@@ -158,6 +164,21 @@ pub struct Recent {
     pub error: String,
 }
 impl Recent {
+    pub fn new_result_count(&self) -> usize {
+        self.rows.iter().filter(|row| row.newly_completed()).count()
+    }
+    pub fn carry_read_state(&mut self, previous: &Self) {
+        let known: HashMap<_, _> = previous
+            .rows
+            .iter()
+            .map(|row| (row.id.as_str(), row.is_unread))
+            .collect();
+        for row in self.rows.iter_mut().chain(&mut self.all_rows).chain(&mut self.busy_metrics) {
+            if row.is_unread.is_none() {
+                row.is_unread = known.get(row.id.as_str()).copied().flatten();
+            }
+        }
+    }
     pub fn totals(&self) -> (Option<u64>, Option<f64>, bool) {
         let mut tokens = None;
         let mut rate = None;
@@ -633,6 +654,7 @@ impl Store {
                 },
             };
             row.state = state.into();
+            row.is_unread = entry["isUnread"].as_bool();
             let updated = entry["updatedAt"]
                 .as_f64()
                 .map(|t| if t > 1e12 { t / 1000. } else { t })
@@ -865,7 +887,10 @@ mod tests {
         )
         .unwrap();
         let mut store = Store::new(&paths);
-        let recent = store.recent(&serde_json::json!({"threads":[{"kind":"codex","hostId":"local","id":"chat-79","status":"active"}]})).unwrap();
+        let recent = store.recent(&serde_json::json!({"threads":[
+            {"kind":"codex","hostId":"local","id":"chat-79","status":"active","isUnread":true},
+            {"kind":"codex","hostId":"local","id":"chat-0","status":"idle","isUnread":true}
+        ]})).unwrap();
         assert_eq!(recent.rows.len(), 80);
         assert!(recent.rows.iter().all(|row| row.id != "metadata-only"));
         assert_eq!(recent.rows[0].id, "chat-0");
@@ -878,6 +903,26 @@ mod tests {
         assert_eq!(recent.all_rows[0].id, "chat-79");
         assert_eq!(recent.busy_count, Some(1));
         assert_eq!(recent.rows[1].state, "Unknown");
+        assert!(recent.rows[0].newly_completed());
+        assert!(!recent.rows[79].newly_completed());
+        assert_eq!(recent.new_result_count(), 1);
+        let mut read = store.recent(&serde_json::json!({"threads":[
+            {"kind":"codex","hostId":"local","id":"chat-0","status":"idle","isUnread":false}
+        ]})).unwrap();
+        read.carry_read_state(&recent);
+        assert_eq!(read.rows[0].is_unread, Some(false));
+        assert_eq!(read.new_result_count(), 0);
+        let mut outside_window = store.recent(&serde_json::json!({})).unwrap();
+        outside_window.carry_read_state(&recent);
+        assert!(outside_window.rows[0].newly_completed());
+        outside_window.carry_read_state(&read);
+        // An explicit newer value always wins over an older cached value.
+        assert!(outside_window.rows[0].newly_completed());
+        let cached: Recent = serde_json::from_value(serde_json::to_value(&read).unwrap()).unwrap();
+        let mut restored = store.recent(&serde_json::json!({})).unwrap();
+        restored.carry_read_state(&cached);
+        assert_eq!(restored.rows[0].is_unread, Some(false));
+        assert_eq!(restored.new_result_count(), 0);
     }
 
     #[test]
