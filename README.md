@@ -6,7 +6,7 @@
 
 **v0.1.0 · Rust 原生 Windows 版** · 运行不需要 Python 或 Qt · 中文使用微软雅黑，支持多屏 DPI 缩放。
 
-![默认在标题栏空白区居中停靠，菜单与窗口按钮保持可用；下方放大展示悬浮条](assets/images/preview-docking.svg)
+![Codex 标题栏中的悬浮条效果：在空白区居中，避开菜单和窗口按钮](assets/images/preview-docking.png)
 
 空间足够时自动居中停靠；窗口过窄时移到标题栏下方，避免遮挡操作区域。也可以拖动调整位置，在设置中点击停靠图标恢复自动位置。
 
