@@ -298,7 +298,7 @@ impl Workers {
         }));
         let (p, s, done) = (paths.clone(), state.clone(), stop.clone());
         handles.push(thread::spawn(move||{
-            let mut rpc=Rpc::new(&p,done.clone());let mut store=Store::new(&p);
+            let mut rpc=Rpc::new(&p,done.clone());let mut store=Store::new(&p);let mut last_quota=0.;
             while !done.load(Ordering::Relaxed) {
                 let ctx=context(&s.lock().unwrap());
                 match rpc.tool("list_threads",json!({"limit":50}),&ctx).and_then(|payload|store.recent(&payload)) {
@@ -309,31 +309,13 @@ impl Workers {
                     },
                     Err(e)=>{let mut live=s.lock().unwrap();let recent=std::sync::Arc::make_mut(&mut live.recent);recent.stale=true;recent.error=format!("{e:#}");}
                 }
-                wait(&done,2000);
-            }
-        }));
-        let (p, s, done) = (paths.clone(), state.clone(), stop.clone());
-        handles.push(thread::spawn(move || {
-            let mut rpc = Rpc::new(&p, done.clone());
-            let mut last = 0.0;
-            while !done.load(Ordering::Relaxed) {
-                if now() - last >= 60.0 || s.lock().unwrap().quota_at < 0.0 {
-                    let ctx = context(&s.lock().unwrap());
-                    match rpc.tool("get_usage_limits", json!({}), &ctx) {
-                        Ok(value) => {
-                            let mut live = s.lock().unwrap();
-                            live.quota = quotas(&value);
-                            live.quota_at = now();
-                            live.quota_error.clear();
-                            last = now();
-                        }
-                        Err(e) => {
-                            s.lock().unwrap().quota_error = format!("{e:#}");
-                            last = now() - 45.0;
-                        }
+                if now()-last_quota>=60. || s.lock().unwrap().quota_at<0. {
+                    match rpc.tool("get_usage_limits",json!({}),&ctx){
+                        Ok(value)=>{let mut live=s.lock().unwrap();live.quota=quotas(&value);live.quota_at=now();live.quota_error.clear();last_quota=now();}
+                        Err(e)=>{s.lock().unwrap().quota_error=format!("{e:#}");last_quota=now()-45.;}
                     }
                 }
-                wait(&done, 250);
+                wait(&done,2000);
             }
         }));
         let (p, s, done, cat) = (paths.clone(), state.clone(), stop.clone(), catalog.clone());
@@ -341,15 +323,17 @@ impl Workers {
             let mut rpc = Rpc::new(&p, done.clone());
             let store = Store::new(&p);
             let mut pending = std::collections::VecDeque::new();
+            let mut last_action=Instant::now();
             while !done.load(Ordering::Relaxed) {
                 let action = if let Some(v) = pending.pop_front() {
                     v
                 } else {
                     match receiver.recv_timeout(Duration::from_millis(100)) {
                         Ok(v) => v,
-                        Err(_) => continue,
+                        Err(_)=>{if last_action.elapsed()>=Duration::from_secs(30){rpc.close();}continue;},
                     }
                 };
+                last_action=Instant::now();
                 for next in receiver.try_iter() {
                     if matches!(next, Action::Navigate(_)) {
                         pending.retain(|a| !matches!(a, Action::Navigate(_)));

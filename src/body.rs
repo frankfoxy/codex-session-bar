@@ -73,10 +73,14 @@ impl Service {
                 let _ = SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
             }
             let mut index: Option<Index> = None;
+            let mut idle_since=std::time::Instant::now();
             while !stop.load(Ordering::Relaxed) {
                 let mut request = match receiver.recv_timeout(Duration::from_millis(100)) {
                     Ok(v) => v,
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Timeout)=>{
+                        if idle_since.elapsed()>=Duration::from_secs(30){index.take();sql_interrupt.lock().unwrap().clear();}
+                        continue;
+                    },
                     Err(_) => break,
                 };
                 // Only the newest query matters. Typing never queues a full scan per key.
@@ -157,6 +161,8 @@ impl Service {
                 if let Err(e) = result {
                     state.error = format!("{e:#}");
                 }
+                if let Some(index)=index.as_ref(){let _=index.db.execute_batch("PRAGMA shrink_memory");}
+                idle_since=std::time::Instant::now();
                 publish(&output, &state, &control);
             }
         });

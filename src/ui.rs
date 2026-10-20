@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use rand::seq::IteratorRandom;
 use serde_json::json;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     mem::size_of,
     sync::{
@@ -24,7 +24,7 @@ use windows::{
     Win32::{
         Foundation::*,
         Graphics::{Direct2D::Common::*, Direct2D::*, DirectWrite::*, Dxgi::Common::*, Gdi::*},
-        System::{LibraryLoader::*, Threading::*},
+        System::{LibraryLoader::*, ProcessStatus::*, Threading::*},
         UI::{
             Controls::*, Accessibility::*,
             HiDpi::*,
@@ -50,10 +50,15 @@ const GREEN: u32 = 0x65d69b;
 const NEW_RESULT: u32 = 0x70b7ff;
 const DETAILS_HEIGHT: i32 = 310;
 const PREFERENCES_HEIGHT: i32 = 464;
-const RECENT_ROW: i32 = 64;
-const RECENT_TOP: i32 = 76;
-const RECENT_FRAME: i32 = 120;
+const RECENT_ROW: i32 = 72;
+const LAYOUT_CACHE_LIMIT: usize = 256;
+const RECENT_TOP: i32 = 48;
+const RECENT_FRAME: i32 = 92;
 thread_local! {static APP:RefCell<Option<App>>=const{RefCell::new(None)};}
+fn private_bytes()->u64{unsafe{
+    let mut counters=PROCESS_MEMORY_COUNTERS_EX::default();counters.cb=size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    if GetProcessMemoryInfo(GetCurrentProcess(),&mut counters as *mut _ as *mut PROCESS_MEMORY_COUNTERS,counters.cb).is_ok(){counters.PrivateUsage as u64}else{0}
+}}
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
@@ -142,6 +147,7 @@ enum Hit {
     Hide,
     Preferences,
     Rows(i32),
+    TitleWidth(i32),
     ShortcutEnabled,
     ApplyPreferences,
     ResetPreferences,
@@ -164,6 +170,9 @@ enum Hit {
     GuardFolder,
     BackPreferences,
     Body,
+    ClearChatSearch,
+    ClearTagSearch,
+    ClearEmojiSearch,
     Compact,
     TagSidebar,
     TagFilter(String),
@@ -200,7 +209,9 @@ struct Painter {
     target: ID2D1DCRenderTarget,
     text: IDWriteFactory,
     formats: RefCell<HashMap<String, IDWriteTextFormat>>,
-    layouts: RefCell<HashMap<(String,u32,u32,u32,bool),IDWriteTextLayout>>,
+    layouts: RefCell<HashMap<(String,u32,u32,u32,bool,bool),(IDWriteTextLayout,u64)>>,
+    measurements: RefCell<HashMap<(String,u32),f32>>,
+    layout_clock: Cell<u64>,
     brushes: RefCell<HashMap<u32,ID2D1SolidColorBrush>>,
     chinese: String,
 }
@@ -236,6 +247,8 @@ impl Painter {
             text,
             formats: RefCell::new(HashMap::new()),
             layouts: RefCell::new(HashMap::new()),
+            measurements: RefCell::new(HashMap::new()),
+            layout_clock: Cell::new(0),
             brushes: RefCell::new(HashMap::new()),
             chinese,
         })
@@ -277,7 +290,7 @@ impl Painter {
     }
     unsafe fn label(&self, text: &str, r: D2D_RECT_F, size: f32, rgb: u32, emoji: bool) {
         let _ = (|| -> Result<()> {
-            let layout = self.layout(text,size,emoji,(r.right-r.left).max(1.),(r.bottom-r.top).max(1.))?;
+            let layout = self.layout(text,size,emoji,(r.right-r.left).max(1.),(r.bottom-r.top).max(1.),false)?;
             let brush = self.brush(rgb)?;
             self.target.DrawTextLayout(
                 D2D_POINT_2F {
@@ -308,6 +321,8 @@ impl Painter {
                 (r.right - r.left).max(1.),
                 (r.bottom - r.top).max(1.),
             )?;
+            layout.SetWordWrapping(DWRITE_WORD_WRAPPING_CHARACTER)?;
+            layout.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM,size+3.,size)?;
             let normal = self.brush(MUTED)?;
             let highlight = self.brush(0xffd27f)?;
             for (start, end) in body::match_ranges(text, query, exact) {
@@ -331,13 +346,24 @@ impl Painter {
         })();
     }
     unsafe fn width(&self, text: &str, size: f32) -> f32 {
-        (|| -> Result<f32> {
-            let layout = self.layout(text,size,false,10000.,40.)?;
-            let mut metrics = DWRITE_TEXT_METRICS::default();
-            layout.GetMetrics(&mut metrics)?;
+        let key=(text.to_string(),size.to_bits());
+        if let Some(width)=self.measurements.borrow().get(&key){return *width;}
+        let width=(|| -> Result<f32> {
+            let f=self.format(size,false,text)?;
+            let chars:Vec<u16>=text.encode_utf16().collect();
+            let layout=self.text.CreateTextLayout(&chars,&f,10000.,40.)?;
+            let mut metrics=DWRITE_TEXT_METRICS::default();layout.GetMetrics(&mut metrics)?;
             Ok(metrics.widthIncludingTrailingWhitespace)
-        })()
-        .unwrap_or(80.)
+        })().unwrap_or(80.);
+        let mut measurements=self.measurements.borrow_mut();
+        if measurements.len()>=512{measurements.clear();}
+        measurements.insert(key,width);width
+    }
+    fn release_layouts(&self){self.layouts.borrow_mut().clear();self.measurements.borrow_mut().clear();}
+    unsafe fn wrapped_label(&self,text:&str,r:D2D_RECT_F,size:f32,rgb:u32){
+        if let Ok(layout)=self.layout(text,size,false,(r.right-r.left).max(1.),(r.bottom-r.top).max(1.),true){
+            if let Ok(brush)=self.brush(rgb){self.target.DrawTextLayout(D2D_POINT_2F{x:r.left,y:r.top},&layout,&brush,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT|D2D1_DRAW_TEXT_OPTIONS_CLIP);}
+        }
     }
     unsafe fn fill(&self, r: D2D_RECT_F, rgb: u32, radius: f32) {
         if let Ok(b) = self.brush(rgb) {
@@ -582,6 +608,7 @@ struct App {
     host_hidden: bool,
     drag: Option<(POINT, [i32; 4])>,
     hover: Option<Hit>,
+    list_pointer: Option<(f32,f32)>,
     width: i32,
     height: i32,
     popup_size: [i32; 2],
@@ -652,6 +679,10 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::GuardFolder => "Open log folder · includes compressed history",
         Hit::BackPreferences => "Back to settings",
         Hit::Body => "Search message text · off by default",
+        Hit::ClearChatSearch => "Clear chat search · keep tag filters",
+        Hit::ClearTagSearch => "Clear tag search · keep selected tags",
+        Hit::ClearEmojiSearch => "Clear emoji search · keep category",
+        Hit::TitleWidth(_) => "Title column maximum · 140–280 DIP · two-line titles and previews",
         Hit::Compact => "Compact view · one line per chat, hide tags and prompt preview",
         Hit::TagSidebar => "Tag filters · expand or collapse · search names or pinyin",
         Hit::TagFilter(_) => "Filter by this tag · selected tags must all match",
@@ -682,6 +713,7 @@ impl App {
         testing: bool,
     ) -> Result<Self> {
         settings.recent_rows = settings.recent_rows.clamp(4, 20);
+        settings.recent_title_width=settings.recent_title_width.clamp(140,280);
         if !settings.recent_shortcut.valid() { settings.recent_shortcut = Shortcut::default(); }
         let _ = InitCommonControlsEx(&INITCOMMONCONTROLSEX {
             dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -808,6 +840,7 @@ impl App {
             host_hidden: false,
             drag: None,
             hover: None,
+            list_pointer: None,
             width: 650,
             height: 34,
             popup_size: [640, 460],
@@ -900,6 +933,7 @@ impl App {
         next.recent_shortcut = Shortcut::from_control_word(word, next.recent_shortcut.enabled);
         anyhow::ensure!(next.recent_shortcut.valid(), "Use Ctrl or Alt with a letter, number or F1–F24");
         next.recent_rows = next.recent_rows.clamp(4, 20);
+        next.recent_title_width=next.recent_title_width.clamp(140,280);
         let changed = next.recent_shortcut != self.settings.recent_shortcut;
         let in_scope = self.shortcut_allowed();
         let new_registration = !self.testing && in_scope && next.recent_shortcut.enabled && (changed || !self.shortcut_registered);
@@ -1171,11 +1205,15 @@ impl App {
                     } else {
                         search
                     },
-                    rect(21., 49., 180., 29.),
+                    rect(21., 49., 148., 29.),
                     13.,
                     MUTED,
                     false,
                 );
+                if !search.is_empty(){
+                    let r=Self::emoji_clear_rect();area(Hit::ClearEmojiSearch,r);
+                    p.search_clear(r,self.hover==Some(Hit::ClearEmojiSearch));
+                }
                 p.label(category, rect(222., 49., 131., 29.), 13., TEXT, false);
                 p.label("⌄", rect(350., 49., 16., 29.), 13., MUTED, false);
                 let columns = 10;
@@ -1224,11 +1262,15 @@ impl App {
                         } else {
                             &self.search
                         },
-                        rect(27., 49., width - 54., 35.),
+                        rect(27., 49., width - 86., 35.),
                         13.,
                         MUTED,
                         false,
                     );
+                }
+                if !self.search.is_empty(){
+                    let r=self.chat_clear_rect();area(Hit::ClearChatSearch,r);
+                    p.search_clear(r,self.hover==Some(Hit::ClearChatSearch));
                 }
                 for (slot, &index) in self
                     .chat_filters
@@ -1240,11 +1282,14 @@ impl App {
                     let row = &self.rows[index];
                     let y = 100. + slot as f32 * 44.;
                     let selected = !live.auto_thread && row.id == live.fixed_thread;
+                    let hovered=self.row_hovered(&row.id);
                     let busy = row.state == "Busy";
                     let r = rect(16., y, width - 32., 40.);
                     p.fill(
                         r,
-                        if selected {
+                        if hovered {
+                            if selected{0x354f46}else if busy{0x4a3d2c}else{0x33434d}
+                        } else if selected {
                             0x293f37
                         } else if busy {
                             0x352e24
@@ -1256,8 +1301,8 @@ impl App {
                     let icon_hit = Hit::ChatIcon(row.id.clone());
                     area(icon_hit.clone(), rect(23., y + 5., 33., 30.));
                     area(Hit::Fixed(row.id.clone()), r);
-                    if selected || self.chat_cursor == self.scroll + slot {
-                        p.border(r, if selected { 0x5ca985 } else { 0x59849c }, 7.);
+                    if hovered || selected || self.chat_cursor == self.scroll + slot {
+                        p.border(r, if hovered {0x78aac4} else if selected { 0x5ca985 } else { 0x59849c }, 7.);
                     }
                     p.fill(
                         rect(23., y + 5., 30., 30.),
@@ -1566,7 +1611,14 @@ impl App {
                     if delta > 0 { p.line(x + 15., 88., x + 15., 98., MUTED, 1.5); }
                 }
                 p.label(&draft.recent_rows.to_string(), rect(width - 108., 78., 50., 30.), 13., TEXT, false);
-                p.label("4–20 rows · all chats remain available by scrolling", rect(20., 113., width - 40., 24.), 11., MUTED, false);
+                p.label("Title column width",rect(20.,113.,260.,26.),12.,MUTED,false);
+                p.fill(rect(width-150.,113.,130.,26.),0x1c2125,6.);
+                for(delta,x)in[(-20,width-146.),(20,width-54.)]{
+                    area(Hit::TitleWidth(delta),rect(x,113.,30.,26.));
+                    p.line(x+10.,126.,x+20.,126.,MUTED,1.5);
+                    if delta>0{p.line(x+15.,121.,x+15.,131.,MUTED,1.5);}
+                }
+                p.label(&format!("{} px",draft.recent_title_width),rect(width-111.,113.,57.,26.),11.,TEXT,false);
                 p.line(20., 145., width - 20., 145., 0x354148, 1.);
                 p.label("Global shortcut", rect(20., 156., width - 95., 28.), 13., TEXT, false);
                 area(Hit::ShortcutEnabled, rect(width - 72., 155., 52., 30.));
@@ -2021,14 +2073,14 @@ impl App {
         )?;
         let controls = (|| -> Result<(HWND, HWND)> {
             let edit = CreateWindowExW(
-                WS_EX_CLIENTEDGE,
+                WINDOW_EX_STYLE(0),
                 w!("EDIT"),
                 w!(""),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
-                14,
-                49,
-                190,
-                29,
+                21,
+                53,
+                146,
+                22,
                 window,
                 HMENU(100isize as *mut _),
                 GetModuleHandleW(None)?,
@@ -2148,7 +2200,7 @@ impl App {
         let _ = SetWindowPos(panel.window, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
         Self::round_window(panel.window, w, h, (10. * scale) as i32);
         for (child, x, y, cw, ch) in [
-            (panel.edit, 14, 49, 190, 29),
+            (panel.edit, 21, 53, 146, 22),
             (panel.combo, 214, 49, 155, 350),
         ] {
             let _ = MoveWindow(
@@ -2167,6 +2219,7 @@ impl App {
             let _ = DestroyWindow(panel.window);
             self.icon_target = None;
             self.hover = None;
+            self.list_pointer=None;
             let _ = InvalidateRect(self.popup, None, false);
             if !self.testing {
                 let _ = SetFocus(self.edit);
@@ -2315,7 +2368,9 @@ impl App {
         }
         let _ = ShowWindow(self.popup, SW_HIDE);
         self.popup_kind = None;
+        self.painter.release_layouts();
         self.hover = None;
+        self.list_pointer=None;
     }
     unsafe fn owns_popup_window(&self, hwnd: HWND) -> bool {
         if hwnd.is_invalid() {
@@ -2399,6 +2454,7 @@ impl App {
             self.icon_target = None;
         }
         self.hover = None;
+        self.list_pointer=None;
         let live = self.snapshot();
         self.popup_size = match kind {
             Popup::Recent => {
@@ -2435,14 +2491,14 @@ impl App {
             self.category = "默认集合".into();
             self.filters = self.catalog.filter("", "默认集合");
             self.edit = CreateWindowExW(
-                WS_EX_CLIENTEDGE,
+                WINDOW_EX_STYLE(0),
                 w!("EDIT"),
                 w!(""),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
-                14,
-                49,
-                190,
-                29,
+                21,
+                53,
+                146,
+                22,
                 self.popup,
                 HMENU(100isize as *mut _),
                 GetModuleHandleW(None)?,
@@ -2514,7 +2570,7 @@ impl App {
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
                 if kind == Popup::Recent { 61 } else { 27 },
                 if kind == Popup::Recent { 13 } else { 55 },
-                if kind == Popup::Recent { 230 } else { 506 },
+                if kind == Popup::Recent { 206 } else { 480 },
                 24,
                 self.popup,
                 HMENU(103isize as *mut _),
@@ -2623,13 +2679,13 @@ impl App {
         // Child controls stay in physical pixels, matching the parent DPI.
         for (child, x, y, cw, ch) in [
             if self.popup_kind == Some(Popup::Fixed) {
-                (self.edit, 27, 55, 506, 24)
+                (self.edit, 27, 55, 480, 24)
             } else if self.popup_kind == Some(Popup::Recent) {
-                (self.edit, 61, 14, 230, 22)
+                (self.edit, 61, 14, 206, 22)
             } else if self.popup_kind == Some(Popup::Preferences) {
                 (self.edit, 258, 198, 278, 24)
             } else {
-                (self.edit, 14, 49, 190, 29)
+                (self.edit, 21, 53, 146, 22)
             },
             (self.combo, 214, 49, 155, 350),
         ] {
@@ -2650,6 +2706,7 @@ impl App {
         let _ = self.write_settings(&self.settings);
     }
     fn diagnostic(&self) {
+        self.paths.write(if self.testing{"rust-test-memory.json"}else{"memory-status.json"},&json!({"time":now(),"private_bytes":private_bytes(),"layout_entries":self.painter.layouts.borrow().len(),"layout_limit":LAYOUT_CACHE_LIMIT,"width_entries":self.painter.measurements.borrow().len(),"popup_open":self.popup_kind.is_some()}));
         self.paths.write(if self.testing { "rust-test-shortcut-status.json" } else { "shortcut-status.json" },
             &json!({"binding":self.settings.recent_shortcut.label(),"enabled":self.settings.recent_shortcut.enabled,"recent_visible_rows":self.settings.recent_rows,"registered":self.shortcut_registered,"error":self.shortcut_error}));
         self.paths.write(if self.testing { "rust-test-body-status.json" } else { "body-search-status.json" },
@@ -2665,6 +2722,27 @@ impl App {
     }
     unsafe fn hit(&mut self, hit: Hit) -> Option<Action> {
         match hit {
+            Hit::ClearChatSearch => {
+                self.search.clear(); self.filter_fixed();
+                let _=SetWindowTextW(self.edit,w!("")); let _=SetFocus(self.edit);
+                self.refresh_list_hover();let _=InvalidateRect(self.popup,None,false);
+            }
+            Hit::ClearTagSearch => {
+                self.tag_query.clear(); self.tag_scroll=[0.;3]; self.rebuild_tag_regions();
+                let _=SetWindowTextW(self.tag_search_input,w!("")); let _=SetFocus(self.tag_search_input);
+                let _=InvalidateRect(self.popup,None,false);
+            }
+            Hit::ClearEmojiSearch => {
+                if let Some(panel)=self.icon_panel.as_mut() {
+                    panel.search.clear(); panel.filters=self.catalog.filter("",&panel.category); panel.scroll=0;
+                    let _=SetWindowTextW(panel.edit,w!("")); let _=SetFocus(panel.edit);
+                    let _=InvalidateRect(panel.window,None,false);
+                } else {
+                    self.search.clear(); self.filters=self.catalog.filter("",&self.category); self.scroll=0;
+                    let _=SetWindowTextW(self.edit,w!("")); let _=SetFocus(self.edit);
+                    let _=InvalidateRect(self.popup,None,false);
+                }
+            }
             Hit::GuardLogs => { let _ = self.popup(Popup::GuardLogs); }
             Hit::GuardRefresh => { self.refresh_guard_events(); }
             Hit::BackPreferences => { let _ = self.popup(Popup::Preferences); }
@@ -2678,6 +2756,9 @@ impl App {
                 }
             }
             Hit::Preferences => { let _ = self.popup(Popup::Preferences); }
+            Hit::TitleWidth(delta)=>{
+                if let Some(draft)=self.preferences_draft.as_mut(){draft.recent_title_width=(draft.recent_title_width as i32+delta).clamp(140,280) as u32;self.preferences_note="Apply to save changes".into();}
+            }
             Hit::Rows(delta) => {
                 if let Some(draft) = self.preferences_draft.as_mut() {
                     draft.recent_rows = (draft.recent_rows as i32 + delta).clamp(4, 20) as usize;
@@ -2694,6 +2775,7 @@ impl App {
             Hit::ResetPreferences => {
                 if let Some(draft) = self.preferences_draft.as_mut() {
                     draft.recent_rows = 10;
+                    draft.recent_title_width=200;
                     draft.recent_shortcut = Shortcut::default();
                     SendMessageW(self.edit, HKM_SETHOTKEY, WPARAM(draft.recent_shortcut.control_word() as usize), LPARAM(0));
                     let _ = EnableWindow(self.edit, true);
@@ -2979,6 +3061,7 @@ impl App {
                 }
                 return Some(Hit::TagClose);
             }
+            if !self.search.is_empty() && Self::contains_rect(self.chat_clear_rect(),x,y){return Some(Hit::ClearChatSearch);}
             if y < RECENT_TOP as f32 {
                 if (12. ..42.).contains(&x)&&(9. ..39.).contains(&y){return Some(Hit::TagSidebar);}
                 if (310. ..370.).contains(&x)&&(8. ..40.).contains(&y){return Some(Hit::Body);}
@@ -2987,6 +3070,7 @@ impl App {
                 return self.popup_hits.iter().rev().find(|a|a.contains(x,y)&&matches!(a.hit,Hit::TagFilter(_)|Hit::TagClear)).map(|a|a.hit.clone());
             }
             if self.sidebar_open && x<TAG_SIDEBAR {
+                if !self.tag_query.is_empty() && Self::contains_rect(Self::tag_clear_rect(),x,y){return Some(Hit::ClearTagSearch);}
                 return self.tag_cloud_hit(x,y);
             }
             let top=RECENT_TOP as f32;let rh=self.recent_row_height() as f32;let left=self.recent_left();
@@ -2994,7 +3078,7 @@ impl App {
             let slot=self.scroll+((y-top)/rh) as usize;
             let &i=self.chat_filters.get(slot)?;let row=&self.rows[i];
             if (left+6. ..left+36.).contains(&x)&&(y-top)%rh<34.{return Some(Hit::ChatIcon(row.id.clone()));}
-            if !self.settings.compact_recent && (y-top)%rh>=29. {
+            if !self.settings.compact_recent && (y-top)%rh>=43. {
                 if x>=width-49.{return Some(Hit::TagEdit(row.id.clone()));}
                 let (_,tags,hidden)=unsafe{self.tag_layout(row)};
                 for(tag,tx,w)in tags{if(tx..tx+w).contains(&x){return Some(Hit::TagFilter(tag.key));}}
@@ -3002,6 +3086,7 @@ impl App {
             }
             return Some(Hit::Recent(row.id.clone()));
         }
+        if !self.search.is_empty() && Self::contains_rect(self.chat_clear_rect(),x,y){return Some(Hit::ClearChatSearch);}
         if (width - 74. ..width - 16.).contains(&x) && (9. ..39.).contains(&y) {
             return Some(Hit::Back);
         }
@@ -3179,7 +3264,13 @@ unsafe extern "system" fn wndproc(
                 app.tick();
                 Some(LRESULT(0))
             }
+            WM_MOUSELEAVE => {
+                app.hover=None; app.list_pointer=None; let _=InvalidateRect(hwnd,None,false); Some(LRESULT(0))
+            }
             WM_MOUSEMOVE => {
+                if !is_bar && matches!(app.popup_kind,Some(Popup::Recent|Popup::Fixed)) && app.set_list_pointer(Some((x,y))){let _=InvalidateRect(hwnd,None,false);}
+                let mut tracking=TRACKMOUSEEVENT{cbSize:size_of::<TRACKMOUSEEVENT>() as u32,dwFlags:TME_LEAVE,hwndTrack:hwnd,dwHoverTime:0};
+                let _=TrackMouseEvent(&mut tracking);
                 if app.tag_scroll_drag.is_some(){
                     app.drag_tag_scroll(y);
                 } else if app.chat_scroll_drag.is_some() {
@@ -3301,6 +3392,7 @@ unsafe extern "system" fn wndproc(
                     app.scroll,
                     (app.scroll + app.list_page_rows() - 1).min(app.chat_filters.len().saturating_sub(1)),
                 );
+                app.refresh_list_hover();
                 let _ = InvalidateRect(app.popup, None, false);
                 Some(LRESULT(0))
             }
@@ -4251,6 +4343,9 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             "guard_log_button_does_not_toggle_protection":true,"guard_log_preserves_unsaved_settings":true}));
         paths.write("rust-popover-shortcut-test.json", &json!({"list_window_preserved":true,"list_search_scroll_selection_preserved":true,"native_icon_click_routed":true,"icon_combo_survives_100_refreshes":true,"recent_shortcut_toggle":true,"index_percent_local_only":true,"body_snippet_highlight":true}));
         verify_recent_tags(&mut app,paths)?;
+        verify_filter_controls(&mut app,paths)?;
+        verify_memory_cache(&mut app,paths)?;
+        verify_two_columns(&mut app,paths)?;
         let _ = app.hit(Hit::Hide);
         assert!(app.hidden);
         app.hidden = false;

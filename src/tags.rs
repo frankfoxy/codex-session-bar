@@ -155,6 +155,52 @@ fn kind_order(k: &Kind) -> u8 {
     }
 }
 
+fn local_assignment(value: &Value) -> Option<String> {
+    value.as_str().map(str::to_owned).or_else(|| {
+        (value["projectKind"].as_str() == Some("local"))
+            .then(|| value["projectId"].as_str().map(str::to_owned))
+            .flatten()
+    })
+}
+fn normalized_root(path: &str) -> String {
+    let path = path.replace('/', "\\");
+    let path = path
+        .strip_prefix(r"\\?\UNC\")
+        .map(|p| format!(r"\\{p}"))
+        .unwrap_or_else(|| path.strip_prefix(r"\\?\").unwrap_or(&path).to_string());
+    path.trim_end_matches('\\').to_lowercase()
+}
+fn root_project(cwd: &str, roots: &[(String, String)]) -> Option<String> {
+    let cwd = normalized_root(cwd);
+    if cwd.is_empty() {
+        return None;
+    }
+    let mut best = 0;
+    let mut ids = HashSet::new();
+    for (root, id) in roots {
+        if root.is_empty() {
+            continue;
+        }
+        if cwd == *root
+            || cwd
+                .strip_prefix(root)
+                .is_some_and(|tail| tail.starts_with('\\'))
+        {
+            if root.len() > best {
+                best = root.len();
+                ids.clear();
+            }
+            if root.len() == best {
+                ids.insert(id.clone());
+            }
+        }
+    }
+    if ids.len() == 1 {
+        ids.into_iter().next()
+    } else {
+        None
+    }
+}
 #[derive(Default)]
 pub struct Sources {
     stamp: Option<(SystemTime, u64)>,
@@ -186,8 +232,14 @@ impl Sources {
                 }
             }
         }
+        let mut roots = Vec::<(String, String)>::new();
         if let Some(projects) = g["local-projects"].as_object() {
             for (id, p) in projects {
+                if let Some(paths) = p["rootPaths"].as_array() {
+                    for path in paths.iter().filter_map(Value::as_str) {
+                        roots.push((normalized_root(path), legacy.get(id).unwrap_or(id).clone()));
+                    }
+                }
                 if let Some(name) = p["name"].as_str() {
                     names.insert(id.clone(), name.into());
                     if let Some(new) = legacy.get(id) {
@@ -203,6 +255,25 @@ impl Sources {
                 for (id, name) in entries.flatten() {
                     names.insert(id, name);
                 }
+            }
+        }
+        if let Ok(mut q) = db.prepare("SELECT project_id,path FROM project_roots") {
+            if let Ok(values) =
+                q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            {
+                for (id, path) in values.flatten() {
+                    roots.push((normalized_root(&path), id));
+                }
+            }
+        }
+        let mut working_dirs = HashMap::<String, String>::new();
+        if let Ok(mut q) =
+            db.prepare("SELECT id,cwd FROM threads WHERE archived=0 AND agent_path IS NULL")
+        {
+            if let Ok(values) =
+                q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            {
+                working_dirs.extend(values.flatten());
             }
         }
         let mut groups = HashMap::<String, Tag>::new();
@@ -258,13 +329,16 @@ impl Sources {
         }
         for row in rows {
             let (project, section) = membership.get(&row.id).cloned().unwrap_or_default();
-            let project = project.or_else(|| {
-                g["thread-project-assignments"][&row.id]
-                    .as_str()
-                    .map(str::to_string)
-            });
+            let project = project
+                .or_else(|| local_assignment(&g["thread-project-assignments"][&row.id]))
+                .or_else(|| {
+                    working_dirs
+                        .get(&row.id)
+                        .and_then(|cwd| root_project(cwd, &roots))
+                });
             if let Some(p) = &project {
-                if let Some(name) = names.get(p) {
+                let canonical = legacy.get(p).unwrap_or(p);
+                if let Some(name) = names.get(canonical).or_else(|| names.get(p)) {
                     row.tags.push(Tag {
                         key: format!("project:{}", legacy.get(p).unwrap_or(p)),
                         label: name.clone(),
@@ -346,6 +420,74 @@ pub fn simplify_prompt(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_project_assignments_and_root_paths_match_without_ambiguity() {
+        use serde_json::json;
+        assert_eq!(
+            local_assignment(&json!({"projectKind":"local","projectId":"p"})),
+            Some("p".into())
+        );
+        assert_eq!(local_assignment(&json!("old")), Some("old".into()));
+        assert_eq!(
+            local_assignment(&json!({"projectKind":"cloud","projectId":"p"})),
+            None
+        );
+        let roots = vec![
+            (normalized_root(r"D:\Work\project"), "a".into()),
+            (normalized_root(r"D:\Work\project\nested"), "b".into()),
+        ];
+        assert_eq!(
+            root_project(r"\\?\D:\WORK\Project\", &roots),
+            Some("a".into())
+        );
+        assert_eq!(
+            root_project("D:/Work/project/nested/src", &roots),
+            Some("b".into())
+        );
+        assert_eq!(root_project(r"D:\Work\project-other", &roots), None);
+        let mut ambiguous = roots.clone();
+        ambiguous.push((normalized_root(r"D:\Work\project"), "other".into()));
+        assert_eq!(root_project(r"D:\Work\project", &ambiguous), None);
+    }
+    #[test]
+    fn enrich_recovers_object_assignment_and_existing_workspace_project() {
+        use serde_json::json;
+        let base = Paths::discover().unwrap();
+        let paths = Paths {
+            home: base
+                .runtime
+                .join(format!("absent-tag-source-{}", std::process::id())),
+            ..base
+        };
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(r"CREATE TABLE projects(id TEXT,name TEXT);CREATE TABLE project_roots(project_id TEXT,path TEXT);CREATE TABLE threads(id TEXT,project_id TEXT,thread_section_id TEXT,archived INTEGER,agent_path TEXT,cwd TEXT);INSERT INTO projects VALUES('new','工程甲'),('explicit','工程乙');
+            INSERT INTO project_roots VALUES('new','D:\Work\demo');
+            INSERT INTO threads VALUES('object',NULL,NULL,0,NULL,''),('root',NULL,NULL,0,NULL,'\\?\D:\WORK\demo\src'),('explicit','explicit',NULL,0,NULL,'D:\Work\demo');").unwrap();
+        let mut sources = Sources {
+            stamp: None,
+            global: json!({"local-projects":{"old":{"name":"旧名称"}},"app-server-project-id-by-legacy-project-id-by-host":{"local:test":{"old":"new"}},"thread-project-assignments":{"object":{"projectKind":"local","projectId":"old"}}}),
+        };
+        let mut rows = vec![
+            Row {
+                id: "object".into(),
+                ..Default::default()
+            },
+            Row {
+                id: "root".into(),
+                ..Default::default()
+            },
+            Row {
+                id: "explicit".into(),
+                ..Default::default()
+            },
+        ];
+        sources.enrich(&paths, &db, &json!({}), &mut rows);
+        assert_eq!(rows[0].tags[0].key, "project:new");
+        // Current database names supersede migrated legacy names.
+        assert_eq!(rows[0].tags[0].label, "工程甲");
+        assert_eq!(rows[1].tags[0].label, "工程甲");
+        assert_eq!(rows[2].tags[0].label, "工程乙");
+    }
     #[test]
     fn tags_keep_sources_locked_and_filter_all_selected() {
         let r = Row {

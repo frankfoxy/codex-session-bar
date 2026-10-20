@@ -136,8 +136,11 @@ pub struct Settings {
     pub recent_shortcut: Shortcut,
     #[serde(default)]
     pub compact_recent: bool,
+    #[serde(default="default_title_width")]
+    pub recent_title_width: u32,
 }
 fn default_recent_rows() -> usize { 10 }
+fn default_title_width()->u32{200}
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -145,6 +148,7 @@ impl Default for Settings {
             position_version: 0, recent_rows: default_recent_rows(),
             recent_shortcut: Shortcut::default(),
             compact_recent: false,
+            recent_title_width:default_title_width(),
         }
     }
 }
@@ -280,6 +284,7 @@ mod settings_tests {
         assert_eq!(settings.host_offset, Some([35,2]));
         assert!(!settings.auto_thread);
         assert_eq!(settings.recent_rows, 10);
+        assert_eq!(settings.recent_title_width,200);
         assert_eq!(settings.recent_shortcut.label(), "Ctrl+Alt+J");
     }
     #[test]

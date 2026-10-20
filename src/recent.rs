@@ -279,7 +279,7 @@ impl App {
             self.tag_search_input,
             (46. * self.dpi) as i32,
             ((RECENT_TOP as f32 + 9.) * self.dpi) as i32,
-            ((TAG_SIDEBAR - 69.) * self.dpi) as i32,
+            ((TAG_SIDEBAR - 97.) * self.dpi) as i32,
             (22. * self.dpi) as i32,
             true,
         );
@@ -393,6 +393,65 @@ impl App {
             h,
         )
     }
+    fn contains_rect(r: D2D_RECT_F, x: f32, y: f32) -> bool {
+        x >= r.left && x < r.right && y >= r.top && y < r.bottom
+    }
+    fn chat_clear_rect(&self) -> D2D_RECT_F {
+        if self.popup_kind == Some(Popup::Recent) {
+            rect(273., 13., 24., 24.)
+        } else {
+            rect(self.popup_size[0] as f32 - 47., 54., 24., 24.)
+        }
+    }
+    fn tag_clear_rect() -> D2D_RECT_F {
+        rect(TAG_SIDEBAR - 43., RECENT_TOP as f32 + 8., 24., 24.)
+    }
+    fn emoji_clear_rect() -> D2D_RECT_F {
+        rect(176., 51.5, 24., 24.)
+    }
+    fn pointed_row(&self) -> Option<usize> {
+        let (x, y) = self.list_pointer?;
+        let (top, rh, left, right, page) = match self.popup_kind {
+            Some(Popup::Recent) => (
+                RECENT_TOP as f32,
+                self.recent_row_height() as f32,
+                self.recent_left(),
+                self.popup_size[0] as f32 - 18.,
+                self.list_page_rows(),
+            ),
+            Some(Popup::Fixed) => (100., 44., 16., self.popup_size[0] as f32 - 16., 8),
+            _ => return None,
+        };
+        if (left..right).contains(&x)
+            && (top..top + page as f32 * rh).contains(&y)
+            && (y - top) % rh < rh - 4.
+        {
+            self.chat_filters
+                .get(self.scroll + ((y - top) / rh) as usize)
+                .copied()
+        } else {
+            None
+        }
+    }
+    fn set_list_pointer(&mut self, p: Option<(f32, f32)>) -> bool {
+        let old = self.pointed_row();
+        self.list_pointer = p;
+        old != self.pointed_row()
+    }
+    fn row_hovered(&self, id: &str) -> bool {
+        if self.list_pointer.is_some() {
+            return self.pointed_row().is_some_and(|i| self.rows[i].id == id);
+        }
+        matches!(&self.hover,Some(Hit::Recent(key)|Hit::Fixed(key)|Hit::ChatIcon(key)|Hit::TagEdit(key)) if key==id)
+    }
+    unsafe fn refresh_list_hover(&mut self) {
+        let mut point = POINT::default();
+        let _ = GetCursorPos(&mut point);
+        let _ = ScreenToClient(self.popup, &mut point);
+        let (x, y) = (point.x as f32 / self.dpi, point.y as f32 / self.dpi);
+        self.list_pointer = Some((x, y));
+        self.hover = self.fixed_hit_at(x, y);
+    }
     unsafe fn draw_recent(&self, width: f32, height: f32) -> Vec<Area> {
         let p = &self.painter;
         let live = self.snapshot();
@@ -417,11 +476,16 @@ impl App {
                 } else {
                     &self.search
                 },
-                rect(61., 9., 230., 32.),
+                rect(61., 9., 206., 32.),
                 12.,
                 MUTED,
                 false,
             );
+        }
+        if !self.search.is_empty() {
+            let r = self.chat_clear_rect();
+            area(Hit::ClearChatSearch, r);
+            p.search_clear(r, self.hover == Some(Hit::ClearChatSearch));
         }
         area(Hit::Body, rect(310., 8., 60., 32.));
         p.action_icon(&Hit::Body, 312., 14.);
@@ -441,52 +505,38 @@ impl App {
             .count();
         p.label(
             &format!(
-                "{} chats{}",
+                "{} chats{}{}",
                 self.chat_filters.len(),
+                if self.tag_filters.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {} tags", self.tag_filters.len())
+                },
                 if fresh > 0 {
                     format!(" · {fresh} new")
                 } else {
                     String::new()
                 }
             ),
-            rect(499., 9., width - 512., 30.),
+            rect(
+                499.,
+                9.,
+                width
+                    - if self.tag_filters.is_empty() {
+                        512.
+                    } else {
+                        546.
+                    },
+                30.,
+            ),
             11.,
             MUTED,
             false,
         );
-        let mut x = 16.;
-        if self.tag_filters.is_empty() {
-            p.label("Tags", rect(x, 46., 32., 24.), 10., MUTED, false);
-            x += 34.;
-            for (text, kind) in [
-                ("Project", tags::Kind::Project),
-                ("Group", tags::Kind::Group),
-                ("Custom", tags::Kind::Custom),
-            ] {
-                let tag = tags::Tag {
-                    label: text.into(),
-                    kind,
-                    ..Default::default()
-                };
-                let w = p.width(text, 10.) + 26.;
-                self.paint_tag(&tag, x, 48., w, false);
-                x += w + 5.;
-            }
-        } else {
-            for (tag, _) in &self.tag_catalog {
-                if !self.tag_filters.contains(&tag.key) {
-                    continue;
-                }
-                let w = (p.width(&tag.label, 10.) + 26.).min(150.);
-                if x + w > width - 100. {
-                    break;
-                }
-                self.paint_tag(tag, x, 48., w, true);
-                area(Hit::TagFilter(tag.key.clone()), rect(x, 48., w, 20.));
-                x += w + 5.;
-            }
-            area(Hit::TagClear, rect(width - 76., 46., 58., 24.));
-            p.action_icon(&Hit::Clear, width - 55., 47.);
+        if !self.tag_filters.is_empty() {
+            let r = rect(width - 39., 13., 24., 24.);
+            area(Hit::TagClear, r);
+            p.search_clear(r, self.hover == Some(Hit::TagClear));
         }
         let left = self.recent_left();
         if self.sidebar_open {
@@ -516,11 +566,16 @@ impl App {
                     } else {
                         &self.tag_query
                     },
-                    rect(46., RECENT_TOP as f32 + 5., TAG_SIDEBAR - 69., 29.),
+                    rect(46., RECENT_TOP as f32 + 5., TAG_SIDEBAR - 97., 29.),
                     11.,
                     TEXT,
                     false,
                 );
+            }
+            if !self.tag_query.is_empty() {
+                let r = Self::tag_clear_rect();
+                area(Hit::ClearTagSearch, r);
+                p.search_clear(r, self.hover == Some(Hit::ClearTagSearch));
             }
             p.label(
                 "Name · pinyin · initials",
@@ -629,9 +684,18 @@ impl App {
             );
             let current = row.id == self.identity(&live);
             let busy = row.state == "Busy";
+            let hovered = self.row_hovered(&row.id);
             p.fill(
                 r,
-                if current {
+                if hovered {
+                    if current {
+                        0x354f46
+                    } else if busy {
+                        0x4a3d2c
+                    } else {
+                        0x33434d
+                    }
+                } else if current {
                     0x293d36
                 } else if busy {
                     0x342c23
@@ -640,8 +704,18 @@ impl App {
                 },
                 7.,
             );
-            if current || self.chat_cursor == self.scroll + slot {
-                p.border(r, if current { 0x527b69 } else { 0x59849c }, 7.);
+            if hovered || current || self.chat_cursor == self.scroll + slot {
+                p.border(
+                    r,
+                    if hovered {
+                        0x78aac4
+                    } else if current {
+                        0x527b69
+                    } else {
+                        0x59849c
+                    },
+                    7.,
+                );
             }
             area(Hit::Recent(row.id.clone()), r);
             let icon_r = rect(left + 6., y + 4., 30., 30.);
@@ -661,13 +735,23 @@ impl App {
             } else {
                 24.
             };
-            p.label(
-                self.catalog.strip(&row.label),
-                rect(left + 42., y + 2., (metric_x - left - 51.).max(40.), line_h),
-                13.,
-                TEXT,
-                false,
-            );
+            let title_width = self.settings.recent_title_width.clamp(140, 280) as f32;
+            if self.settings.compact_recent {
+                p.label(
+                    self.catalog.strip(&row.label),
+                    rect(left + 42., y + 2., (metric_x - left - 51.).max(40.), line_h),
+                    13.,
+                    TEXT,
+                    false,
+                );
+            } else {
+                p.wrapped_label(
+                    self.catalog.strip(&row.label),
+                    rect(left + 42., y + 5., title_width, 32.),
+                    13.,
+                    TEXT,
+                );
+            }
             let metrics = if busy {
                 format!(
                     "{} t/s · {} TOK · {}",
@@ -686,7 +770,11 @@ impl App {
             };
             p.label(
                 &metrics,
-                rect(metric_x, y + 2., metric_width, line_h),
+                if self.settings.compact_recent {
+                    rect(metric_x, y + 2., metric_width, line_h)
+                } else {
+                    rect(left + 42., y + 43., 225., 22.)
+                },
                 10.,
                 MUTED,
                 false,
@@ -718,49 +806,49 @@ impl App {
             if self.settings.compact_recent {
                 continue;
             }
-            let (start, tags, hidden) = self.tag_layout(row);
+            let (_, tags, hidden) = self.tag_layout(row);
             let snippet = self.body_previews.get(&row.id).filter(|_| {
                 self.search_body
                     && !self.search.trim().is_empty()
                     && self.body_only.contains(&row.id)
             });
             let preview = snippet.unwrap_or(&row.prompt);
-            let preview_r = rect(left + 42., y + 31., (start - left - 50.).max(30.), 21.);
+            let preview_x = left + 42. + title_width + 18.;
+            let preview_r = rect(preview_x, y + 6., (width - 105. - preview_x).max(40.), 30.);
             if snippet.is_some() {
-                p.highlighted_label(preview, preview_r, 11., &self.search, false);
+                p.highlighted_label(preview, preview_r, 12., &self.search, false);
             } else {
-                p.label(
+                p.wrapped_label(
                     if preview.is_empty() { "—" } else { preview },
                     preview_r,
-                    11.,
+                    12.,
                     MUTED,
-                    false,
                 );
             }
             for (tag, x, w) in tags {
-                self.paint_tag(&tag, x, y + 31., w, self.tag_filters.contains(&tag.key));
-                area(Hit::TagFilter(tag.key), rect(x, y + 31., w, 20.));
+                self.paint_tag(&tag, x, y + 45., w, self.tag_filters.contains(&tag.key));
+                area(Hit::TagFilter(tag.key), rect(x, y + 45., w, 20.));
             }
             if hidden > 0 {
                 p.label(
                     &format!("+{hidden}"),
-                    rect(width - 79., y + 31., 26., 20.),
+                    rect(width - 79., y + 45., 26., 20.),
                     10.,
                     MUTED,
                     false,
                 );
                 area(
                     Hit::TagEdit(row.id.clone()),
-                    rect(width - 79., y + 31., 26., 20.),
+                    rect(width - 79., y + 45., 26., 20.),
                 );
             }
             area(
                 Hit::TagEdit(row.id.clone()),
-                rect(width - 49., y + 29., 30., 25.),
+                rect(width - 49., y + 43., 30., 25.),
             );
-            p.border(rect(width - 43., y + 35., 12., 10.), 0x91a8b5, 2.);
-            p.line(width - 40., y + 40., width - 34., y + 40., MUTED, 1.);
-            p.line(width - 37., y + 37., width - 37., y + 43., MUTED, 1.);
+            p.border(rect(width - 43., y + 49., 12., 10.), 0x91a8b5, 2.);
+            p.line(width - 40., y + 54., width - 34., y + 54., MUTED, 1.);
+            p.line(width - 37., y + 51., width - 37., y + 57., MUTED, 1.);
         }
         if self.chat_filters.is_empty() {
             p.label(
@@ -785,23 +873,16 @@ impl App {
             p.fill(rect(width - 11., top + off, 4., thumb), 0x6f8b9d, 2.);
         }
         p.line(16., height - 38., width - 16., height - 38., 0x354148, 1.);
-        p.label(
-            &format!(
-                "{} / {} chats · Index {:.0}%{}",
-                self.chat_filters.len(),
-                self.rows.len(),
-                self.body_state.progress_percent(),
-                if !self.body_state.error.is_empty() {
-                    " · retry pending"
-                } else {
-                    ""
-                }
-            ),
-            rect(16., height - 29., 260., 24.),
-            10.,
-            MUTED,
-            false,
-        );
+        let legend = [
+            ("Project", tags::Kind::Project),
+            ("Group", tags::Kind::Group),
+            ("Custom", tags::Kind::Custom),
+        ];
+        let lw: f32 = legend
+            .iter()
+            .map(|(text, _)| p.width(text, 10.) + 31.)
+            .sum();
+        let mut lx = width - 16. - lw;
         let (tok, rate, partial) = live.recent.totals();
         let total = format!(
             "Total {}{} t/s · {} TOK",
@@ -810,13 +891,46 @@ impl App {
             data::compact(tok)
         );
         let tw = p.width(&total, 10.);
+        let tx = lx - 14. - tw;
         p.label(
-            &total,
-            rect(width - 16. - tw, height - 29., tw + 1., 24.),
+            &format!(
+                "{} / {} chats · Index {:.0}%{}",
+                self.chat_filters.len(),
+                self.rows.len(),
+                self.body_state.progress_percent(),
+                if self.body_state.error.is_empty() {
+                    ""
+                } else {
+                    " · retry pending"
+                }
+            ),
+            rect(16., height - 29., (tx - 28.).max(30.), 24.),
             10.,
             MUTED,
             false,
         );
+        p.label(
+            &total,
+            rect(tx, height - 29., tw + 1., 24.),
+            10.,
+            MUTED,
+            false,
+        );
+        for (text, kind) in legend {
+            let w = p.width(text, 10.) + 26.;
+            self.paint_tag(
+                &tags::Tag {
+                    label: text.into(),
+                    kind,
+                    ..Default::default()
+                },
+                lx,
+                height - 27.,
+                w,
+                false,
+            );
+            lx += w + 5.;
+        }
         if let Some(id) = &self.tag_editor {
             let r = self.tag_editor_rect();
             let x = r.left;
@@ -1015,6 +1129,29 @@ impl App {
 }
 
 impl Painter {
+    unsafe fn search_clear(&self, r: D2D_RECT_F, hover: bool) {
+        if hover {
+            self.fill(r, 0x40535e, 5.);
+        }
+        let x = (r.left + r.right) * 0.5;
+        let y = (r.top + r.bottom) * 0.5;
+        self.line(
+            x - 3.5,
+            y - 3.5,
+            x + 3.5,
+            y + 3.5,
+            if hover { TEXT } else { MUTED },
+            1.4,
+        );
+        self.line(
+            x + 3.5,
+            y - 3.5,
+            x - 3.5,
+            y + 3.5,
+            if hover { TEXT } else { MUTED },
+            1.4,
+        );
+    }
     unsafe fn tag_icon(&self, x: f32, y: f32, rgb: u32, scale: f32) {
         for (a, b, c, d) in [
             (3., 3., 12., 3.),
@@ -1054,6 +1191,7 @@ impl Painter {
         emoji: bool,
         w: f32,
         h: f32,
+        wrap: bool,
     ) -> Result<IDWriteTextLayout> {
         let key = (
             text.to_string(),
@@ -1061,20 +1199,34 @@ impl Painter {
             w.to_bits(),
             h.to_bits(),
             emoji,
+            wrap,
         );
-        if let Some(layout) = self.layouts.borrow().get(&key) {
+        let clock = self.layout_clock.get().wrapping_add(1);
+        self.layout_clock.set(clock);
+        if let Some((layout, used)) = self.layouts.borrow_mut().get_mut(&key) {
+            *used = clock;
             return Ok(layout.clone());
         }
         let f = self.format(size, emoji, text)?;
         let chars: Vec<u16> = text.encode_utf16().collect();
         let layout = self.text.CreateTextLayout(&chars, &f, w, h)?;
-        let mut cache = self.layouts.borrow_mut();
-        // Bounded cache: retains common row/icon/label layouts without growing
-        // indefinitely as counters and search previews change.
-        if cache.len() >= 2048 {
-            cache.clear();
+        if wrap {
+            layout.SetWordWrapping(DWRITE_WORD_WRAPPING_CHARACTER)?;
+            layout.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, size + 3., size)?;
         }
-        cache.insert(key, layout.clone());
+        let mut cache = self.layouts.borrow_mut();
+        // Evict only the least recently used native layout; changing counters
+        // never retain thousands of COM/font objects or flush every hot row.
+        if cache.len() >= LAYOUT_CACHE_LIMIT {
+            if let Some(old) = cache
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| key.clone())
+            {
+                cache.remove(&old);
+            }
+        }
+        cache.insert(key, (layout.clone(), clock));
         Ok(layout)
     }
 }
@@ -1376,6 +1528,211 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     app.state.lock().unwrap().host = old_host;
     paths.write("rust-tags-ui-test.json",&json!({"collapsed_by_default":true,"sidebar_scroll_and_multitag_filter":true,"source_tags_locked":true,"editor_keeps_list_window_and_scroll":true,
         "custom_add_color_toggle_and_enter":true,"three_capped_regions_scroll_independently":true,"tag_scrollbars_drag_to_end":true,"tag_name_pinyin_initials_match":true,"tag_search_preserves_selections":true,"native_tag_search_control":true,
-        "compact_hides_tags_and_preview_preserves_filter_scroll":true,"title_results_immediate_during_body_search":true,"shortcut_released_and_available_to_other_apps":true,"render_cache_limit":2048}));
+        "compact_hides_tags_and_preview_preserves_filter_scroll":true,"title_results_immediate_during_body_search":true,"shortcut_released_and_available_to_other_apps":true,"render_cache_limit":LAYOUT_CACHE_LIMIT}));
+    Ok(())
+}
+
+unsafe fn verify_filter_controls(app: &mut App, paths: &Paths) -> Result<()> {
+    app.close_popup();
+    app.sidebar_open = false;
+    app.popup(Popup::Recent)?;
+    app.search = "xxx".into();
+    app.filter_fixed();
+    let _ = SetWindowTextW(app.edit, w!("xxx"));
+    app.tag_filters.insert("project:demo".into());
+    let selected = app.tag_filters.clone();
+    assert_eq!(app.fixed_hit_at(285., 25.), Some(Hit::ClearChatSearch));
+    let _ = app.hit(Hit::ClearChatSearch);
+    assert!(app.search.is_empty());
+    assert_eq!(GetWindowTextLengthW(app.edit), 0);
+    assert_eq!(app.tag_filters, selected);
+    let _ = app.hit(Hit::TagSidebar);
+    app.testing = false;
+    app.ensure_tag_search()?;
+    app.testing = true;
+    app.tag_query = "pc".into();
+    app.rebuild_tag_regions();
+    let _ = SetWindowTextW(app.tag_search_input, w!("pc"));
+    let r = App::tag_clear_rect();
+    assert_eq!(
+        app.fixed_hit_at(r.left + 12., r.top + 12.),
+        Some(Hit::ClearTagSearch)
+    );
+    let _ = app.hit(Hit::ClearTagSearch);
+    assert!(app.tag_query.is_empty());
+    assert_eq!(GetWindowTextLengthW(app.tag_search_input), 0);
+    assert_eq!(app.tag_filters, selected);
+    let _ = app.hit(Hit::TagClear);
+    let _ = app.hit(Hit::TagSidebar);
+    // Pointer position controls the whole row, including tag chips, independently of the keyboard cursor.
+    app.chat_cursor = 0;
+    app.scroll = 0;
+    assert!(app.set_list_pointer(Some((80., RECENT_TOP as f32 + RECENT_ROW as f32 + 15.))));
+    assert!(!app.set_list_pointer(Some((82., RECENT_TOP as f32 + RECENT_ROW as f32 + 17.))));
+    let hover_id = app.rows[app.chat_filters[1]].id.clone();
+    assert!(app.row_hovered(&hover_id));
+    assert!(!app.row_hovered(&app.rows[app.chat_filters[0]].id));
+    app.scroll = 1;
+    assert!(!app.row_hovered(&hover_id));
+    app.scroll = 0;
+    app.hover = Some(Hit::Recent(hover_id));
+    capture(
+        app,
+        Some(Popup::Recent),
+        820,
+        app.popup_size[1] as u32,
+        &paths.runtime.join("rust-list-hover-verification.png"),
+    )?;
+    app.list_pointer = None;
+    app.hover = None;
+    assert!(app.rows.iter().all(|r| !app.row_hovered(&r.id)));
+    app.search = "xxx".into();
+    app.filter_fixed();
+    let _ = SetWindowTextW(app.edit, w!("xxx"));
+    capture(
+        app,
+        Some(Popup::Recent),
+        820,
+        app.popup_size[1] as u32,
+        &paths.runtime.join("rust-search-clear-verification.png"),
+    )?;
+    let _ = app.hit(Hit::ChatIcon("fixture-0".into()));
+    let parent_search = app.search.clone();
+    let parent_filters = app.chat_filters.clone();
+    let parent_scroll = app.scroll;
+    {
+        let panel = app.icon_panel.as_mut().unwrap();
+        panel.search = "camera".into();
+        let _ = SetWindowTextW(panel.edit, w!("camera"));
+    }
+    let cat = app.icon_panel.as_ref().unwrap().category.clone();
+    let _ = app.hit(Hit::ClearEmojiSearch);
+    let panel = app.icon_panel.as_ref().unwrap();
+    assert!(panel.search.is_empty());
+    assert_eq!(panel.category, cat);
+    assert_eq!(GetWindowTextLengthW(panel.edit), 0);
+    assert_eq!(app.search, parent_search);
+    assert_eq!(app.chat_filters, parent_filters);
+    assert_eq!(app.scroll, parent_scroll);
+    app.close_popup();
+    app.popup(Popup::Fixed)?;
+    app.search = "test".into();
+    app.filter_fixed();
+    assert_eq!(
+        app.fixed_hit_at(app.popup_size[0] as f32 - 35., 66.),
+        Some(Hit::ClearChatSearch)
+    );
+    let _ = app.hit(Hit::ClearChatSearch);
+    assert!(app.search.is_empty());
+    assert_eq!(GetWindowTextLengthW(app.edit), 0);
+    app.close_popup();
+    app.popup(Popup::Icons)?;
+    app.search = "camera".into();
+    let _ = SetWindowTextW(app.edit, w!("camera"));
+    let category = app.category.clone();
+    let _ = app.hit(Hit::ClearEmojiSearch);
+    assert!(app.search.is_empty());
+    assert_eq!(app.category, category);
+    assert_eq!(GetWindowTextLengthW(app.edit), 0);
+    paths.write("rust-filter-ui-test.json",&json!({"chat_clear":true,"fixed_chat_clear":true,"tag_clear_keeps_selection":true,"emoji_clear_keeps_category":true,"popover_clear_keeps_parent":true,"hover_tracks_pointer_and_scroll":true,"footer_legend":true}));
+    Ok(())
+}
+
+unsafe fn verify_memory_cache(app: &mut App, paths: &Paths) -> Result<()> {
+    app.close_popup();
+    let before = private_bytes();
+    let hot = "常用会话名称";
+    let hot_layout = app.painter.layout(hot, 13., false, 200., 40., true)?;
+    for i in 0..3000 {
+        let text = format!("变化中的统计 {i} TOK · 12:{:02}", i % 60);
+        let _ = app.painter.layout(&text, 11., false, 250., 24., false)?;
+        let _ = app.painter.width(&text, 11.);
+        let same = app.painter.layout(hot, 13., false, 200., 40., true)?;
+        assert_eq!(same, hot_layout);
+        assert!(app.painter.layouts.borrow().len() <= LAYOUT_CACHE_LIMIT);
+    }
+    let populated = private_bytes();
+    let entries = app.painter.layouts.borrow().len();
+    app.painter.release_layouts();
+    assert!(app.painter.layouts.borrow().is_empty());
+    assert!(app.painter.measurements.borrow().is_empty());
+    paths.write("rust-memory-cache-test.json",&json!({"changing_counters":3000,"layout_entries":entries,"layout_limit":LAYOUT_CACHE_LIMIT,"width_limit":512,"hot_layout_retained":true,"released_after_close":true,"private_before":before,"private_populated":populated,"private_after_clear":private_bytes()}));
+    Ok(())
+}
+
+unsafe fn verify_two_columns(app: &mut App, paths: &Paths) -> Result<()> {
+    app.close_popup();
+    app.sidebar_open = false;
+    app.settings.compact_recent = false;
+    app.settings.recent_title_width = 200;
+    app.popup(Popup::Recent)?;
+    let first = app.chat_filters[0];
+    app.rows[first].label = "🚧 条码智能相机纯 RTL：图像采集、数据链路与帧缓存验证".into();
+    app.rows[first].prompt="继续完成图像采集链路，检查帧缓存与跨时钟域数据传输，保持四路并行，覆盖连续采集时的背压、丢帧和异常恢复。".into();
+    let second = app.chat_filters[1];
+    app.rows[second].label = "💾 LPDDR2C 控制器调试优化与多通道读写性能验证".into();
+    app.rows[second].prompt =
+        "先修改设计，然后运行仿真回归以及板级测试，核对采样时序、突发传输和数据校验的结果。".into();
+    let h = app.popup_size[1] as u32;
+    app.popup_hits = capture(
+        app,
+        Some(Popup::Recent),
+        820,
+        h,
+        &paths.runtime.join("rust-two-column-verification.png"),
+    )?;
+    assert_eq!(app.recent_row_height(), 72);
+    let (_, tags, _) = app.tag_layout(&app.rows[first]);
+    if let Some((tag, x, _)) = tags.first() {
+        assert_eq!(
+            app.fixed_hit_at(x + 5., RECENT_TOP as f32 + 52.),
+            Some(Hit::TagFilter(tag.key.clone()))
+        );
+    }
+    app.search = "帧缓存".into();
+    app.search_body = true;
+    app.body_only.insert(app.rows[first].id.clone());
+    app.body_previews
+        .insert(app.rows[first].id.clone(), app.rows[first].prompt.clone());
+    capture(
+        app,
+        Some(Popup::Recent),
+        820,
+        h,
+        &paths
+            .runtime
+            .join("rust-two-column-search-verification.png"),
+    )?;
+    app.close_popup();
+    app.popup(Popup::Preferences)?;
+    let _ = app.hit(Hit::TitleWidth(20));
+    assert_eq!(
+        app.preferences_draft.as_ref().unwrap().recent_title_width,
+        220
+    );
+    for _ in 0..20 {
+        let _ = app.hit(Hit::TitleWidth(20));
+    }
+    assert_eq!(
+        app.preferences_draft.as_ref().unwrap().recent_title_width,
+        280
+    );
+    for _ in 0..20 {
+        let _ = app.hit(Hit::TitleWidth(-20));
+    }
+    assert_eq!(
+        app.preferences_draft.as_ref().unwrap().recent_title_width,
+        140
+    );
+    capture(
+        app,
+        Some(Popup::Preferences),
+        560,
+        PREFERENCES_HEIGHT as u32,
+        &paths.runtime.join("rust-column-settings-verification.png"),
+    )?;
+    let saved: Settings = serde_json::from_value(serde_json::to_value(&app.settings)?)?;
+    assert_eq!(saved.recent_title_width, 200);
+    paths.write("rust-two-column-test.json",&json!({"two_line_title_and_prompt":true,"body_highlight":true,"tag_hit_positions":true,"width_setting_range":[140,280],"settings_roundtrip":true,"compact_unchanged":true}));
     Ok(())
 }
