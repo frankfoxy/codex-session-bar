@@ -316,11 +316,6 @@ impl Catalog {
     pub fn rename(&self, title: &str, icon: &str) -> String {
         format!("{} {}", icon, self.strip(title)).trim().into()
     }
-    pub fn retitle(&self, old: &str, title: &str) -> String {
-        let old = old.trim();
-        let prefix = old[..old.len() - self.strip(old).len()].trim();
-        format!("{} {}", prefix, self.strip(title)).trim().into()
-    }
     pub fn suggest(&self, title: &str) -> String {
         let title = self.strip(title).to_lowercase();
         let rules: &[(&[&str], &str)] = &[
