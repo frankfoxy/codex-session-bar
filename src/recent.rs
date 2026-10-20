@@ -12,6 +12,13 @@ struct RecentColumns {
     meta_left: f32,
     meta_width: f32,
     meta_right: f32,
+    tags_left: f32,
+    tags_width: f32,
+}
+struct RowTagLayout {
+    chips: Vec<(tags::Tag, D2D_RECT_F)>,
+    hidden: usize,
+    action: D2D_RECT_F,
 }
 struct TagCloudItem {
     index: usize,
@@ -20,6 +27,30 @@ struct TagCloudItem {
 struct TagRegion {
     items: Vec<TagCloudItem>,
     height: f32,
+}
+
+// Anchor the conversation area first; the sidebar consumes space to its left.
+// At a monitor edge, keep the complete popup reachable inside the work area.
+fn recent_panel_x(
+    bar_left: i32,
+    width: i32,
+    sidebar: bool,
+    scale: f32,
+    work_left: i32,
+    work_right: i32,
+) -> i32 {
+    let inset = if sidebar {
+        (TAG_SIDEBAR * scale).round() as i32
+    } else {
+        0
+    };
+    let list_width = width - inset;
+    let list_left = bar_left
+        .max(work_left)
+        .min((work_right - list_width).max(work_left));
+    (list_left - inset)
+        .max(work_left)
+        .min((work_right - width).max(work_left))
 }
 
 impl App {
@@ -84,7 +115,7 @@ impl App {
         let base = if self.settings.compact_recent {
             640
         } else {
-            1220
+            1040
         };
         let requested = base
             + if self.sidebar_open {
@@ -240,7 +271,9 @@ impl App {
         Some((r, thumb, offset))
     }
     unsafe fn begin_tag_scroll(&mut self, x: f32, y: f32) -> bool {
-        if self.tag_editor.is_some() || !(TAG_SIDEBAR - 10. ..TAG_SIDEBAR).contains(&x) {
+        if (self.tag_editor.is_some() || self.tag_overflow.is_some())
+            || !(TAG_SIDEBAR - 10. ..TAG_SIDEBAR).contains(&x)
+        {
             return false;
         }
         let Some(i) = self.tag_region_at(x, y) else {
@@ -343,52 +376,138 @@ impl App {
         let width = self.popup_size[0] as f32;
         let left = self.recent_left();
         let content = (width - left - 18.).max(300.);
-        let meta_width = (content * 0.30).clamp(200., 280.);
-        let meta_right = width - 99.;
+        let tags_width = (content * 0.20).clamp(120., 210.);
+        let tags_left = width - 93. - tags_width;
+        let meta_width = (content * 0.145).clamp(100., 155.);
+        let meta_right = tags_left - 6.;
         let meta_left = meta_right - meta_width;
-        let title_left = left + 42.;
+        let title_left = left + 50.;
         let title_width = (self.settings.recent_title_width.clamp(140, 280) as f32)
-            .min((meta_left - 18. - title_left - 18. - 100.).max(80.));
-        let preview_left = title_left + title_width + 18.;
+            .min((meta_left - title_left - 16. - 100.).max(80.));
+        let preview_left = title_left + title_width + 8.;
         RecentColumns {
             title_left,
             title_width,
             preview_left,
-            preview_width: (meta_left - 18. - preview_left).max(40.),
+            preview_width: (meta_left - 8. - preview_left).max(40.),
             meta_left,
             meta_width,
             meta_right,
+            tags_left,
+            tags_width,
         }
     }
-    unsafe fn tag_layout(&self, row: &Row) -> (f32, Vec<(tags::Tag, f32, f32)>, usize) {
+    unsafe fn chip_width(&self, tag: &tags::Tag, limit: f32) -> f32 {
+        (self.painter.width(&tag.label, 10.)
+            + if tag.kind == tags::Kind::Custom {
+                14.
+            } else {
+                26.
+            })
+        .min(130.)
+        .min(limit.max(30.))
+    }
+    unsafe fn tag_layout(&self, row: &Row) -> RowTagLayout {
         let tags = self.custom_tags.for_row(row);
-        let columns = self.recent_columns();
-        let budget = columns.meta_width - 26.;
-        let mut used = 0.;
-        let mut result = Vec::new();
-        for tag in tags.iter().take(3) {
-            let w = (self.painter.width(&tag.label, 10.)
-                + if tag.kind == tags::Kind::Custom {
-                    14.
-                } else {
-                    26.
-                })
-            .min(130.);
-            if used + w > budget - 34. {
+        let c = self.recent_columns();
+        let (mut x, mut line) = (0., 0usize);
+        let mut chips = Vec::new();
+        for tag in &tags {
+            let mut limit = if line == 0 {
+                c.tags_width
+            } else {
+                c.tags_width - 28.
+            };
+            let mut w = self.chip_width(tag, limit);
+            if x + w > limit && x > 0. {
+                if line == 1 {
+                    break;
+                }
+                line = 1;
+                x = 0.;
+                limit = c.tags_width - 28.;
+                w = self.chip_width(tag, limit);
+            }
+            if line >= 2 {
                 break;
             }
-            result.push((tag.clone(), 0., w));
-            used += w + 5.;
+            chips.push((
+                tag.clone(),
+                rect(c.tags_left + x, 1. + line as f32 * 22., w, 20.),
+            ));
+            x += w + 4.;
         }
-        let hidden = tags.len() - result.len();
-        let extra = if hidden > 0 { 28. } else { 0. };
-        let start = columns.meta_right - 26. - used - extra;
-        let mut x = start;
-        for (_, tx, w) in &mut result {
-            *tx = x;
-            x += *w + 5.;
+        let hidden = tags.len() - chips.len();
+        if x + 24. > c.tags_width {
+            line += 1;
+            x = 0.;
         }
-        (start, result, hidden)
+        let action = rect(c.tags_left + x, 1. + line.min(1) as f32 * 22., 24., 20.);
+        RowTagLayout {
+            chips,
+            hidden,
+            action,
+        }
+    }
+    fn tag_overflow_rect(&self) -> D2D_RECT_F {
+        let width = (self.popup_size[0] as f32 - self.recent_left() - 24.).min(360.);
+        let height = (self.popup_size[1] as f32 - RECENT_TOP as f32 - 44.).min(264.);
+        let x = self
+            .recent_columns()
+            .tags_left
+            .min(self.popup_size[0] as f32 - width - 18.)
+            .max(self.recent_left());
+        let y = self
+            .tag_overflow_y
+            .min(self.popup_size[1] as f32 - height - 42.)
+            .max(RECENT_TOP as f32);
+        rect(x, y, width, height)
+    }
+    unsafe fn tag_overflow_chips(&self) -> (Vec<(tags::Tag, D2D_RECT_F)>, f32) {
+        let Some(id) = &self.tag_overflow else {
+            return (Vec::new(), 0.);
+        };
+        let Some(row) = self.rows.iter().find(|r| &r.id == id) else {
+            return (Vec::new(), 0.);
+        };
+        let r = self.tag_overflow_rect();
+        let width = r.right - r.left - 32.;
+        let (mut x, mut y) = (0., 0.);
+        let mut chips = Vec::new();
+        for tag in self.custom_tags.for_row(row) {
+            let w = self.chip_width(&tag, width);
+            if x + w > width && x > 0. {
+                x = 0.;
+                y += 26.;
+            }
+            chips.push((tag, rect(x, y, w, 20.)));
+            x += w + 5.;
+        }
+        (chips, y + 20.)
+    }
+    unsafe fn scroll_tag_overflow(&mut self, delta: f32) {
+        let r = self.tag_overflow_rect();
+        let (_, height) = self.tag_overflow_chips();
+        self.tag_overflow_scroll = (self.tag_overflow_scroll + delta)
+            .clamp(0., (height - (r.bottom - r.top - 78.)).max(0.));
+    }
+    unsafe fn open_tag_overflow(&mut self, id: String) {
+        self.close_icon_panel();
+        self.close_tag_editor();
+        self.tag_overflow_y = self
+            .rows
+            .iter()
+            .position(|r| r.id == id)
+            .and_then(|i| self.chat_filters.iter().position(|v| *v == i))
+            .map(|slot| {
+                RECENT_TOP as f32
+                    + slot.saturating_sub(self.scroll) as f32 * self.recent_row_height() as f32
+                    + 24.
+            })
+            .unwrap_or(RECENT_TOP as f32);
+        self.tag_overflow = Some(id);
+        self.tag_overflow_scroll = 0.;
+        let _ = InvalidateRect(self.popup, None, false);
     }
     unsafe fn paint_tag(&self, tag: &tags::Tag, x: f32, y: f32, w: f32, selected: bool) {
         let p = &self.painter;
@@ -441,6 +560,9 @@ impl App {
         rect(176., 51.5, 24., 24.)
     }
     fn pointed_row(&self) -> Option<usize> {
+        if self.tag_editor.is_some() || self.tag_overflow.is_some() {
+            return None;
+        }
         let (x, y) = self.list_pointer?;
         let (top, rh, left, right, page) = match self.popup_kind {
             Some(Popup::Recent) => (
@@ -473,7 +595,7 @@ impl App {
         if self.list_pointer.is_some() {
             return self.pointed_row().is_some_and(|i| self.rows[i].id == id);
         }
-        matches!(&self.hover,Some(Hit::Recent(key)|Hit::Fixed(key)|Hit::ChatIcon(key)|Hit::TagEdit(key)) if key==id)
+        matches!(&self.hover,Some(Hit::Recent(key)|Hit::Fixed(key)|Hit::ChatIcon(key)|Hit::TagEdit(key)|Hit::TagOverflow(key)) if key==id)
     }
     unsafe fn refresh_list_hover(&mut self) {
         let mut point = POINT::default();
@@ -750,12 +872,12 @@ impl App {
             }
             area(Hit::Recent(row.id.clone()), r);
             let icon_y = y + if self.settings.compact_recent { 4. } else { 7. };
-            let icon_r = rect(left + 6., icon_y, 30., 30.);
+            let icon_r = rect(left + 12., icon_y, 30., 30.);
             area(Hit::ChatIcon(row.id.clone()), icon_r);
             p.fill(icon_r, 0x303b43, 7.);
             p.label(
                 &self.catalog.icon(&row.label),
-                rect(left + 10., icon_y - 2., 25., 34.),
+                rect(left + 16., icon_y - 2., 25., 34.),
                 17.,
                 TEXT,
                 true,
@@ -771,7 +893,7 @@ impl App {
             if self.settings.compact_recent {
                 p.label(
                     self.catalog.strip(&row.label),
-                    rect(left + 42., y + 2., (metric_x - left - 51.).max(40.), line_h),
+                    rect(left + 50., y + 2., (metric_x - left - 59.).max(40.), line_h),
                     13.,
                     TEXT,
                     false,
@@ -807,9 +929,31 @@ impl App {
                     false,
                 );
             } else {
+                let summary = if busy {
+                    format!(
+                        "{} t/s · {} TOK",
+                        row.rate().map(|v| format!("{v:.1}")).unwrap_or("—".into()),
+                        data::compact(row.tokens)
+                    )
+                } else {
+                    format!("{} TOK", data::compact(row.tokens))
+                };
+                let elapsed = if busy {
+                    row.started_at
+                        .map(|t| data::duration(now() - t))
+                        .unwrap_or("—".into())
+                } else {
+                    row.total_seconds.map(data::duration).unwrap_or("—".into())
+                };
                 p.right_label(
-                    &metrics,
+                    &summary,
                     rect(columns.meta_left, y + 1., columns.meta_width, 20.),
+                    10.,
+                    MUTED,
+                );
+                p.right_label(
+                    &elapsed,
+                    rect(columns.meta_left, y + 23., columns.meta_width, 20.),
                     10.,
                     MUTED,
                 );
@@ -836,21 +980,12 @@ impl App {
                 false,
             );
             if row.newly_completed() {
-                p.circle(
-                    width - 27.,
-                    y + if self.settings.compact_recent {
-                        19.
-                    } else {
-                        22.
-                    },
-                    3.3,
-                    NEW_RESULT,
-                );
+                p.circle(left + 5., icon_y + 15., 3., NEW_RESULT);
             }
             if self.settings.compact_recent {
                 continue;
             }
-            let (_, tags, hidden) = self.tag_layout(row);
+            let tag_layout = self.tag_layout(row);
             let snippet = self.body_previews.get(&row.id).filter(|_| {
                 self.search_body
                     && !self.search.trim().is_empty()
@@ -868,31 +1003,49 @@ impl App {
                     MUTED,
                 );
             }
-            let edit_x = columns.meta_right - 24.;
-            for (tag, x, w) in tags {
-                self.paint_tag(&tag, x, y + 23., w, self.tag_filters.contains(&tag.key));
-                area(Hit::TagFilter(tag.key), rect(x, y + 23., w, 20.));
-            }
-            if hidden > 0 {
-                p.label(
-                    &format!("+{hidden}"),
-                    rect(columns.meta_right - 54., y + 23., 26., 20.),
-                    10.,
-                    MUTED,
-                    false,
+            for (tag, r) in tag_layout.chips {
+                self.paint_tag(
+                    &tag,
+                    r.left,
+                    y + r.top,
+                    r.right - r.left,
+                    self.tag_filters.contains(&tag.key),
                 );
                 area(
-                    Hit::TagEdit(row.id.clone()),
-                    rect(columns.meta_right - 54., y + 23., 26., 20.),
+                    Hit::TagFilter(tag.key),
+                    rect(r.left, y + r.top, r.right - r.left, 20.),
                 );
             }
-            area(
-                Hit::TagEdit(row.id.clone()),
-                rect(edit_x, y + 21., 24., 23.),
-            );
-            p.border(rect(edit_x + 6., y + 27., 12., 10.), 0x91a8b5, 2.);
-            p.line(edit_x + 9., y + 32., edit_x + 15., y + 32., MUTED, 1.);
-            p.line(edit_x + 12., y + 29., edit_x + 12., y + 35., MUTED, 1.);
+            let r = tag_layout.action;
+            let button = rect(r.left, y + r.top, r.right - r.left, 20.);
+            if tag_layout.hidden > 0 {
+                area(Hit::TagOverflow(row.id.clone()), button);
+                p.fill(button, 0x34424a, 4.);
+                p.label("…", button, 16., TEXT, false);
+            } else {
+                area(Hit::TagEdit(row.id.clone()), button);
+                p.border(
+                    rect(button.left + 6., button.top + 5., 12., 10.),
+                    0x91a8b5,
+                    2.,
+                );
+                p.line(
+                    button.left + 9.,
+                    button.top + 10.,
+                    button.left + 15.,
+                    button.top + 10.,
+                    MUTED,
+                    1.,
+                );
+                p.line(
+                    button.left + 12.,
+                    button.top + 7.,
+                    button.left + 12.,
+                    button.top + 13.,
+                    MUTED,
+                    1.,
+                );
+            }
         }
         if self.chat_filters.is_empty() {
             p.label(
@@ -974,6 +1127,81 @@ impl App {
                 false,
             );
             lx += w + 5.;
+        }
+        if let Some(id) = &self.tag_overflow {
+            let r = self.tag_overflow_rect();
+            let (x, y, w, h) = (r.left, r.top, r.right - r.left, r.bottom - r.top);
+            area(Hit::TagOverflowBackground, r);
+            p.fill(r, 0x2a3237, 9.);
+            p.border(r, 0x52646f, 9.);
+            let (chips, content_height) = self.tag_overflow_chips();
+            p.label(
+                &format!("All tags · {}", chips.len()),
+                rect(x + 14., y + 6., w - 110., 28.),
+                14.,
+                TEXT,
+                false,
+            );
+            area(
+                Hit::TagEdit(id.clone()),
+                rect(x + w - 76., y + 7., 30., 26.),
+            );
+            p.tag_icon(x + w - 72., y + 9., MUTED, 0.75);
+            area(Hit::TagOverflowClose, rect(x + w - 39., y + 7., 28., 26.));
+            p.search_clear(
+                rect(x + w - 37., y + 8., 24., 24.),
+                self.hover == Some(Hit::TagOverflowClose),
+            );
+            if let Some(row) = self.rows.iter().find(|r| &r.id == id) {
+                p.label(
+                    self.catalog.strip(&row.label),
+                    rect(x + 14., y + 36., w - 28., 22.),
+                    11.,
+                    MUTED,
+                    false,
+                );
+            }
+            let viewport = rect(x + 14., y + 64., w - 28., h - 78.);
+            p.target
+                .PushAxisAlignedClip(&viewport, D2D1_ANTIALIAS_MODE_ALIASED);
+            for (tag, item) in chips {
+                let cy = viewport.top + item.top - self.tag_overflow_scroll;
+                if cy + 20. < viewport.top || cy > viewport.bottom {
+                    continue;
+                }
+                self.paint_tag(
+                    &tag,
+                    viewport.left + item.left,
+                    cy,
+                    item.right - item.left,
+                    self.tag_filters.contains(&tag.key),
+                );
+                let top = cy.max(viewport.top);
+                let bottom = (cy + 20.).min(viewport.bottom);
+                if bottom > top {
+                    area(
+                        Hit::TagFilter(tag.key),
+                        rect(
+                            viewport.left + item.left,
+                            top,
+                            item.right - item.left,
+                            bottom - top,
+                        ),
+                    );
+                }
+            }
+            p.target.PopAxisAlignedClip();
+            let visible = viewport.bottom - viewport.top;
+            if content_height > visible {
+                let thumb = (visible * visible / content_height).max(18.);
+                let offset =
+                    (visible - thumb) * self.tag_overflow_scroll / (content_height - visible);
+                p.fill(
+                    rect(x + w - 8., viewport.top + offset, 3., thumb),
+                    0x77929f,
+                    1.5,
+                );
+            }
         }
         if let Some(id) = &self.tag_editor {
             let r = self.tag_editor_rect();
@@ -1106,6 +1334,7 @@ impl App {
         hits
     }
     unsafe fn close_tag_editor(&mut self) {
+        self.tag_overflow = None;
         self.tag_editor = None;
         if !self.tag_input.is_invalid() {
             let _ = DestroyWindow(self.tag_input);
@@ -1315,9 +1544,45 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     app.chat_cursor = 3;
     app.scroll = 2;
     let order = app.chat_filters.clone();
+    let original_bar = host::bounds(app.bar.0 as isize).unwrap();
+    let scale = app.dpi;
+    let _ = SetWindowPos(
+        app.bar,
+        HWND_TOPMOST,
+        (360. * scale) as i32,
+        (40. * scale) as i32,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+    app.place_popup();
+    let before_panel = host::bounds(app.popup.0 as isize).unwrap();
+    let before_chat_x = before_panel[0] + (app.recent_left() * scale).round() as i32;
     let _ = app.hit(Hit::TagSidebar);
+    let expanded_panel = host::bounds(app.popup.0 as isize).unwrap();
+    assert_eq!(
+        before_chat_x,
+        expanded_panel[0] + (app.recent_left() * scale).round() as i32
+    );
+    assert_eq!(
+        before_panel[2], expanded_panel[2],
+        "Sidebar must grow to the left"
+    );
+    let _ = app.hit(Hit::ChatIcon("fixture-3".into()));
+    assert_eq!(host::bounds(app.popup.0 as isize).unwrap(), expanded_panel);
+    let panel = app.icon_panel.as_ref().unwrap();
+    let icon_bounds = host::bounds(panel.window.0 as isize).unwrap();
+    assert!(icon_bounds[0] >= expanded_panel[0] && icon_bounds[0] < expanded_panel[2]);
+    let target = app.icon_target.clone();
+    for _ in 0..10 {
+        app.place_popup();
+        app.place_icon_panel();
+    }
+    assert_eq!(host::bounds(app.popup.0 as isize).unwrap(), expanded_panel);
+    assert_eq!(app.icon_target, target);
+    app.close_icon_panel();
     assert!(app.sidebar_open);
-    assert_eq!(app.popup_size[0], 1456);
+    assert_eq!(app.popup_size[0], 1276);
     assert_eq!(app.chat_filters, order);
     assert_eq!(app.scroll, 2);
     assert_eq!(app.chat_cursor, 3);
@@ -1327,7 +1592,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     app.popup_hits = capture(
         app,
         Some(Popup::Recent),
-        1456,
+        1276,
         h,
         &paths.runtime.join("rust-tags-expanded-verification.png"),
     )?;
@@ -1372,7 +1637,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     app.popup_hits = capture(
         app,
         Some(Popup::Recent),
-        1456,
+        1276,
         h,
         &paths.runtime.join("rust-tags-editor-verification.png"),
     )?;
@@ -1386,11 +1651,22 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     assert!(app.tag_editor.is_none());
     let _ = app.hit(Hit::TagSidebar);
     assert!(!app.sidebar_open);
-    assert_eq!(app.popup_size[0], 1220);
+    assert_eq!(app.popup_size[0], 1040);
+    assert_eq!(host::bounds(app.popup.0 as isize).unwrap(), before_panel);
+    let _ = SetWindowPos(
+        app.bar,
+        HWND_TOPMOST,
+        original_bar[0],
+        original_bar[1],
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+    app.place_popup();
     app.popup_hits = capture(
         app,
         Some(Popup::Recent),
-        1220,
+        1040,
         h,
         &paths.runtime.join("rust-tags-collapsed-verification.png"),
     )?;
@@ -1428,7 +1704,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     );
     let _ = app.hit(Hit::Compact);
     assert!(!app.settings.compact_recent);
-    assert_eq!(app.popup_size, [1220, RECENT_FRAME + 10 * RECENT_ROW]);
+    assert_eq!(app.popup_size, [1040, RECENT_FRAME + 10 * RECENT_ROW]);
     app.search = "mingcheng 2".into();
     app.filter_fixed();
     let title_hits = app.chat_filters.clone();
@@ -1487,7 +1763,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     capture(
         app,
         Some(Popup::Recent),
-        1456,
+        1276,
         h,
         &paths.runtime.join("rust-tags-regions-verification.png"),
     )?;
@@ -1514,7 +1790,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     capture(
         app,
         Some(Popup::Recent),
-        1456,
+        1276,
         h,
         &paths.runtime.join("rust-tags-pinyin-verification.png"),
     )?;
@@ -1578,7 +1854,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     app.shortcut_foreground = HWND::default();
     app.settings.recent_shortcut = shortcut;
     app.state.lock().unwrap().host = old_host;
-    paths.write("rust-tags-ui-test.json",&json!({"collapsed_by_default":true,"sidebar_scroll_and_multitag_filter":true,"source_tags_locked":true,"editor_keeps_list_window_and_scroll":true,
+    paths.write("rust-tags-ui-test.json",&json!({"collapsed_by_default":true,"sidebar_grows_left_keeps_chat_screen_position":true,"icon_popup_overlays_parent_without_resizing":true,"sidebar_scroll_and_multitag_filter":true,"source_tags_locked":true,"editor_keeps_list_window_and_scroll":true,
         "custom_add_color_toggle_and_enter":true,"three_capped_regions_scroll_independently":true,"tag_scrollbars_drag_to_end":true,"tag_name_pinyin_initials_match":true,"tag_search_preserves_selections":true,"native_tag_search_control":true,
         "compact_hides_tags_and_preview_preserves_filter_scroll":true,"title_results_immediate_during_body_search":true,"shortcut_released_and_available_to_other_apps":true,"render_cache_limit":LAYOUT_CACHE_LIMIT}));
     Ok(())
@@ -1631,7 +1907,7 @@ unsafe fn verify_filter_controls(app: &mut App, paths: &Paths) -> Result<()> {
     capture(
         app,
         Some(Popup::Recent),
-        1220,
+        1040,
         app.popup_size[1] as u32,
         &paths.runtime.join("rust-list-hover-verification.png"),
     )?;
@@ -1644,7 +1920,7 @@ unsafe fn verify_filter_controls(app: &mut App, paths: &Paths) -> Result<()> {
     capture(
         app,
         Some(Popup::Recent),
-        1220,
+        1040,
         app.popup_size[1] as u32,
         &paths.runtime.join("rust-search-clear-verification.png"),
     )?;
@@ -1729,25 +2005,39 @@ unsafe fn verify_two_columns(app: &mut App, paths: &Paths) -> Result<()> {
     app.popup_hits = capture(
         app,
         Some(Popup::Recent),
-        1220,
+        1040,
         h,
         &paths.runtime.join("rust-two-column-verification.png"),
     )?;
     assert_eq!(app.recent_row_height(), 48);
+    let unread_slot = app
+        .chat_filters
+        .iter()
+        .position(|&i| app.rows[i].newly_completed())
+        .unwrap();
+    let unread_id = app.rows[app.chat_filters[unread_slot]].id.clone();
+    assert_eq!(
+        app.fixed_hit_at(
+            app.recent_left() + 5.,
+            RECENT_TOP as f32 + unread_slot as f32 * 48. + 22.
+        ),
+        Some(Hit::Recent(unread_id))
+    );
     assert_eq!(RECENT_TOP, 48); // The list starts directly below the toolbar, without column headings.
     let normal_size = app.popup_size;
-    for (width, sidebar) in [(1220, false), (1456, true), (900, true), (820, false)] {
+    for (width, sidebar) in [(1040, false), (1276, true), (900, true), (820, false)] {
         app.popup_size[0] = width;
         app.sidebar_open = sidebar;
         for configured in [140, 200, 280] {
             app.settings.recent_title_width = configured;
             let c = app.recent_columns();
             assert!(c.title_left + c.title_width < c.preview_left);
-            assert!(c.preview_left + c.preview_width <= c.meta_left - 17.);
-            let (_, tags, _) = app.tag_layout(&app.rows[first]);
-            assert!(tags
-                .iter()
-                .all(|(_, x, w)| *x >= c.meta_left && x + w <= c.meta_right - 26.));
+            assert!(c.preview_left + c.preview_width <= c.meta_left - 7.);
+            assert!(c.meta_right + 5. <= c.tags_left);
+            let layout = app.tag_layout(&app.rows[first]);
+            assert!(layout.chips.iter().all(|(_, r)| r.left >= c.tags_left
+                && r.right <= c.tags_left + c.tags_width
+                && r.bottom <= 43.));
         }
     }
     app.sidebar_open = false;
@@ -1764,10 +2054,10 @@ unsafe fn verify_two_columns(app: &mut App, paths: &Paths) -> Result<()> {
         assert_ne!(title, leading);
         assert_eq!(leading.GetTextAlignment(), DWRITE_TEXT_ALIGNMENT_LEADING);
     }
-    let (_, tags, _) = app.tag_layout(&app.rows[first]);
-    if let Some((tag, x, _)) = tags.first() {
+    let layout = app.tag_layout(&app.rows[first]);
+    if let Some((tag, r)) = layout.chips.first() {
         assert_eq!(
-            app.fixed_hit_at(x + 5., RECENT_TOP as f32 + 30.),
+            app.fixed_hit_at(r.left + 5., RECENT_TOP as f32 + r.top + 10.),
             Some(Hit::TagFilter(tag.key.clone()))
         );
     }
@@ -1779,7 +2069,7 @@ unsafe fn verify_two_columns(app: &mut App, paths: &Paths) -> Result<()> {
     capture(
         app,
         Some(Popup::Recent),
-        1220,
+        1040,
         h,
         &paths
             .runtime
@@ -1817,4 +2107,163 @@ unsafe fn verify_two_columns(app: &mut App, paths: &Paths) -> Result<()> {
     assert_eq!(saved.recent_title_width, 200);
     paths.write("rust-two-column-test.json",&json!({"two_line_title_and_prompt":true,"total_row_height":48,"column_headings":false,"name_only_column":true,"centered_single_and_double_line_titles":true,"narrow_and_sidebar_columns_do_not_overlap":true,"body_highlight":true,"tag_hit_positions":true,"width_setting_range":[140,280],"settings_roundtrip":true,"compact_unchanged":true}));
     Ok(())
+}
+
+unsafe fn verify_tag_overflow(app: &mut App, paths: &Paths) -> Result<()> {
+    app.close_popup();
+    app.sidebar_open = false;
+    app.settings.compact_recent = false;
+    app.popup(Popup::Recent)?;
+    app.search = "xxx".into();
+    app.filter_fixed();
+    app.scroll = 2;
+    app.chat_cursor = 3;
+    let row_index = app.chat_filters[app.scroll];
+    let id = app.rows[row_index].id.clone();
+    for i in 0..60 {
+        app.custom_tags
+            .add(&id, &format!("会话标签{i:02}"), i % 6)?;
+    }
+    app.refresh_tag_catalog();
+    let all = app.custom_tags.for_row(&app.rows[row_index]);
+    let layout = app.tag_layout(&app.rows[row_index]);
+    assert!(layout.hidden > 0);
+    assert!(layout.chips.len() > 3);
+    assert!(layout.chips.iter().any(|(_, r)| r.top > 20.));
+    assert_eq!(layout.chips.len() + layout.hidden, all.len());
+    assert!(layout
+        .chips
+        .iter()
+        .all(|(_, r)| !(r.top == layout.action.top && r.right > layout.action.left)));
+    assert!(
+        layout.action.right <= app.recent_columns().tags_left + app.recent_columns().tags_width
+    );
+    let y = RECENT_TOP as f32;
+    assert_eq!(
+        app.fixed_hit_at(layout.action.left + 12., y + layout.action.top + 10.),
+        Some(Hit::TagOverflow(id.clone()))
+    );
+    let parent = (
+        app.popup,
+        app.edit,
+        app.search.clone(),
+        app.scroll,
+        app.chat_cursor,
+        app.chat_filters.clone(),
+    );
+    capture(
+        app,
+        Some(Popup::Recent),
+        1040,
+        app.popup_size[1] as u32,
+        &paths.runtime.join("rust-tag-column-verification.png"),
+    )?;
+    let _ = app.hit(Hit::TagOverflow(id.clone()));
+    assert_eq!(app.tag_overflow.as_ref(), Some(&id));
+    let (chips, height) = app.tag_overflow_chips();
+    assert_eq!(chips.len(), all.len());
+    app.popup_hits = capture(
+        app,
+        Some(Popup::Recent),
+        1040,
+        app.popup_size[1] as u32,
+        &paths.runtime.join("rust-tag-overflow-verification.png"),
+    )?;
+    let r = app.tag_overflow_rect();
+    assert_eq!(
+        app.fixed_hit_at(r.left + 10., r.top + 60.),
+        Some(Hit::TagOverflowBackground)
+    );
+    let first = chips.first().unwrap();
+    assert_eq!(
+        app.fixed_hit_at(
+            r.left + 14. + first.1.left + 5.,
+            r.top + 64. + first.1.top + 10.
+        ),
+        Some(Hit::TagFilter(first.0.key.clone()))
+    );
+    app.scroll_tag_overflow(10000.);
+    let visible = r.bottom - r.top - 78.;
+    assert_eq!(app.tag_overflow_scroll, (height - visible).max(0.));
+    assert!(app.tag_overflow_scroll > 0.);
+    assert!(app.fixed_key(VK_HOME.0 as u32));
+    assert_eq!(app.tag_overflow_scroll, 0.);
+    assert!(app.fixed_key(VK_END.0 as u32));
+    assert_eq!(app.tag_overflow_scroll, (height - visible).max(0.));
+    assert!(app.fixed_key(VK_RETURN.0 as u32));
+    assert_eq!(app.tag_overflow.as_ref(), Some(&id));
+    app.popup_hits = capture(
+        app,
+        Some(Popup::Recent),
+        1040,
+        app.popup_size[1] as u32,
+        &paths
+            .runtime
+            .join("rust-tag-overflow-scrolled-verification.png"),
+    )?;
+    let last = chips.last().unwrap();
+    let last_y = r.top + 64. + last.1.top - app.tag_overflow_scroll + 10.;
+    assert_eq!(
+        app.fixed_hit_at(r.left + 14. + last.1.left + 5., last_y),
+        Some(Hit::TagFilter(last.0.key.clone()))
+    );
+    assert!(app.fixed_key(VK_ESCAPE.0 as u32));
+    assert!(app.tag_overflow.is_none());
+    assert_eq!(
+        (
+            app.popup,
+            app.edit,
+            app.search.clone(),
+            app.scroll,
+            app.chat_cursor,
+            app.chat_filters.clone()
+        ),
+        parent
+    );
+    let _ = app.hit(Hit::TagOverflow(id.clone()));
+    let _ = app.hit(Hit::TagEdit(id.clone()));
+    assert!(app.tag_overflow.is_none());
+    assert_eq!(app.tag_editor.as_ref(), Some(&id));
+    assert_eq!(app.popup, parent.0);
+    let _ = app.hit(Hit::TagClose);
+    for (width, sidebar) in [(1040, false), (1276, true), (900, true), (820, false)] {
+        app.popup_size[0] = width;
+        app.sidebar_open = sidebar;
+        let layout = app.tag_layout(&app.rows[row_index]);
+        let c = app.recent_columns();
+        assert!(layout.action.right <= c.tags_left + c.tags_width);
+        assert!(layout.chips.iter().all(|(_, r)| r.left >= c.tags_left
+            && r.right <= c.tags_left + c.tags_width
+            && r.bottom <= 43.));
+    }
+    app.sidebar_open = false;
+    app.popup_size[0] = 1040;
+    paths.write("rust-tag-overflow-test.json",&json!({"two_rows":true,"more_than_three_tags":true,"ellipsis_after_last_chip":true,"all_assigned_tags_shown":true,"overflow_scroll_to_last_tag":true,"filter_hit_targets":true,"escape_preserves_list_search_cursor_scroll":true,"editor_keeps_list_open":true,"narrow_and_sidebar_layouts":true}));
+    Ok(())
+}
+
+#[cfg(test)]
+mod panel_position_tests {
+    use super::recent_panel_x;
+    #[test]
+    fn sidebar_keeps_conversation_anchor_at_dpi_and_monitor_edges() {
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            for left in [0, -2560] {
+                let right = left + (2560. * scale) as i32;
+                for base in [640., 1040.] {
+                    let width = (base * scale).round() as i32;
+                    let inset = (236. * scale).round() as i32;
+                    for anchor in [left + inset, left + (600. * scale) as i32, right - 20] {
+                        let collapsed = recent_panel_x(anchor, width, false, scale, left, right);
+                        let expanded =
+                            recent_panel_x(anchor, width + inset, true, scale, left, right);
+                        assert_eq!(collapsed, expanded + inset);
+                        assert_eq!(collapsed + width, expanded + width + inset);
+                    }
+                    let edge = recent_panel_x(left, width + inset, true, scale, left, right);
+                    assert!(edge >= left && edge + width + inset <= right);
+                }
+            }
+        }
+    }
 }

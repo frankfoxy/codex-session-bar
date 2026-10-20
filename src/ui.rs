@@ -178,6 +178,9 @@ enum Hit {
     TagFilter(String),
     TagClear,
     TagEdit(String),
+    TagOverflow(String),
+    TagOverflowClose,
+    TagOverflowBackground,
     TagToggle(String),
     TagAdd,
     TagColor(usize),
@@ -602,6 +605,9 @@ struct App {
     tag_catalog_due: Instant,
     sidebar_open: bool,
     tag_editor: Option<String>,
+    tag_overflow: Option<String>,
+    tag_overflow_y:f32,
+    tag_overflow_scroll:f32,
     tag_editor_y: f32,
     tag_editor_scroll: usize,
     tag_input: HWND,
@@ -644,6 +650,7 @@ struct IconPanel {
     scroll: usize,
     hits: Vec<Area>,
     layout: Option<[i32; 4]>,
+    anchor: [f32; 3], // Icon right edge, row top and bottom in parent DIP.
 }
 // Stable tool rectangles/text let hover delays finish despite frequent repaints.
 struct Tips {
@@ -697,6 +704,9 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::TagSidebar => "Tag filters · expand or collapse · search names or pinyin",
         Hit::TagFilter(_) => "Filter by this tag · selected tags must all match",
         Hit::TagClear => "Clear tag filters",
+        Hit::TagOverflow(_) => "Show all tags · scroll for more · keep the chat list open",
+        Hit::TagOverflowClose => "Close all tags · keep the chat list open",
+        Hit::TagOverflowBackground => "All tags assigned to this chat",
         Hit::TagEdit(_) => "Edit custom tags · project and group tags are read-only",
         Hit::TagToggle(_) => "Add or remove this custom tag from the chat",
         Hit::TagAdd => "Create or attach the tag",
@@ -834,6 +844,7 @@ impl App {
             tag_catalog_due: Instant::now(),
             sidebar_open: false,
             tag_editor: None,
+            tag_overflow:None,tag_overflow_y:100.,tag_overflow_scroll:0.,
             tag_editor_y: 100.,
             tag_editor_scroll: 0,
             tag_input: HWND::default(),
@@ -1309,13 +1320,13 @@ impl App {
                         7.,
                     );
                     let icon_hit = Hit::ChatIcon(row.id.clone());
-                    area(icon_hit.clone(), rect(23., y + 5., 33., 30.));
+                    area(icon_hit.clone(), rect(29., y + 5., 33., 30.));
                     area(Hit::Fixed(row.id.clone()), r);
                     if hovered || selected || self.chat_cursor == self.scroll + slot {
                         p.border(r, if hovered {0x78aac4} else if selected { 0x5ca985 } else { 0x59849c }, 7.);
                     }
                     p.fill(
-                        rect(23., y + 5., 30., 30.),
+                        rect(29., y + 5., 30., 30.),
                         if self.hover == Some(icon_hit) {
                             0x496173
                         } else {
@@ -1325,7 +1336,7 @@ impl App {
                     );
                     p.label(
                         &self.catalog.icon(&row.label),
-                        rect(26., y + 4., 28., 32.),
+                        rect(32., y + 4., 28., 32.),
                         20.,
                         TEXT,
                         true,
@@ -1334,9 +1345,9 @@ impl App {
                     p.label(
                         self.catalog.strip(&row.label),
                         rect(
-                            62.,
+                            68.,
                             y + 2.,
-                            width - 202.,
+                            width - 208.,
                             if with_metrics { 21. } else { 36. },
                         ),
                         13.,
@@ -1358,7 +1369,7 @@ impl App {
                                     row.total_seconds.map(data::duration).unwrap_or("—".into())
                                 )
                             },
-                            rect(62., y + 22., width - 202., 16.),
+                            rect(68., y + 22., width - 208., 16.),
                             10.,
                             MUTED,
                             false,
@@ -1380,7 +1391,7 @@ impl App {
                         p.label("✓", rect(width - 39., y + 3., 20., 34.), 14., GREEN, false);
                     }
                     if row.newly_completed() {
-                        p.circle(width - 57., y + 20., 3.3, NEW_RESULT);
+                        p.circle(20., y + 20., 3., NEW_RESULT);
                     }
                 }
                 if self.chat_filters.is_empty() {
@@ -2067,6 +2078,12 @@ impl App {
         let _ = Shell_NotifyIconW(if add { NIM_ADD } else { NIM_DELETE }, &data);
     }
     unsafe fn open_icon_panel(&mut self) -> Result<()> {
+        let row_height = if self.popup_kind == Some(Popup::Recent) { self.recent_row_height() as f32 } else { 40. };
+        let top = if self.popup_kind == Some(Popup::Recent) { RECENT_TOP as f32 } else { 112. };
+        let slot = self.icon_target.as_ref().and_then(|(id, _)| self.chat_filters.iter().position(|&i| self.rows[i].id == *id))
+            .unwrap_or(self.chat_cursor).saturating_sub(self.scroll).min(self.list_page_rows().saturating_sub(1));
+        let row_top = top + slot as f32 * row_height;
+        let anchor = [if self.popup_kind == Some(Popup::Recent) { self.recent_left() + 42. } else { 62. }, row_top, row_top + row_height - 4.];
         let window = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             CLASS,
@@ -2156,6 +2173,7 @@ impl App {
             scroll: 0,
             hits: Vec::new(),
             layout: None,
+            anchor,
         });
         self.place_icon_panel();
         if !self.testing {
@@ -2190,18 +2208,15 @@ impl App {
             &mut info,
         );
         let bounds = info.rcWork;
-        let x = if parent[0] - gap - w >= bounds.left {
-            parent[0] - gap - w
-        } else if parent[2] + gap + w <= bounds.right {
-            parent[2] + gap
-        } else {
-            (parent[2] - w)
-                .max(bounds.left)
-                .min((bounds.right - w).max(bounds.left))
-        };
-        let y = parent[1]
-            .max(bounds.top)
-            .min((bounds.bottom - h).max(bounds.top));
+        // Float beside the clicked icon, over the existing list/sidebar. Never
+        // widen or move the parent to make room for this owned popup.
+        let x = (parent[0] + (panel.anchor[0] * scale).round() as i32 + gap)
+            .max(bounds.left).min((bounds.right - w).max(bounds.left));
+        let below = parent[1] + (panel.anchor[2] * scale).round() as i32 + gap;
+        let above = parent[1] + (panel.anchor[1] * scale).round() as i32 - gap - h;
+        let y = if below + h <= bounds.bottom { below }
+            else if above >= bounds.top { above }
+            else { below.max(bounds.top).min((bounds.bottom - h).max(bounds.top)) };
         let layout = [x, y, w, h];
         if panel.layout == Some(layout) {
             return;
@@ -2668,9 +2683,11 @@ impl App {
         };
         let _ = GetMonitorInfoW(monitor, &mut info);
         let bounds = info.rcWork;
-        let x = bar[0]
-            .max(bounds.left)
-            .min((bounds.right - w).max(bounds.left));
+        let x = if self.popup_kind == Some(Popup::Recent) {
+            recent_panel_x(bar[0], w, self.sidebar_open, scale, bounds.left, bounds.right)
+        } else {
+            bar[0].max(bounds.left).min((bounds.right - w).max(bounds.left))
+        };
         let y = if bar[1] - h - 6 >= bounds.top {
             bar[1] - h - 6
         } else {
@@ -2942,6 +2959,9 @@ impl App {
                 self.chat_filters=self.filtered_chats();self.scroll=0;self.chat_cursor=0;
             }
             Hit::TagClear => {self.tag_filters.clear();self.chat_filters=self.filtered_chats();self.scroll=0;self.chat_cursor=0;}
+            Hit::TagOverflow(id)=>{self.open_tag_overflow(id);}
+            Hit::TagOverflowClose=>{self.tag_overflow=None;let _=InvalidateRect(self.popup,None,false);}
+            Hit::TagOverflowBackground=>{}
             Hit::TagEdit(id) => {self.close_icon_panel();let _=self.open_tag_editor(id);}
             Hit::TagToggle(key) => {if let Some(id)=self.tag_editor.clone(){self.custom_tags.toggle(&id,&key);self.save_tag_changes();}}
             Hit::TagColor(color) => {self.tag_color=color;}
@@ -3064,6 +3084,11 @@ impl App {
         let width = self.popup_size[0] as f32;
         if self.popup_kind == Some(Popup::Recent) {
             // Recompute geometry from current scroll/filter state, never stale paint hits.
+            if self.tag_overflow.is_some(){
+                let r=self.tag_overflow_rect();
+                if Self::contains_rect(r,x,y){return self.popup_hits.iter().rev().find(|a|a.contains(x,y)&&matches!(a.hit,Hit::TagOverflowClose|Hit::TagEdit(_)|Hit::TagFilter(_)|Hit::TagOverflowBackground)).map(|a|a.hit.clone()).or(Some(Hit::TagOverflowBackground));}
+                return Some(Hit::TagOverflowClose);
+            }
             if self.tag_editor.is_some() {
                 let r=self.tag_editor_rect();
                 if x>=r.left&&x<r.right&&y>=r.top&&y<r.bottom {
@@ -3088,13 +3113,11 @@ impl App {
             let slot=self.scroll+((y-top)/rh) as usize;
             let &i=self.chat_filters.get(slot)?;let row=&self.rows[i];
             let local_y=(y-top)%rh;let icon_top=if self.settings.compact_recent{4.}else{7.};
-            if (left+6. ..left+36.).contains(&x)&&(icon_top..icon_top+30.).contains(&local_y){return Some(Hit::ChatIcon(row.id.clone()));}
-            if !self.settings.compact_recent && (21. ..44.).contains(&local_y) {
-                let columns=self.recent_columns();
-                if(columns.meta_right-24. ..columns.meta_right).contains(&x){return Some(Hit::TagEdit(row.id.clone()));}
-                let (_,tags,hidden)=unsafe{self.tag_layout(row)};
-                for(tag,tx,w)in tags{if(tx..tx+w).contains(&x){return Some(Hit::TagFilter(tag.key));}}
-                if hidden>0&&(columns.meta_right-54. ..columns.meta_right-28.).contains(&x){return Some(Hit::TagEdit(row.id.clone()));}
+            if (left+12. ..left+42.).contains(&x)&&(icon_top..icon_top+30.).contains(&local_y){return Some(Hit::ChatIcon(row.id.clone()));}
+            if !self.settings.compact_recent{
+                let layout=unsafe{self.tag_layout(row)};
+                for(tag,r)in layout.chips{if Self::contains_rect(r,x,local_y){return Some(Hit::TagFilter(tag.key));}}
+                if Self::contains_rect(layout.action,x,local_y){return Some(if layout.hidden>0{Hit::TagOverflow(row.id.clone())}else{Hit::TagEdit(row.id.clone())});}
             }
             return Some(Hit::Recent(row.id.clone()));
         }
@@ -3110,7 +3133,7 @@ impl App {
         }
         let slot = self.scroll + ((y - 100.) / 44.) as usize;
         self.chat_filters.get(slot).map(|&index| {
-            if (23. ..56.).contains(&x) {
+            if (29. ..62.).contains(&x) {
                 Hit::ChatIcon(self.rows[index].id.clone())
             } else {
                 Hit::Fixed(self.rows[index].id.clone())
@@ -3118,6 +3141,16 @@ impl App {
         })
     }
     unsafe fn fixed_key(&mut self, key: u32) -> bool {
+        if self.tag_overflow.is_some(){
+            if key==VK_ESCAPE.0 as u32{let _=self.hit(Hit::TagOverflowClose);return true;}
+            if key==VK_RETURN.0 as u32{return true;}
+            let delta=match key {
+                k if k==VK_UP.0 as u32=>Some(-26.),k if k==VK_DOWN.0 as u32=>Some(26.),
+                k if k==VK_PRIOR.0 as u32=>Some(-156.),k if k==VK_NEXT.0 as u32=>Some(156.),
+                k if k==VK_HOME.0 as u32=>Some(-1e6),k if k==VK_END.0 as u32=>Some(1e6),_=>None,
+            };
+            if let Some(delta)=delta{self.scroll_tag_overflow(delta);let _=InvalidateRect(self.popup,None,false);return true;}
+        }
         if !self.tag_search_input.is_invalid() && GetFocus()==self.tag_search_input {
             if key==VK_RETURN.0 as u32 {
                 if let Some(key)=self.tag_regions.iter().find_map(|region|region.items.first().map(|i|self.tag_catalog[i.index].0.key.clone())){let _=self.hit(Hit::TagFilter(key));}
@@ -3195,7 +3228,7 @@ impl App {
         ))
     }
     unsafe fn begin_chat_scroll(&mut self, x: f32, y: f32) -> bool {
-        if self.tag_editor.is_some(){return false;}
+        if self.tag_editor.is_some()||self.tag_overflow.is_some(){return false;}
         let Some((top, height, thumb)) = self.chat_scroll_geometry() else {
             return false;
         };
@@ -3377,6 +3410,10 @@ unsafe extern "system" fn wndproc(
                     }
                 }
                 Some(LRESULT(0))
+            }
+            WM_MOUSEWHEEL if !is_bar && app.popup_kind==Some(Popup::Recent) && app.tag_overflow.is_some()=>{
+                let delta=((wparam.0>>16) as i16) as i32;
+                app.scroll_tag_overflow(if delta<0{48.}else{-48.});let _=InvalidateRect(app.popup,None,false);Some(LRESULT(0))
             }
             WM_MOUSEWHEEL if !is_bar && app.popup_kind==Some(Popup::Recent) && (app.tag_editor.is_some() || (app.sidebar_open && {
                 let mut cursor=POINT::default();let _=GetCursorPos(&mut cursor);let _=ScreenToClient(app.popup,&mut cursor);(cursor.x as f32/scale)<TAG_SIDEBAR
@@ -3857,7 +3894,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         let _ = app.hit(Hit::Body);
         assert!(!app.search_body);
         assert_eq!(app.rows.len(), 40);
-        assert_eq!(app.popup_size, [1220, RECENT_FRAME + 8 * RECENT_ROW]);
+        assert_eq!(app.popup_size, [1040, RECENT_FRAME + 8 * RECENT_ROW]);
         app.search = "huihuamingcheng 25".into();
         app.filter_fixed();
         assert_eq!(app.chat_filters, [24]);
@@ -3941,7 +3978,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            1220,
+            1040,
             (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-recent-verification.png"),
         )?;
@@ -4060,7 +4097,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            1220,
+            1040,
             (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-background-index-verification.png"),
         )?;
@@ -4071,7 +4108,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            1220,
+            1040,
             (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-recent-search-verification.png"),
         )?;
@@ -4106,7 +4143,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            1220,
+            1040,
             (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-recent-body-verification.png"),
         )?;
@@ -4272,7 +4309,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert_eq!(app.settings.recent_rows, 10);
         assert_eq!(app.settings.recent_shortcut.label(), "Ctrl+Alt+K");
         app.popup(Popup::Recent)?;
-        assert_eq!(app.popup_size, [1220, RECENT_FRAME + 10 * RECENT_ROW]);
+        assert_eq!(app.popup_size, [1040, RECENT_FRAME + 10 * RECENT_ROW]);
         assert_eq!(app.list_page_rows(), 10);
         assert_eq!(app.fixed_hit_at(80., (RECENT_TOP + 9 * RECENT_ROW + 10) as f32), Some(Hit::Recent(rows[9].id.clone())));
         assert!(app.begin_chat_scroll(app.popup_size[0] as f32-10., 450.));
@@ -4282,7 +4319,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         let _ = ReleaseCapture();
         app.scroll = 0;
         app.chat_cursor = 0;
-        capture(&app, Some(Popup::Recent), 1220, (RECENT_FRAME + 10 * RECENT_ROW) as u32, &paths.runtime.join("rust-recent-configured-verification.png"))?;
+        capture(&app, Some(Popup::Recent), 1040, (RECENT_FRAME + 10 * RECENT_ROW) as u32, &paths.runtime.join("rust-recent-configured-verification.png"))?;
         app.popup(Popup::Preferences)?;
         app.hit(Hit::ShortcutEnabled);
         app.hit(Hit::ApplyPreferences);
@@ -4358,6 +4395,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         verify_filter_controls(&mut app,paths)?;
         verify_memory_cache(&mut app,paths)?;
         verify_two_columns(&mut app,paths)?;
+        verify_tag_overflow(&mut app,paths)?;
         let _ = app.hit(Hit::Hide);
         assert!(app.hidden);
         app.hidden = false;
