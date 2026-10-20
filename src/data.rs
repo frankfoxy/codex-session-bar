@@ -54,6 +54,10 @@ pub struct Row {
     pub id: String,
     #[serde(default)]
     pub label: String,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub tags: Vec<crate::tags::Tag>,
     #[serde(skip)]
     pub fallback_title: bool,
     #[serde(default = "unknown")]
@@ -292,6 +296,8 @@ pub struct Catalog {
     pub entries: Vec<Emoji>,
     pub defaults: Vec<String>,
     prefixes: HashMap<char, Vec<String>>,
+    searchable: Vec<String>,
+    default_indices: Vec<usize>,
 }
 impl Catalog {
     pub fn load(paths: &Paths) -> Result<Self> {
@@ -307,10 +313,14 @@ impl Catalog {
         for list in prefixes.values_mut() {
             list.sort_by_key(|s| std::cmp::Reverse(s.len()));
         }
+        let searchable=entries.iter().map(|e|format!("{} {} {} {}",e.emoji,e.name,e.group,e.subgroup).to_lowercase()).collect();
+        let default_indices=defaults.iter().filter_map(|icon|entries.iter().position(|e|&e.emoji==icon)).collect();
         Ok(Self {
             entries,
             defaults,
             prefixes,
+            searchable,
+            default_indices,
         })
     }
     pub fn strip<'a>(&self, title: &'a str) -> &'a str {
@@ -372,28 +382,15 @@ impl Catalog {
     }
     pub fn filter(&self, query: &str, group: &str) -> Vec<usize> {
         let q = query.trim().to_lowercase();
-        let include = |entry: &Emoji| {
-            q.is_empty()
-                || format!(
-                    "{} {} {} {}",
-                    entry.emoji, entry.name, entry.group, entry.subgroup
-                )
-                .to_lowercase()
-                .contains(&q)
-        };
         if q.is_empty() && group == "默认集合" {
-            return self
-                .defaults
-                .iter()
-                .filter_map(|icon| self.entries.iter().position(|e| e.emoji == *icon))
-                .filter(|i| include(&self.entries[*i]))
-                .collect();
+            return self.default_indices.clone();
         }
         self.entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| {
-                (!q.is_empty() || group == "All emoji" || e.group == group) && include(e)
+            .filter(|(i, e)| {
+                (!q.is_empty() || group == "All emoji" || e.group == group)
+                    && (q.is_empty() || self.searchable[*i].contains(&q))
             })
             .map(|(i, _)| i)
             .collect()
@@ -415,12 +412,16 @@ struct Cache {
 pub struct Store {
     paths: Paths,
     cache: HashMap<String, Cache>,
+    prompts: HashMap<String, (i64, String)>,
+    tag_sources: crate::tags::Sources,
 }
 impl Store {
     pub fn new(paths: &Paths) -> Self {
         Self {
             paths: paths.clone(),
             cache: HashMap::new(),
+            prompts: HashMap::new(),
+            tag_sources: crate::tags::Sources::default(),
         }
     }
     fn db(&self, name: &str) -> Result<Connection> {
@@ -614,6 +615,38 @@ impl Store {
         // Local metadata supplies the complete list even when the app's status
         // snapshot is bounded. Fetch token logs only for confirmed busy chats.
         let mut rows = self.sessions()?;
+        if let Ok(db) = self.db("state_5.sqlite") {
+            self.tag_sources.enrich(&self.paths, &db, payload, &mut rows);
+        }
+        // Indexed, bounded latest-user-message lookups stay on the existing worker.
+        // JSON is only parsed when the last user item changes, never per repaint.
+        if let (Ok(mut latest), Ok(mut messages)) = (
+            history.prepare("SELECT updated_at_ordinal FROM thread_items WHERE thread_id=? AND item_type='userMessage' ORDER BY rollout_ordinal DESC LIMIT 1"),
+            history.prepare("SELECT CASE WHEN length(CAST(item_json AS BLOB))<=65536 THEN item_json ELSE NULL END FROM thread_items WHERE thread_id=? AND item_type='userMessage' ORDER BY rollout_ordinal DESC LIMIT 64"),
+        ) {
+            for row in &mut rows {
+                let revision=latest.query_row([&row.id],|r|r.get::<_,i64>(0)).optional()?.unwrap_or(-1);
+                if self.prompts.get(&row.id).is_none_or(|(cached,_)|*cached!=revision) {
+                    let mut first=String::new(); let mut chosen=String::new(); let mut seen=false;
+                    if let Ok(mut values)=messages.query([&row.id]) {
+                        while let Some(value)=values.next()? {
+                            let Some(json)=value.get::<_,Option<String>>(0)? else{continue};
+                            let Some(text)=crate::body::history_text(&json) else{continue};
+                            let text=crate::tags::simplify_prompt(&text);
+                            if text.is_empty(){continue;}
+                            let count=text.chars().filter(|c|!c.is_whitespace()).count();
+                            if (!seen && count>=10) || (seen && count>10){chosen=text;break;}
+                            if !seen{first=text;seen=true;}
+                        }
+                    }
+                    if chosen.is_empty(){chosen=first;}
+                    self.prompts.insert(row.id.clone(),(revision,chosen));
+                }
+                row.prompt=self.prompts.get(&row.id).map(|(_,s)|s.clone()).unwrap_or_default();
+            }
+            let ids:std::collections::HashSet<_>=rows.iter().map(|r|r.id.as_str()).collect();
+            self.prompts.retain(|id,_|ids.contains(id.as_str()));
+        }
         let local =
             crate::body::local_ids(&self.paths, rows.iter().map(|r| r.id.clone()).collect())?;
         rows.retain(|row| local.contains(&row.id));
@@ -758,6 +791,37 @@ mod tests {
             },
             directory,
         )
+    }
+
+    #[test]
+    fn recent_prompt_fallback_and_auto_tags_follow_source_metadata() {
+        let (paths,dir)=fixture("prompts-tags");
+        let db=Connection::open(dir.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT,title TEXT,name TEXT,updated_at REAL,tokens_used INTEGER,archived INTEGER,agent_path TEXT,rollout_path TEXT,project_id TEXT,thread_section_id TEXT);
+            CREATE TABLE projects(id TEXT,name TEXT);
+            INSERT INTO projects VALUES('project','工程甲');
+            INSERT INTO threads VALUES('a','A',NULL,10,0,0,NULL,NULL,'project',NULL),('b','B',NULL,9,0,0,NULL,NULL,'project',NULL);").unwrap();
+        let history=Connection::open(dir.join("thread_history_1.sqlite")).unwrap();
+        history.execute_batch("CREATE TABLE thread_turns(thread_id TEXT,status TEXT,rollout_ordinal INTEGER,started_at REAL,completed_at REAL);
+            CREATE TABLE thread_items(thread_id TEXT,item_id TEXT,item_type TEXT,rollout_ordinal INTEGER,updated_at_ordinal INTEGER,item_json TEXT);").unwrap();
+        let msg=|text:&str|serde_json::json!({"type":"userMessage","content":[{"type":"text","text":text}]}).to_string();
+        for(id,ordinal,text)in [("a",1,"请检查图像采集链路中的帧丢失问题。"),("a",2,"继续"),("a",3,"# AGENTS.md instructions\nignore context"),("b",1,"更早之前的有效提问内容超过十个字。"),("b",2,"一二三四五六七八九十")]{
+            history.execute("INSERT INTO thread_items VALUES(?,?,'userMessage',?,?,?)",rusqlite::params![id,ordinal.to_string(),ordinal,ordinal,msg(text)]).unwrap();
+        }
+        let payload=serde_json::json!({"sections":[{"sectionId":"group","name":"IP","itemKeys":["codex:project:project"]}]});
+        let mut store=Store::new(&paths);let recent=store.recent(&payload).unwrap();
+        let a=recent.rows.iter().find(|r|r.id=="a").unwrap();
+        assert_eq!(a.prompt,"请检查图像采集链路中的帧丢失问题。");
+        assert_eq!(a.tags.iter().map(|t|t.label.as_str()).collect::<Vec<_>>(),["工程甲","IP"]);
+        assert_eq!(recent.rows.iter().find(|r|r.id=="b").unwrap().prompt,"一二三四五六七八九十");
+        // Warm refresh keeps prompts cached; a new user item invalidates only A.
+        assert_eq!(store.recent(&payload).unwrap().rows[0].prompt,a.prompt);
+        history.execute("INSERT INTO thread_items VALUES('a','4','userMessage',4,4,?)",[msg("现在检查图像采集链路中的背压处理。")]).unwrap();
+        assert_eq!(store.recent(&payload).unwrap().rows[0].prompt,"现在检查图像采集链路中的背压处理。");
+        let mut custom=crate::tags::Custom::default();custom.add("a","排查",2).unwrap();
+        let isolated=Paths{app:dir.clone(),runtime:dir.clone(),..paths};
+        custom.save(&isolated).unwrap();let restored=crate::tags::Custom::load(&isolated);
+        assert_eq!(restored.for_row(a).len(),3);assert_eq!(restored.definitions[0].color,2);
     }
 
     #[test]

@@ -78,6 +78,40 @@ struct SearchText {
     syllables: Vec<Vec<String>>,
     initials: Vec<Vec<String>>,
 }
+
+/// Shared name/pinyin matcher for tag names, cached independently of chat search.
+#[derive(Default)]
+pub struct LabelSearch { entries: HashMap<String, SearchText> }
+impl LabelSearch {
+    pub fn sync<'a>(&mut self,labels:impl Iterator<Item=(&'a str,&'a str)>){
+        let mut ids=HashSet::new();
+        for(key,label)in labels{
+            ids.insert(key.to_string());
+            if self.entries.get(key).is_none_or(|e|e.source!=label){
+                self.entries.insert(key.into(),SearchText::new(label,label));
+            }
+        }
+        self.entries.retain(|key,_|ids.contains(key));
+    }
+    pub fn matches(&self,key:&str,query:&str)->bool{
+        let query=query.trim().to_lowercase();
+        query.is_empty()||self.entries.get(key).is_some_and(|e|query.split_whitespace().all(|term|e.matches(term)))
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+    #[test]
+    fn tag_names_full_pinyin_initials_and_renames() {
+        let mut index=LabelSearch::default();
+        index.sync([("a","图像排查"),("b","IP-research"),("c","重庆采集")].into_iter());
+        for query in ["排查","paicha","pc","TUXIANG pc"]{assert!(index.matches("a",query),"{query}");}
+        assert!(index.matches("b","ip"));assert!(index.matches("c","chongqing"));
+        index.sync([("a","图像仿真")].into_iter());
+        assert!(!index.matches("a","pc"));assert!(index.matches("a","fangzhen"));assert!(!index.matches("b","ip"));
+    }
+}
 fn compact(text: &str) -> String {
     text.chars().filter(|c| c.is_alphanumeric()).collect()
 }

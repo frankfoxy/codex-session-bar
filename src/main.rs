@@ -6,6 +6,7 @@ mod desktop;
 mod host;
 mod guard;
 mod search;
+mod tags;
 mod ui;
 
 use anyhow::{Context, Result};
@@ -133,6 +134,8 @@ pub struct Settings {
     pub recent_rows: usize,
     #[serde(default)]
     pub recent_shortcut: Shortcut,
+    #[serde(default)]
+    pub compact_recent: bool,
 }
 fn default_recent_rows() -> usize { 10 }
 impl Default for Settings {
@@ -141,6 +144,7 @@ impl Default for Settings {
             thread: String::new(), auto_thread: true, host_offset: None,
             position_version: 0, recent_rows: default_recent_rows(),
             recent_shortcut: Shortcut::default(),
+            compact_recent: false,
         }
     }
 }
@@ -196,7 +200,7 @@ pub struct Shared {
     pub slot: Option<[i32; 4]>,
     pub slot_host: isize,
     pub snapshot: Option<data::Snapshot>,
-    pub recent: data::Recent,
+    pub recent: Arc<data::Recent>,
     pub quota: Vec<data::Quota>,
     pub quota_at: f64,
     pub quota_error: String,
@@ -243,7 +247,7 @@ fn run() -> Result<()> {
     let state = Arc::new(Mutex::new(Shared {
         auto_thread: settings.auto_thread,
         fixed_thread: settings.thread.clone(),
-        recent: data::load_recent(&paths),
+        recent: data::load_recent(&paths).into(),
         ..Shared::default()
     }));
     let stop = Arc::new(AtomicBool::new(false));

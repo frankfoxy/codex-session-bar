@@ -1,4 +1,5 @@
 settings.json
+tags.json
 bin/
 /memory-watch/
 target/

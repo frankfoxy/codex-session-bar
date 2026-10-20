@@ -305,9 +305,9 @@ impl Workers {
                     Ok(mut recent)=>{
                         recent.carry_read_state(&s.lock().unwrap().recent);
                         p.write("recent-cache.json",&json!({"schema":1,"rows":recent.rows,"all_rows":recent.all_rows,"busy_count":recent.busy_count,"busy_metrics":recent.busy_metrics,"loaded_at":recent.loaded_at,"stale":false}));
-                        s.lock().unwrap().recent=recent;
+                        s.lock().unwrap().recent=std::sync::Arc::new(recent);
                     },
-                    Err(e)=>{let mut live=s.lock().unwrap();live.recent.stale=true;live.recent.error=format!("{e:#}");}
+                    Err(e)=>{let mut live=s.lock().unwrap();let recent=std::sync::Arc::make_mut(&mut live.recent);recent.stale=true;recent.error=format!("{e:#}");}
                 }
                 wait(&done,2000);
             }
@@ -395,7 +395,8 @@ impl Workers {
                             if let Some(snapshot) = live.snapshot.as_mut().filter(|v| v.id == *id) {
                                 snapshot.label = label.clone();
                             }
-                            let recent = &mut live.recent;
+                            let recent = std::sync::Arc::make_mut(&mut live.recent);
+                            recent.loaded_at=now();
                             for row in recent.rows.iter_mut().chain(&mut recent.all_rows).chain(&mut recent.busy_metrics) {
                                 if row.id == *id {
                                     row.label = label.clone();
@@ -434,16 +435,36 @@ pub fn inspect(paths: &Paths) -> Result<()> {
     let mut rpc = Rpc::new(paths, stop);
     let mut store = Store::new(paths);
     let context = default_context(paths);
-    let recent = rpc
-        .tool("list_threads", json!({"limit":50}), &context)
-        .and_then(|p| store.recent(&p))?;
+    let payload=rpc.tool("list_threads", json!({"limit":50}), &context)?;
+    let cold=Instant::now();
+    let recent=store.recent(&payload)?;
+    let cold_ms=cold.elapsed().as_secs_f64()*1000.;
+    let warm=Instant::now();
+    for _ in 0..3 {let _=store.recent(&payload)?;}
+    let warm_ms=warm.elapsed().as_secs_f64()*1000./3.;
+    let cat=Catalog::load(paths)?;
+    let mut search=crate::search::ChatSearch::default();search.sync(&recent.rows,&cat);
+    let titles=Instant::now();for _ in 0..1000 {std::hint::black_box(search.filter(&recent.rows,"huihua",false));}
+    let title_us=titles.elapsed().as_secs_f64()*1e6/1000.;
+    let icons=Instant::now();for _ in 0..1000 {std::hint::black_box(cat.filter("camera","默认集合"));}
+    let emoji_us=icons.elapsed().as_secs_f64()*1e6/1000.;
+    let custom=crate::tags::Custom::load(paths);let tag_catalog=custom.catalog(&recent.rows);
+    let chosen=tag_catalog.first().map(|(tag,_)|std::collections::HashSet::from([tag.key.clone()])).unwrap_or_default();
+    let tags=Instant::now();for _ in 0..1000{std::hint::black_box(recent.rows.iter().filter(|row|custom.matches(row,&chosen)).count());}
+    let tag_us=tags.elapsed().as_secs_f64()*1e6/1000.;
+    let mut tag_names=crate::search::LabelSearch::default();tag_names.sync(tag_catalog.iter().map(|(t,_)|(t.key.as_str(),t.label.as_str())));
+    let tag_pinyin=Instant::now();for _ in 0..1000{std::hint::black_box(tag_catalog.iter().filter(|(tag,_)|tag_names.matches(&tag.key,"pc")).count());}
+    let tag_pinyin_us=tag_pinyin.elapsed().as_secs_f64()*1e6/1000.;
+    let metrics=json!({"metadata_cold_ms":cold_ms,"metadata_warm_ms":warm_ms,"title_pinyin_filter_us":title_us,"emoji_filter_us":emoji_us,"tag_filter_us":tag_us,"tag_pinyin_filter_us":tag_pinyin_us,
+        "prompt_coverage":recent.rows.iter().filter(|r|!r.prompt.is_empty()).count(),"project_tag_chats":recent.rows.iter().filter(|r|r.tags.iter().any(|t|t.kind==crate::tags::Kind::Project)).count(),
+        "group_tag_chats":recent.rows.iter().filter(|r|r.tags.iter().any(|t|t.kind==crate::tags::Kind::Group)).count()});
     let sorted = recent.rows.windows(2).all(|w| w[0].updated_at >= w[1].updated_at);
     let local_count = recent.rows.len();
     let quota = quotas(&rpc.tool("get_usage_limits", json!({}), &context)?);
-    paths.write("rust-inspect.json",&json!({"time":now(),"rows":recent.rows.len(),"local_chats":local_count,"sorted_by_recency":sorted,"busy":recent.busy_count,"quota":quota,"runtime":"rust","mutations":false}));
+    paths.write("rust-inspect.json",&json!({"time":now(),"rows":recent.rows.len(),"local_chats":local_count,"sorted_by_recency":sorted,"busy":recent.busy_count,"quota":quota,"performance":metrics,"runtime":"rust","mutations":false}));
     println!(
         "{}",
-        json!({"rows":recent.rows.len(),"local_chats":local_count,"sorted_by_recency":sorted,"busy":recent.busy_count,"quota_windows":quota.len(),"runtime":"rust","mutations":false})
+        json!({"rows":recent.rows.len(),"local_chats":local_count,"sorted_by_recency":sorted,"busy":recent.busy_count,"quota_windows":quota.len(),"performance":metrics,"runtime":"rust","mutations":false})
     );
     Ok(())
 }

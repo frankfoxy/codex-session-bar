@@ -2,8 +2,8 @@ use crate::{
     body,
     data::{self, Catalog, Row},
     desktop::{Action, Workers},
-    guard, host, now,
-    search::{ranked_matches, ChatSearch},
+    guard, host, now, tags,
+    search::{ranked_matches, ChatSearch, LabelSearch},
     Paths, Settings, Shortcut, State, Stop,
 };
 use anyhow::{Context, Result};
@@ -26,7 +26,7 @@ use windows::{
         Graphics::{Direct2D::Common::*, Direct2D::*, DirectWrite::*, Dxgi::Common::*, Gdi::*},
         System::{LibraryLoader::*, Threading::*},
         UI::{
-            Controls::*,
+            Controls::*, Accessibility::*,
             HiDpi::*,
             Input::{Ime::*, KeyboardAndMouse::*},
             Shell::*,
@@ -39,6 +39,7 @@ const CLASS: PCWSTR = w!("CodexSessionBarRust");
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const QUIT_MESSAGE: u32 = WM_APP + 2;
 const HIDE_MESSAGE: u32 = WM_APP + 3;
+const FOCUS_MESSAGE: u32 = WM_APP + 4;
 const RECENT_HOTKEY: i32 = 0x5342;
 const BG: u32 = 0x23272b;
 const PANEL: u32 = 0x242a2e;
@@ -49,6 +50,9 @@ const GREEN: u32 = 0x65d69b;
 const NEW_RESULT: u32 = 0x70b7ff;
 const DETAILS_HEIGHT: i32 = 310;
 const PREFERENCES_HEIGHT: i32 = 464;
+const RECENT_ROW: i32 = 64;
+const RECENT_TOP: i32 = 76;
+const RECENT_FRAME: i32 = 120;
 thread_local! {static APP:RefCell<Option<App>>=const{RefCell::new(None)};}
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
@@ -160,6 +164,16 @@ enum Hit {
     GuardFolder,
     BackPreferences,
     Body,
+    Compact,
+    TagSidebar,
+    TagFilter(String),
+    TagClear,
+    TagEdit(String),
+    TagToggle(String),
+    TagAdd,
+    TagColor(usize),
+    TagClose,
+    TagBackground,
     Quit,
 }
 #[derive(Clone)]
@@ -186,6 +200,8 @@ struct Painter {
     target: ID2D1DCRenderTarget,
     text: IDWriteFactory,
     formats: RefCell<HashMap<String, IDWriteTextFormat>>,
+    layouts: RefCell<HashMap<(String,u32,u32,u32,bool),IDWriteTextLayout>>,
+    brushes: RefCell<HashMap<u32,ID2D1SolidColorBrush>>,
     chinese: String,
 }
 impl Painter {
@@ -219,6 +235,8 @@ impl Painter {
             target,
             text,
             formats: RefCell::new(HashMap::new()),
+            layouts: RefCell::new(HashMap::new()),
+            brushes: RefCell::new(HashMap::new()),
             chinese,
         })
     }
@@ -259,15 +277,8 @@ impl Painter {
     }
     unsafe fn label(&self, text: &str, r: D2D_RECT_F, size: f32, rgb: u32, emoji: bool) {
         let _ = (|| -> Result<()> {
-            let f = self.format(size, emoji, text)?;
-            let chars: Vec<u16> = text.encode_utf16().collect();
-            let layout = self.text.CreateTextLayout(
-                &chars,
-                &f,
-                (r.right - r.left).max(1.),
-                (r.bottom - r.top).max(1.),
-            )?;
-            let brush = self.target.CreateSolidColorBrush(&color(rgb), None)?;
+            let layout = self.layout(text,size,emoji,(r.right-r.left).max(1.),(r.bottom-r.top).max(1.))?;
+            let brush = self.brush(rgb)?;
             self.target.DrawTextLayout(
                 D2D_POINT_2F {
                     x: r.left,
@@ -297,8 +308,8 @@ impl Painter {
                 (r.right - r.left).max(1.),
                 (r.bottom - r.top).max(1.),
             )?;
-            let normal = self.target.CreateSolidColorBrush(&color(MUTED), None)?;
-            let highlight = self.target.CreateSolidColorBrush(&color(0xffd27f), None)?;
+            let normal = self.brush(MUTED)?;
+            let highlight = self.brush(0xffd27f)?;
             for (start, end) in body::match_ranges(text, query, exact) {
                 let range = DWRITE_TEXT_RANGE {
                     startPosition: text[..start].encode_utf16().count() as u32,
@@ -321,9 +332,7 @@ impl Painter {
     }
     unsafe fn width(&self, text: &str, size: f32) -> f32 {
         (|| -> Result<f32> {
-            let f = self.format(size, false, text)?;
-            let chars: Vec<u16> = text.encode_utf16().collect();
-            let layout = self.text.CreateTextLayout(&chars, &f, 10000., 40.)?;
+            let layout = self.layout(text,size,false,10000.,40.)?;
             let mut metrics = DWRITE_TEXT_METRICS::default();
             layout.GetMetrics(&mut metrics)?;
             Ok(metrics.widthIncludingTrailingWhitespace)
@@ -331,7 +340,7 @@ impl Painter {
         .unwrap_or(80.)
     }
     unsafe fn fill(&self, r: D2D_RECT_F, rgb: u32, radius: f32) {
-        if let Ok(b) = self.target.CreateSolidColorBrush(&color(rgb), None) {
+        if let Ok(b) = self.brush(rgb) {
             self.target.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
                     rect: r,
@@ -343,7 +352,7 @@ impl Painter {
         }
     }
     unsafe fn border(&self, r: D2D_RECT_F, rgb: u32, radius: f32) {
-        if let Ok(b) = self.target.CreateSolidColorBrush(&color(rgb), None) {
+        if let Ok(b) = self.brush(rgb) {
             self.target.DrawRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
                     rect: r,
@@ -357,7 +366,7 @@ impl Painter {
         }
     }
     unsafe fn line(&self, x: f32, y: f32, x2: f32, y2: f32, rgb: u32, width: f32) {
-        if let Ok(b) = self.target.CreateSolidColorBrush(&color(rgb), None) {
+        if let Ok(b) = self.brush(rgb) {
             self.target.DrawLine(
                 D2D_POINT_2F { x, y },
                 D2D_POINT_2F { x: x2, y: y2 },
@@ -368,7 +377,7 @@ impl Painter {
         }
     }
     unsafe fn circle(&self, x: f32, y: f32, radius: f32, rgb: u32) {
-        if let Ok(b) = self.target.CreateSolidColorBrush(&color(rgb), None) {
+        if let Ok(b) = self.brush(rgb) {
             self.target.FillEllipse(
                 &D2D1_ELLIPSE {
                     point: D2D_POINT_2F { x, y },
@@ -522,11 +531,14 @@ struct App {
     shortcut_registered: bool,
     shortcut_error: String,
     shortcut_id: i32,
+    shortcut_foreground: HWND,
+    shortcut_context: bool,
     preferences_draft: Option<Settings>,
     preferences_note: String,
     guard_events: Vec<guard::LogEntry>,
     guard_log_error: String,
     rows: Vec<Row>,
+    recent_rows_at: f64,
     hits: Vec<Area>,
     popup_hits: Vec<Area>,
     filters: Vec<usize>,
@@ -542,6 +554,24 @@ struct App {
     body_hits: HashSet<String>,
     body_previews: HashMap<String, String>,
     body_only: HashSet<String>,
+    custom_tags: tags::Custom,
+    tag_filters: HashSet<String>,
+    tag_catalog: Vec<(tags::Tag,usize)>,
+    tag_regions: Vec<TagRegion>,
+    tag_search: LabelSearch,
+    tag_query: String,
+    tag_search_input: HWND,
+    tag_scroll: [f32;3],
+    tag_scroll_drag: Option<(usize,f32)>,
+    tag_catalog_due: Instant,
+    sidebar_open: bool,
+    tag_editor: Option<String>,
+    tag_editor_y: f32,
+    tag_editor_scroll: usize,
+    tag_input: HWND,
+    tag_draft: String,
+    tag_color: usize,
+    tag_note: String,
     chat_scroll_drag: Option<f32>,
     chat_cursor: usize,
     groups: Vec<String>,
@@ -602,7 +632,7 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::Hide => "Hide to tray · restore from the tray icon or recent-chats shortcut",
         Hit::Preferences => "Settings · list size, shortcut and extensions",
         Hit::Rows(n) => if *n < 0 { "Show fewer rows" } else { "Show more rows" },
-        Hit::ShortcutEnabled => "Enable or disable the global recent-chats shortcut",
+        Hit::ShortcutEnabled => "Enable shortcut · only while Codex or Session Bar has focus",
         Hit::ApplyPreferences => "Apply and save settings",
         Hit::ResetPreferences => "Restore default list size and shortcut · apply to save",
         Hit::Details => "Session details",
@@ -622,6 +652,16 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::GuardFolder => "Open log folder · includes compressed history",
         Hit::BackPreferences => "Back to settings",
         Hit::Body => "Search message text · off by default",
+        Hit::Compact => "Compact view · one line per chat, hide tags and prompt preview",
+        Hit::TagSidebar => "Tag filters · expand or collapse · search names or pinyin",
+        Hit::TagFilter(_) => "Filter by this tag · selected tags must all match",
+        Hit::TagClear => "Clear tag filters",
+        Hit::TagEdit(_) => "Edit custom tags · project and group tags are read-only",
+        Hit::TagToggle(_) => "Add or remove this custom tag from the chat",
+        Hit::TagAdd => "Create or attach the tag",
+        Hit::TagColor(_) => "Choose custom tag color",
+        Hit::TagClose => "Close tag editor · keep the chat list open",
+        Hit::TagBackground => "",
         Hit::Quit => "Quit Session Bar",
         Hit::Emoji(i) => {
             return catalog
@@ -694,6 +734,7 @@ impl App {
                 PCWSTR(wide(&format!("Local\\{}-show", paths.instance)).as_ptr()),
             )?
         };
+        let custom_tags = tags::Custom::load(&paths);
         let mut app = Self {
             paths,
             settings,
@@ -715,12 +756,15 @@ impl App {
             shortcut_registered: false,
             shortcut_error: String::new(),
             shortcut_id: RECENT_HOTKEY,
+            shortcut_foreground: HWND::default(),
+            shortcut_context: false,
             preferences_draft: None,
             preferences_note: String::new(),
             guard_events: Vec::new(),
             guard_log_error: String::new(),
             popup_layout: None,
             rows: Vec::new(),
+            recent_rows_at: -1.,
             hits: Vec::new(),
             popup_hits: Vec::new(),
             filters,
@@ -736,6 +780,24 @@ impl App {
             body_hits: HashSet::new(),
             body_previews: HashMap::new(),
             body_only: HashSet::new(),
+            custom_tags,
+            tag_filters: HashSet::new(),
+            tag_catalog: Vec::new(),
+            tag_regions: Vec::new(),
+            tag_search: LabelSearch::default(),
+            tag_query: String::new(),
+            tag_search_input: HWND::default(),
+            tag_scroll: [0.;3],
+            tag_scroll_drag: None,
+            tag_catalog_due: Instant::now(),
+            sidebar_open: false,
+            tag_editor: None,
+            tag_editor_y: 100.,
+            tag_editor_scroll: 0,
+            tag_input: HWND::default(),
+            tag_draft: String::new(),
+            tag_color: 0,
+            tag_note: String::new(),
             chat_scroll_drag: None,
             chat_cursor: 0,
             groups,
@@ -776,12 +838,7 @@ impl App {
             w!("Microsoft YaHei UI"),
         );
         if !testing {
-            if app.settings.recent_shortcut.enabled {
-                match app.register_shortcut(app.shortcut_id, &app.settings.recent_shortcut) {
-                    Ok(()) => app.shortcut_registered = true,
-                    Err(error) => app.shortcut_error = error.to_string(),
-                }
-            }
+            app.sync_shortcut_scope(true);
             app.tray(true);
             SetTimer(bar, 1, 80, None);
         }
@@ -800,18 +857,20 @@ impl App {
     }
     fn list_page_rows(&self) -> usize {
         if self.popup_kind == Some(Popup::Recent) {
-            ((self.popup_size[1] - 92) / 43).clamp(1, 20) as usize
+            (((self.popup_size[1] - RECENT_FRAME) / self.recent_row_height()).clamp(1, 20) as usize).min(self.settings.recent_rows.clamp(4,20))
         } else { 8 }
     }
     unsafe fn recent_panel_height(&self) -> i32 {
         let requested = self.settings.recent_rows.clamp(4, 20) as i32;
-        if self.testing { return 92 + requested * 43; }
+        let row=self.recent_row_height();
+        let minimum=if self.sidebar_open{(TAG_CLOUD_TOP+44.+3.*(28.+32.)) as i32}else{RECENT_FRAME+row};
+        if self.testing { return (RECENT_FRAME + requested * row).max(minimum); }
         let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
         let monitor = MonitorFromWindow(self.bar, MONITOR_DEFAULTTONEAREST);
         let available = if GetMonitorInfoW(monitor, &mut info).as_bool() {
             ((info.rcWork.bottom - info.rcWork.top) as f32 / self.dpi) as i32 - 16
-        } else { 92 + requested * 43 };
-        92 + requested.min(((available - 92) / 43).max(1)) * 43
+        } else { RECENT_FRAME + requested * row };
+        (RECENT_FRAME + requested.min(((available - RECENT_FRAME) / row).max(1)) * row).max(minimum).min(available.max(RECENT_FRAME+row))
     }
     fn write_settings(&self, settings: &Settings) -> Result<()> {
         if self.testing { return Ok(()); }
@@ -842,7 +901,8 @@ impl App {
         anyhow::ensure!(next.recent_shortcut.valid(), "Use Ctrl or Alt with a letter, number or F1–F24");
         next.recent_rows = next.recent_rows.clamp(4, 20);
         let changed = next.recent_shortcut != self.settings.recent_shortcut;
-        let new_registration = !self.testing && next.recent_shortcut.enabled && (changed || !self.shortcut_registered);
+        let in_scope = self.shortcut_allowed();
+        let new_registration = !self.testing && in_scope && next.recent_shortcut.enabled && (changed || !self.shortcut_registered);
         let next_id = if self.shortcut_id == RECENT_HOTKEY { RECENT_HOTKEY + 1 } else { RECENT_HOTKEY };
         if new_registration {
             self.register_shortcut(next_id, &next.recent_shortcut)
@@ -854,7 +914,7 @@ impl App {
         }
         if !self.testing && (changed || new_registration) {
             if self.shortcut_registered { let _ = UnregisterHotKey(self.bar, self.shortcut_id); }
-            self.shortcut_registered = next.recent_shortcut.enabled;
+            self.shortcut_registered = new_registration;
             if new_registration { self.shortcut_id = next_id; }
             self.shortcut_error.clear();
         }
@@ -1075,263 +1135,7 @@ impl App {
                 area(Hit::Preferences, rect(x, 3., 25., 28.));
                 p.action_icon(&Hit::Preferences, x + 2., 6.);
             }
-            Some(Popup::Recent) => {
-                p.fill(rect(12., 9., 244., 30.), 0x1c2125, 6.);
-                p.border(rect(12., 9., 244., 30.), 0x43515a, 6.);
-                if self.testing {
-                    p.label(
-                        if self.search.is_empty() {
-                            "Search chats / pinyin…"
-                        } else {
-                            &self.search
-                        },
-                        rect(23., 9., 222., 30.),
-                        12.,
-                        MUTED,
-                        false,
-                    );
-                }
-                area(Hit::Body, rect(264., 8., 60., 32.));
-                p.action_icon(&Hit::Body, 266., 14.);
-                p.toggle(293., 16., self.search_body);
-                let (tokens, rate, partial) = live.recent.totals();
-                let total = format!(
-                    "Total {}{} t/s  ·  {}{} TOK",
-                    rate.map(|r| format!("{r:.1}")).unwrap_or("—".into()),
-                    if partial && rate.is_some() { "*" } else { "" },
-                    data::compact(tokens),
-                    if partial && tokens.is_some() { "*" } else { "" }
-                );
-                p.fill(rect(332., 8., 32., 32.), 0x2b3a3c, 8.);
-                p.border(rect(332., 8., 32., 32.), 0x445c5c, 8.);
-                area(Hit::Refresh, rect(332., 8., 32., 32.));
-                p.action_icon(&Hit::Refresh, 337., 13.);
-                let new_results = self.chat_filters.iter()
-                    .filter(|&&index| self.rows[index].newly_completed()).count();
-                p.label(
-                    &format!(
-                        "{} chats{}",
-                        self.chat_filters.len(),
-                        if new_results > 0 {
-                            format!(" · {new_results} new")
-                        } else {
-                            String::new()
-                        }
-                    ),
-                    rect(379., 9., width - 391., 30.),
-                    11.,
-                    MUTED,
-                    false,
-                );
-                for (slot, &index) in self
-                    .chat_filters
-                    .iter()
-                    .skip(self.scroll)
-                    .take(self.list_page_rows())
-                    .enumerate()
-                {
-                    let row = &self.rows[index];
-                    let y = 48. + slot as f32 * 43.;
-                    let busy = row.state == "Busy";
-                    let current = row.id == self.identity(&live);
-                    let r = rect(12., y, width - 30., 39.);
-                    p.fill(
-                        r,
-                        if current {
-                            0x293d36
-                        } else if busy {
-                            0x342c23
-                        } else {
-                            PANEL
-                        },
-                        7.,
-                    );
-                    if current || self.chat_cursor == self.scroll + slot {
-                        p.border(r, if current { 0x527b69 } else { 0x59849c }, 7.);
-                    }
-                    let icon_hit = Hit::ChatIcon(row.id.clone());
-                    area(icon_hit.clone(), rect(18., y + 4., 30., 30.));
-                    area(Hit::Recent(row.id.clone()), r);
-                    p.fill(
-                        rect(18., y + 4., 30., 30.),
-                        if self.hover == Some(icon_hit) {
-                            0x496173
-                        } else {
-                            0x303b43
-                        },
-                        7.,
-                    );
-                    p.label(
-                        &self.catalog.icon(&row.label),
-                        rect(22., y + 2., 25., 34.),
-                        16.,
-                        TEXT,
-                        true,
-                    );
-                    let label_width = if busy { width - 365. } else { width - 305. };
-                    let body_only = self.body_only.contains(&row.id);
-                    let snippet = self
-                        .body_previews
-                        .get(&row.id)
-                        .filter(|_| self.search_body && !self.search.trim().is_empty());
-                    let line_height = if snippet.is_some() { 18. } else { 34. };
-                    p.label(
-                        self.catalog.strip(&row.label),
-                        rect(
-                            49.,
-                            y + 2.,
-                            label_width - if body_only { 39. } else { 0. },
-                            line_height,
-                        ),
-                        13.,
-                        TEXT,
-                        false,
-                    );
-                    if body_only {
-                        p.label(
-                            "Body",
-                            rect(49. + label_width - 34., y + 2., 34., line_height),
-                            10.,
-                            0x81b5d1,
-                            false,
-                        );
-                    }
-                    if busy {
-                        let speed = row.rate().map(|r| format!("{r:.1}")).unwrap_or("—".into());
-                        let metrics = format!(
-                            "{speed} t/s   ·   {} TOK   ·   {}",
-                            data::compact(row.tokens),
-                            row.started_at
-                                .map(|t| data::duration(now() - t))
-                                .unwrap_or("—".into())
-                        );
-                        p.label(
-                            &metrics,
-                            rect(width - 310., y + 2., 220., line_height),
-                            11.,
-                            MUTED,
-                            false,
-                        );
-                    } else {
-                        p.label(
-                            &format!(
-                                "{} TOK   ·   {}",
-                                data::compact(row.tokens),
-                                row.total_seconds.map(data::duration).unwrap_or("—".into())
-                            ),
-                            rect(width - 250., y + 2., 160., line_height),
-                            11.,
-                            MUTED,
-                            false,
-                        );
-                    }
-                    if let Some(snippet) = snippet {
-                        p.highlighted_label(
-                            snippet,
-                            rect(49., y + 20., width - 145., 17.),
-                            11.,
-                            &self.search,
-                            false,
-                        );
-                    }
-                    p.label(
-                        &row.status_text(),
-                        rect(width - 85., y + 2., 70., 34.),
-                        12.,
-                        if busy {
-                            ORANGE
-                        } else if row.state == "Done" {
-                            GREEN
-                        } else if row.state == "Failed" {
-                            0xf87171
-                        } else if row.state == "Waiting" {
-                            ORANGE
-                        } else {
-                            MUTED
-                        },
-                        false,
-                    );
-                    if row.newly_completed() {
-                        p.circle(width - 29., y + 19., 3.3, NEW_RESULT);
-                    }
-                }
-                if self.chat_filters.is_empty() {
-                    p.label(
-                        if self.body_pending {
-                            "Searching chat bodies…"
-                        } else if !self.rows.is_empty() {
-                            "No matching chats"
-                        } else if live.recent.error.is_empty() {
-                            "Loading recent chats…"
-                        } else {
-                            "Cached list unavailable · refresh pending"
-                        },
-                        rect(20., 86., width - 40., 45.),
-                        13.,
-                        MUTED,
-                        false,
-                    );
-                }
-                let page_rows = self.list_page_rows();
-                let track_height = page_rows as f32 * 43. - 7.;
-                if self.chat_filters.len() > page_rows {
-                    let thumb = (track_height * page_rows as f32 / self.chat_filters.len() as f32).max(20.);
-                    let offset =
-                        (track_height - thumb) * self.scroll as f32 / (self.chat_filters.len() - page_rows) as f32;
-                    p.fill(rect(width - 11., 50., 4., track_height), 0x303c44, 2.);
-                    p.fill(rect(width - 11., 50. + offset, 4., thumb), 0x6f8b9d, 2.);
-                }
-                let hint = if live.recent.stale || now() - live.recent.loaded_at > 10. {
-                    " · Cached"
-                } else {
-                    ""
-                };
-                p.line(16., height - 38., width - 16., height - 38., 0x354148, 1.);
-                let count = if self.index_pending || self.body_pending {
-                    format!(
-                        "Index {:.0}% · {} / {} · {:.0} MiB",
-                        self.body_state.progress_percent(),
-                        self.body_state.indexed,
-                        self.body_state.available,
-                        self.body_state.bytes_read as f64 / 1048576.
-                    )
-                } else if !self.body_state.error.is_empty() {
-                    "Index unavailable · retry pending".into()
-                } else if self.body_state.complete {
-                    format!(
-                        "{} / {} chats · Index {:.0}%{}",
-                        self.chat_filters.len(),
-                        self.rows.len(),
-                        self.body_state.progress_percent(),
-                        if self.body_state.skipped > 0 {
-                            " · partial"
-                        } else {
-                            ""
-                        }
-                    )
-                } else {
-                    format!(
-                        "{} / {} chats{hint}",
-                        self.chat_filters.len(),
-                        self.rows.len()
-                    )
-                };
-                p.label(
-                    &count,
-                    rect(16., height - 29., 235., 24.),
-                    11.,
-                    MUTED,
-                    false,
-                );
-                let tw = p.width(&total, 11.).min(width - 265.);
-                p.label(
-                    &total,
-                    rect(width - 16. - tw, height - 29., tw + 1., 24.),
-                    11.,
-                    MUTED,
-                    false,
-                );
-            }
+            Some(Popup::Recent) => return self.draw_recent(width, height),
             Some(Popup::Icons) => {
                 let (search, category, filters, scroll) = self
                     .icon_panel
@@ -1876,6 +1680,8 @@ impl App {
                         let guard = self.snapshot().guard;
                         format!("{} recorded storm episodes · view log · continuous storms count once; recovered after 60 stable seconds",
                             guard.storm_count.map(|v|v.to_string()).unwrap_or_else(|| "—".into()))
+                    } else if let Hit::TagFilter(key)=&a.hit {
+                        self.tag_catalog.iter().find(|(tag,_)|&tag.key==key).map(|(tag,count)|format!("{} · {} chats · {} · click to toggle filter",tag.label,count,if tag.kind==tags::Kind::Custom{"custom tag"}else{"synced, read-only"})).unwrap_or_else(||tip_text(&a.hit,&self.catalog))
                     } else { tip_text(&a.hit, &self.catalog) }),
                 )
             })
@@ -2001,10 +1807,12 @@ impl App {
         }
     }
     unsafe fn tick(&mut self) {
+        if !self.testing { self.sync_shortcut_scope(false); }
         if !self.event.is_invalid() && WaitForSingleObject(self.event, 0) == WAIT_OBJECT_0 {
             self.hidden = false;
         }
         let live = self.snapshot();
+        if self.popup_kind == Some(Popup::Recent) && Instant::now() >= self.tag_catalog_due { self.refresh_tag_catalog(); }
         let identity = self.identity(&live);
         if identity != self.last_identity {
             self.last_identity = identity;
@@ -2012,11 +1820,13 @@ impl App {
                 self.close_popup();
             }
         }
-        if self.popup_kind == Some(Popup::Recent) {
+        if self.popup_kind == Some(Popup::Recent) && self.recent_rows_at!=live.recent.loaded_at {
             self.rows = data::stable_rows(&self.rows, &live.recent.rows);
+            self.recent_rows_at=live.recent.loaded_at;
         }
-        if self.popup_kind == Some(Popup::Fixed) && !live.recent.all_rows.is_empty() {
+        if self.popup_kind == Some(Popup::Fixed) && !live.recent.all_rows.is_empty() && self.recent_rows_at!=live.recent.loaded_at {
             self.rows = data::stable_rows(&self.rows, &live.recent.all_rows);
+            self.recent_rows_at=live.recent.loaded_at;
         }
         if matches!(self.popup_kind, Some(Popup::Recent | Popup::Fixed))
             && self.chat_search.sync(&self.rows, &self.catalog)
@@ -2485,6 +2295,9 @@ impl App {
         Some(LRESULT(0))
     }
     unsafe fn close_popup(&mut self) {
+        self.close_tag_editor();
+        self.close_tag_search();
+        if self.tag_scroll_drag.take().is_some(){let _=ReleaseCapture();}
         self.close_icon_panel();
         self.tips.retain(|t| t.owner != self.popup);
         if self.body_pending {
@@ -2547,6 +2360,8 @@ impl App {
         true
     }
     unsafe fn popup(&mut self, kind: Popup) -> Result<()> {
+        self.close_tag_editor();
+        self.close_tag_search();
         let resume_preferences = kind == Popup::Preferences && self.popup_kind == Some(Popup::GuardLogs);
         if self.popup_kind == Some(Popup::Preferences) && kind == Popup::GuardLogs {
             if let Some(draft) = self.preferences_draft.as_mut() {
@@ -2588,7 +2403,7 @@ impl App {
         self.popup_size = match kind {
             Popup::Recent => {
                 self.rows = live.recent.rows.clone();
-                [560, self.recent_panel_height()]
+                [self.recent_width(), self.recent_panel_height()]
             }
             Popup::Icons => [384, 450],
             Popup::Details => [560, DETAILS_HEIGHT],
@@ -2682,6 +2497,7 @@ impl App {
             }
             self.search.clear();
             self.scroll = 0;
+            self.refresh_tag_catalog();
             self.filter_fixed();
             if kind == Popup::Fixed && !live.auto_thread {
                 self.chat_cursor = self
@@ -2696,9 +2512,9 @@ impl App {
                 w!("EDIT"),
                 w!(""),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
-                27,
+                if kind == Popup::Recent { 61 } else { 27 },
                 if kind == Popup::Recent { 13 } else { 55 },
-                if kind == Popup::Recent { 218 } else { 506 },
+                if kind == Popup::Recent { 230 } else { 506 },
                 24,
                 self.popup,
                 HMENU(103isize as *mut _),
@@ -2743,6 +2559,7 @@ impl App {
         }
         let _ = DeleteObject(previous_font);
         self.place_popup();
+        self.ensure_tag_search()?;
         let _ = InvalidateRect(self.popup, None, false);
         if !self.testing {
             let _ = ShowWindow(self.popup, SW_SHOW);
@@ -2808,7 +2625,7 @@ impl App {
             if self.popup_kind == Some(Popup::Fixed) {
                 (self.edit, 27, 55, 506, 24)
             } else if self.popup_kind == Some(Popup::Recent) {
-                (self.edit, 23, 13, 218, 22)
+                (self.edit, 61, 14, 230, 22)
             } else if self.popup_kind == Some(Popup::Preferences) {
                 (self.edit, 258, 198, 278, 24)
             } else {
@@ -2827,6 +2644,7 @@ impl App {
                 );
             }
         }
+        self.place_tag_search();
     }
     fn settings(&self) {
         let _ = self.write_settings(&self.settings);
@@ -3011,6 +2829,38 @@ impl App {
                 }
                 let _ = InvalidateRect(self.popup, None, false);
             }
+            Hit::TagSidebar => {
+                self.close_tag_editor();self.sidebar_open=!self.sidebar_open;
+                self.popup_size=[self.recent_width(),self.recent_panel_height()];self.popup_layout=None;
+                for i in 0..3{self.tag_scroll[i]=self.tag_scroll[i].min(self.tag_scroll_max(i));}
+                self.scroll=self.scroll.min(self.chat_filters.len().saturating_sub(self.list_page_rows()));self.place_popup();
+                let _=self.ensure_tag_search();
+            }
+            Hit::Compact => {
+                self.close_tag_editor();self.close_icon_panel();
+                self.settings.compact_recent=!self.settings.compact_recent;
+                self.popup_size=[self.recent_width(),self.recent_panel_height()];self.popup_layout=None;
+                for i in 0..3{self.tag_scroll[i]=self.tag_scroll[i].min(self.tag_scroll_max(i));}
+                self.scroll=self.scroll.min(self.chat_filters.len().saturating_sub(self.list_page_rows()));
+                self.settings();self.place_popup();
+            }
+            Hit::TagFilter(key) => {
+                self.close_tag_editor();
+                if !self.tag_filters.remove(&key){self.tag_filters.insert(key);}
+                self.chat_filters=self.filtered_chats();self.scroll=0;self.chat_cursor=0;
+            }
+            Hit::TagClear => {self.tag_filters.clear();self.chat_filters=self.filtered_chats();self.scroll=0;self.chat_cursor=0;}
+            Hit::TagEdit(id) => {self.close_icon_panel();let _=self.open_tag_editor(id);}
+            Hit::TagToggle(key) => {if let Some(id)=self.tag_editor.clone(){self.custom_tags.toggle(&id,&key);self.save_tag_changes();}}
+            Hit::TagColor(color) => {self.tag_color=color;}
+            Hit::TagAdd => {if let Some(id)=self.tag_editor.clone(){
+                match self.custom_tags.add(&id,&self.tag_draft,self.tag_color){
+                    Ok(())=>{self.save_tag_changes();self.tag_draft.clear();if !self.tag_input.is_invalid(){let _=SetWindowTextW(self.tag_input,w!(""));}}
+                    Err(e)=>self.tag_note=e.to_string(),
+                }
+            }}
+            Hit::TagClose => {self.close_tag_editor();self.chat_filters=self.filtered_chats();self.scroll=self.scroll.min(self.chat_filters.len().saturating_sub(self.list_page_rows()));self.chat_cursor=self.chat_cursor.min(self.chat_filters.len().saturating_sub(1));}
+            Hit::TagBackground => {}
             Hit::Body => {
                 self.search_body = !self.search_body;
                 self.filter_fixed();
@@ -3089,16 +2939,13 @@ impl App {
         self.scroll = 0;
     }
     fn filtered_chats(&self) -> Vec<usize> {
-        if self.body_pending {
-            return Vec::new();
-        }
         let titles = self.chat_search.filter(&self.rows, &self.search, false);
         ranked_matches(
             &self.rows,
             &titles,
             &self.body_hits,
             !self.search.trim().is_empty(),
-        )
+        ).into_iter().filter(|&i| self.popup_kind != Some(Popup::Recent) || self.custom_tags.matches(&self.rows[i], &self.tag_filters)).collect()
     }
     fn update_body_only(&mut self) {
         let titles: HashSet<_> = self
@@ -3124,26 +2971,36 @@ impl App {
     fn fixed_hit_at(&self, x: f32, y: f32) -> Option<Hit> {
         let width = self.popup_size[0] as f32;
         if self.popup_kind == Some(Popup::Recent) {
-            if (264. ..324.).contains(&x) && (8. ..40.).contains(&y) {
-                return Some(Hit::Body);
-            }
-            if (332. ..364.).contains(&x) && (8. ..40.).contains(&y) {
-                return Some(Hit::Refresh);
-            }
-            if !(12. ..width - 18.).contains(&x)
-                || !(48. ..48. + self.list_page_rows() as f32 * 43.).contains(&y)
-                || (y - 48.) % 43. >= 39.
-            {
-                return None;
-            }
-            let slot = self.scroll + ((y - 48.) / 43.) as usize;
-            return self.chat_filters.get(slot).map(|&index| {
-                if (18. ..48.).contains(&x) {
-                    Hit::ChatIcon(self.rows[index].id.clone())
-                } else {
-                    Hit::Recent(self.rows[index].id.clone())
+            // Recompute geometry from current scroll/filter state, never stale paint hits.
+            if self.tag_editor.is_some() {
+                let r=self.tag_editor_rect();
+                if x>=r.left&&x<r.right&&y>=r.top&&y<r.bottom {
+                    return self.popup_hits.iter().rev().find(|a|a.contains(x,y)&&matches!(a.hit,Hit::TagClose|Hit::TagAdd|Hit::TagToggle(_)|Hit::TagColor(_)|Hit::TagBackground)).map(|a|a.hit.clone()).or(Some(Hit::TagBackground));
                 }
-            });
+                return Some(Hit::TagClose);
+            }
+            if y < RECENT_TOP as f32 {
+                if (12. ..42.).contains(&x)&&(9. ..39.).contains(&y){return Some(Hit::TagSidebar);}
+                if (310. ..370.).contains(&x)&&(8. ..40.).contains(&y){return Some(Hit::Body);}
+                if (382. ..442.).contains(&x)&&(8. ..40.).contains(&y){return Some(Hit::Compact);}
+                if (454. ..486.).contains(&x)&&(8. ..40.).contains(&y){return Some(Hit::Refresh);}
+                return self.popup_hits.iter().rev().find(|a|a.contains(x,y)&&matches!(a.hit,Hit::TagFilter(_)|Hit::TagClear)).map(|a|a.hit.clone());
+            }
+            if self.sidebar_open && x<TAG_SIDEBAR {
+                return self.tag_cloud_hit(x,y);
+            }
+            let top=RECENT_TOP as f32;let rh=self.recent_row_height() as f32;let left=self.recent_left();
+            if !(left..width-18.).contains(&x)||!(top..top+self.list_page_rows() as f32*rh).contains(&y)||(y-top)%rh>=rh-4.{return None;}
+            let slot=self.scroll+((y-top)/rh) as usize;
+            let &i=self.chat_filters.get(slot)?;let row=&self.rows[i];
+            if (left+6. ..left+36.).contains(&x)&&(y-top)%rh<34.{return Some(Hit::ChatIcon(row.id.clone()));}
+            if !self.settings.compact_recent && (y-top)%rh>=29. {
+                if x>=width-49.{return Some(Hit::TagEdit(row.id.clone()));}
+                let (_,tags,hidden)=unsafe{self.tag_layout(row)};
+                for(tag,tx,w)in tags{if(tx..tx+w).contains(&x){return Some(Hit::TagFilter(tag.key));}}
+                if hidden>0&&x>=width-79.{return Some(Hit::TagEdit(row.id.clone()));}
+            }
+            return Some(Hit::Recent(row.id.clone()));
         }
         if (width - 74. ..width - 16.).contains(&x) && (9. ..39.).contains(&y) {
             return Some(Hit::Back);
@@ -3164,6 +3021,18 @@ impl App {
         })
     }
     unsafe fn fixed_key(&mut self, key: u32) -> bool {
+        if !self.tag_search_input.is_invalid() && GetFocus()==self.tag_search_input {
+            if key==VK_RETURN.0 as u32 {
+                if let Some(key)=self.tag_regions.iter().find_map(|region|region.items.first().map(|i|self.tag_catalog[i.index].0.key.clone())){let _=self.hit(Hit::TagFilter(key));}
+                let _=InvalidateRect(self.popup,None,false);return true;
+            }
+            if key!=VK_ESCAPE.0 as u32{return false;}
+        }
+        if self.tag_editor.is_some(){
+            if key==VK_ESCAPE.0 as u32{let _=self.hit(Hit::TagClose);return true;}
+            if key==VK_RETURN.0 as u32{let _=self.hit(Hit::TagAdd);let _=InvalidateRect(self.popup,None,false);return true;}
+            return false;
+        }
         if self.icon_panel.is_some() {
             return false;
         }
@@ -3218,7 +3087,7 @@ impl App {
             return None;
         }
         let (top, height) = match self.popup_kind {
-            Some(Popup::Recent) => (50., page_rows as f32 * 43. - 7.),
+            Some(Popup::Recent) => (RECENT_TOP as f32+2., page_rows as f32 * self.recent_row_height() as f32 - 7.),
             Some(Popup::Fixed) => (100., 350.),
             _ => return None,
         };
@@ -3229,6 +3098,7 @@ impl App {
         ))
     }
     unsafe fn begin_chat_scroll(&mut self, x: f32, y: f32) -> bool {
+        if self.tag_editor.is_some(){return false;}
         let Some((top, height, thumb)) = self.chat_scroll_geometry() else {
             return false;
         };
@@ -3286,9 +3156,10 @@ unsafe extern "system" fn wndproc(
         let y = ((lparam.0 >> 16) as i16) as f32 / scale;
         match message {
             WM_HOTKEY if is_bar && wparam.0 == app.shortcut_id as usize => {
-                if app.popup_kind != Some(Popup::Preferences) { app.recent_shortcut(); }
+                if app.shortcut_allowed() && app.popup_kind != Some(Popup::Preferences) { app.recent_shortcut(); }
                 Some(LRESULT(0))
             }
+            FOCUS_MESSAGE if is_bar => { app.sync_shortcut_scope(true); Some(LRESULT(0)) }
             WM_MOUSEACTIVATE if is_bar => Some(LRESULT(MA_NOACTIVATE as isize)),
             WM_SETCURSOR => {
                 let cursor = match app.hover {
@@ -3309,7 +3180,9 @@ unsafe extern "system" fn wndproc(
                 Some(LRESULT(0))
             }
             WM_MOUSEMOVE => {
-                if app.chat_scroll_drag.is_some() {
+                if app.tag_scroll_drag.is_some(){
+                    app.drag_tag_scroll(y);
+                } else if app.chat_scroll_drag.is_some() {
                     app.drag_chat_scroll(y);
                 } else if let Some((start, original)) = app.drag {
                     let mut point = POINT::default();
@@ -3343,6 +3216,7 @@ unsafe extern "system" fn wndproc(
                 Some(LRESULT(0))
             }
             WM_LBUTTONDOWN => {
+                if !is_bar && app.begin_tag_scroll(x,y){return Some(LRESULT(0));}
                 if !is_bar && app.begin_chat_scroll(x, y) {
                     return Some(LRESULT(0));
                 }
@@ -3362,7 +3236,9 @@ unsafe extern "system" fn wndproc(
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {
-                if app.chat_scroll_drag.take().is_some() {
+                if app.tag_scroll_drag.take().is_some(){
+                    let _=ReleaseCapture();
+                } else if app.chat_scroll_drag.take().is_some() {
                     let _ = ReleaseCapture();
                 } else if app.drag.take().is_some() {
                     let _ = ReleaseCapture();
@@ -3398,6 +3274,19 @@ unsafe extern "system" fn wndproc(
                     }
                 }
                 Some(LRESULT(0))
+            }
+            WM_MOUSEWHEEL if !is_bar && app.popup_kind==Some(Popup::Recent) && (app.tag_editor.is_some() || (app.sidebar_open && {
+                let mut cursor=POINT::default();let _=GetCursorPos(&mut cursor);let _=ScreenToClient(app.popup,&mut cursor);(cursor.x as f32/scale)<TAG_SIDEBAR
+            })) => {
+                let delta=((wparam.0>>16) as i16) as i32;
+                if app.tag_editor.is_some(){
+                    let page=((app.tag_editor_rect().bottom-app.tag_editor_rect().top-204.)/25.).max(1.) as usize;
+                    app.tag_editor_scroll=if delta<0{(app.tag_editor_scroll+3).min(app.custom_tags.definitions.len().saturating_sub(page))}else{app.tag_editor_scroll.saturating_sub(3)};
+                }else{
+                    let mut cursor=POINT::default();let _=GetCursorPos(&mut cursor);let _=ScreenToClient(app.popup,&mut cursor);
+                    if let Some(i)=app.tag_region_at(cursor.x as f32/scale,cursor.y as f32/scale){app.scroll_tag_region(i,if delta<0{48.}else{-48.});}
+                }
+                let _=InvalidateRect(app.popup,None,false);Some(LRESULT(0))
             }
             WM_MOUSEWHEEL
                 if !is_bar && matches!(app.popup_kind, Some(Popup::Fixed | Popup::Recent)) =>
@@ -3450,6 +3339,13 @@ unsafe extern "system" fn wndproc(
                     app.search = String::from_utf16_lossy(&text[..len as usize]);
                     app.filter_fixed();
                     let _ = InvalidateRect(app.popup, None, false);
+                } else if id == 106 && code == EN_CHANGE {
+                    let mut text=[0u16;256];let len=GetWindowTextW(app.tag_search_input,&mut text);
+                    app.tag_query=String::from_utf16_lossy(&text[..len as usize]);
+                    app.tag_scroll=[0.;3];app.rebuild_tag_regions();let _=InvalidateRect(app.popup,None,false);
+                } else if id == 105 && code == EN_CHANGE {
+                    let mut text=[0u16;256];let len=GetWindowTextW(app.tag_input,&mut text);
+                    app.tag_draft=String::from_utf16_lossy(&text[..len as usize]);
                 } else if id == 104 && code == EN_CHANGE {
                     app.preferences_note = "Apply to save changes".into();
                     let _ = InvalidateRect(app.popup, None, false);
@@ -3585,6 +3481,7 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
         observers.push(guard::start(&paths, &state, &stop));
         ACTIONS.with(|a| *a.borrow_mut() = Some(workers.actions.clone()));
         APP.with(|a| *a.borrow_mut() = Some(app));
+        let focus_hook=SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,None,Some(foreground_changed),0,0,WINEVENT_OUTOFCONTEXT);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             // The search edit owns focus; wheel scrolling still belongs to its list.
@@ -3634,6 +3531,7 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        if !focus_hook.is_invalid(){let _=UnhookWinEvent(focus_hook);}
         stop.store(true, Ordering::Relaxed);
         drop(workers);
         for observer in observers {
@@ -3758,6 +3656,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
                     ["🧪", "🚧", "🚀", "💬", "🎯", "📦", "💻", "🧠", "🌈", "📷"][i % 10],
                     i + 1
                 ),
+                prompt: "请检查图像采集链路，并补充连续帧仿真。".into(),
+                tags: vec![tags::Tag{key:"project:demo".into(),label:"Demo project".into(),kind:tags::Kind::Project,color:0},tags::Tag{key:"group:IP".into(),label:"IP".into(),kind:tags::Kind::Group,color:0}],
                 state: if i < 3 { "Busy".into() } else { "Done".into() },
                 is_unread: Some(i == 3 || i == 5),
                 tokens: Some(27190000),
@@ -3776,7 +3676,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             busy_metrics: rows[..3].to_vec(),
             loaded_at: now(),
             ..Default::default()
-        };
+        }.into();
         assert_eq!(app.bar_text(&app.snapshot()).1, "Recent chats");
         assert!(app.current(&app.snapshot()).is_none());
         {
@@ -3846,14 +3746,14 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         );
         assert!(!app.search_body);
         assert!(app.body_service.is_none());
-        assert_eq!(app.fixed_hit_at(290., 25.), Some(Hit::Body));
+        assert_eq!(app.fixed_hit_at(340., 25.), Some(Hit::Body));
         let _ = app.hit(Hit::Body);
         assert!(app.search_body);
         assert!(app.body_service.is_none());
         let _ = app.hit(Hit::Body);
         assert!(!app.search_body);
         assert_eq!(app.rows.len(), 40);
-        assert_eq!(app.popup_size, [560, 436]);
+        assert_eq!(app.popup_size, [820, RECENT_FRAME + 8 * RECENT_ROW]);
         app.search = "huihuamingcheng 25".into();
         app.filter_fixed();
         assert_eq!(app.chat_filters, [24]);
@@ -3862,7 +3762,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         app.move_fixed_cursor(24);
         assert_eq!(app.scroll, 17);
         assert_eq!(
-            app.fixed_hit_at(80., 381.),
+            app.fixed_hit_at(80., (RECENT_TOP + 7 * RECENT_ROW + 10) as f32),
             Some(Hit::Recent(rows[24].id.clone()))
         );
         let original = app.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
@@ -3873,7 +3773,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             app.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
             original
         );
-        state.lock().unwrap().recent.rows.reverse();
+        Arc::make_mut(&mut state.lock().unwrap().recent).rows.reverse();
         for _ in 0..100 {
             app.tick();
         }
@@ -3883,7 +3783,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             app.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
             original
         );
-        assert!(app.begin_chat_scroll(550., 382.));
+        assert!(app.begin_chat_scroll(810., 382.));
         app.drag_chat_scroll(1000.);
         assert_eq!(app.scroll, 32);
         app.chat_scroll_drag = None;
@@ -3895,7 +3795,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert!(app.fixed_key(VK_RETURN.0 as u32));
         assert!(matches!(received.try_recv().unwrap(), Action::Navigate(id) if id == rows[24].id));
         ACTIONS.with(|a| *a.borrow_mut() = None);
-        state.lock().unwrap().recent.rows = rows.clone();
+        Arc::make_mut(&mut state.lock().unwrap().recent).rows = rows.clone();
         app.close_popup();
         let snap = data::Snapshot {
             id: "fixture-0".into(),
@@ -3937,8 +3837,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            560,
-            436,
+            820,
+            (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-recent-verification.png"),
         )?;
         assert_eq!(
@@ -4056,8 +3956,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            560,
-            436,
+            820,
+            (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-background-index-verification.png"),
         )?;
         app.index_pending = false;
@@ -4067,8 +3967,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            560,
-            436,
+            820,
+            (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-recent-search-verification.png"),
         )?;
         app.search_body = true;
@@ -4102,8 +4002,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            560,
-            436,
+            820,
+            (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-recent-body-verification.png"),
         )?;
         app.paths.write("rust-body-ui-test.json",&json!({"default_off":true,"background_prewarm":true,"ios_switches":true,"busy_title_body_ranking":true,"body_match_badge":true}));
@@ -4151,7 +4051,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         app.last_identity = app.identity(&before);
         app.popup(Popup::Fixed)?;
         let order = app.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
-        state.lock().unwrap().recent.all_rows.reverse();
+        Arc::make_mut(&mut state.lock().unwrap().recent).all_rows.reverse();
         for _ in 0..100 {
             app.tick();
         }
@@ -4179,7 +4079,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert_eq!(app.snapshot().fixed_thread, rows[1].id);
         assert!(!app.snapshot().auto_thread);
         assert_eq!(app.popup_kind, Some(Popup::Details));
-        state.lock().unwrap().recent.all_rows = rows.clone();
+        Arc::make_mut(&mut state.lock().unwrap().recent).all_rows = rows.clone();
         app.popup(Popup::Fixed)?;
         let picker_hits = capture(
             &app,
@@ -4268,17 +4168,17 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert_eq!(app.settings.recent_rows, 10);
         assert_eq!(app.settings.recent_shortcut.label(), "Ctrl+Alt+K");
         app.popup(Popup::Recent)?;
-        assert_eq!(app.popup_size, [560, 522]);
+        assert_eq!(app.popup_size, [820, RECENT_FRAME + 10 * RECENT_ROW]);
         assert_eq!(app.list_page_rows(), 10);
-        assert_eq!(app.fixed_hit_at(80., 48. + 9. * 43. + 10.), Some(Hit::Recent(rows[9].id.clone())));
-        assert!(app.begin_chat_scroll(550., 450.));
+        assert_eq!(app.fixed_hit_at(80., (RECENT_TOP + 9 * RECENT_ROW + 10) as f32), Some(Hit::Recent(rows[9].id.clone())));
+        assert!(app.begin_chat_scroll(810., 450.));
         app.drag_chat_scroll(10000.);
         assert_eq!(app.scroll, 30);
         app.chat_scroll_drag = None;
         let _ = ReleaseCapture();
         app.scroll = 0;
         app.chat_cursor = 0;
-        capture(&app, Some(Popup::Recent), 560, 522, &paths.runtime.join("rust-recent-configured-verification.png"))?;
+        capture(&app, Some(Popup::Recent), 820, (RECENT_FRAME + 10 * RECENT_ROW) as u32, &paths.runtime.join("rust-recent-configured-verification.png"))?;
         app.popup(Popup::Preferences)?;
         app.hit(Hit::ShortcutEnabled);
         app.hit(Hit::ApplyPreferences);
@@ -4319,6 +4219,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         app.paths.app = fixture.clone();
         app.paths.runtime = fixture.clone();
         app.testing = false;
+        state.lock().unwrap().host=GetForegroundWindow().0 as isize;
         app.shortcut_registered = false;
         app.settings.recent_shortcut.enabled = false;
         let native_shortcut = Shortcut { key: 0x87, shift: true, ..Shortcut::default() };
@@ -4349,6 +4250,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             "default_recent_rows":10,"configured_scroll_last_row":true,"extensions_only_in_settings":true,
             "guard_log_button_does_not_toggle_protection":true,"guard_log_preserves_unsaved_settings":true}));
         paths.write("rust-popover-shortcut-test.json", &json!({"list_window_preserved":true,"list_search_scroll_selection_preserved":true,"native_icon_click_routed":true,"icon_combo_survives_100_refreshes":true,"recent_shortcut_toggle":true,"index_percent_local_only":true,"body_snippet_highlight":true}));
+        verify_recent_tags(&mut app,paths)?;
         let _ = app.hit(Hit::Hide);
         assert!(app.hidden);
         app.hidden = false;
@@ -4366,3 +4268,5 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         Ok(())
     }
 }
+
+include!("recent.rs");
