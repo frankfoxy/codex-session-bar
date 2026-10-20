@@ -133,6 +133,7 @@ enum Hit {
     Hide,
     Details,
     Recent(String),
+    ChatIcon(String),
     ChooseFixed,
     Fixed(String),
     Back,
@@ -322,6 +323,14 @@ impl Painter {
             );
         }
     }
+    unsafe fn toggle(&self, x: f32, y: f32, on: bool) {
+        self.fill(
+            rect(x, y, 34., 20.),
+            if on { 0x30c777 } else { 0x4b555e },
+            10.,
+        );
+        self.circle(x + if on { 24. } else { 10. }, y + 10., 8., 0xffffff);
+    }
 }
 
 struct App {
@@ -339,6 +348,7 @@ struct App {
     child_brush: HBRUSH,
     tray_icon: HICON,
     popup_kind: Option<Popup>,
+    icon_target: Option<(String, String)>,
     rows: Vec<Row>,
     hits: Vec<Area>,
     popup_hits: Vec<Area>,
@@ -350,6 +360,8 @@ struct App {
     body_service: Option<body::Service>,
     body_generation: u64,
     body_pending: bool,
+    index_pending: bool,
+    index_due: Instant,
     body_state: body::Status,
     body_hits: HashSet<String>,
     body_only: HashSet<String>,
@@ -447,6 +459,7 @@ impl App {
             child_brush: CreateSolidBrush(COLORREF(0x25211c)),
             tray_icon: create_tray_icon()?,
             popup_kind: None,
+            icon_target: None,
             popup_layout: None,
             rows: Vec::new(),
             hits: Vec::new(),
@@ -459,6 +472,8 @@ impl App {
             body_service: None,
             body_generation: 0,
             body_pending: false,
+            index_pending: false,
+            index_due: Instant::now() + std::time::Duration::from_secs(3),
             body_state: body::Status::default(),
             body_hits: HashSet::new(),
             body_only: HashSet::new(),
@@ -724,44 +739,12 @@ impl App {
                 }
                 let exact = rect(288., 14., 80., 34.);
                 area(Hit::Exact, exact);
-                p.fill(
-                    exact,
-                    if self.search_exact {
-                        0x294438
-                    } else {
-                        0x30383e
-                    },
-                    6.,
-                );
-                p.label(
-                    if self.search_exact {
-                        "✓  Exact"
-                    } else {
-                        "Exact"
-                    },
-                    rect(298., 14., 70., 34.),
-                    12.,
-                    if self.search_exact { GREEN } else { MUTED },
-                    false,
-                );
+                p.label("Exact", rect(288., 14., 39., 34.), 12., TEXT, false);
+                p.toggle(332., 21., self.search_exact);
                 let (tokens, rate, partial) = live.recent.totals();
                 area(Hit::Body, rect(384., 14., 94., 34.));
-                p.border(
-                    rect(390., 23., 16., 16.),
-                    if self.search_body { GREEN } else { MUTED },
-                    3.,
-                );
-                if self.search_body {
-                    p.line(393., 31., 397., 35., GREEN, 1.6);
-                    p.line(397., 35., 403., 27., GREEN, 1.6);
-                }
-                p.label(
-                    "Body",
-                    rect(415., 14., 58., 34.),
-                    12.,
-                    if self.search_body { GREEN } else { MUTED },
-                    false,
-                );
+                p.label("Body", rect(384., 14., 34., 34.), 12., TEXT, false);
+                p.toggle(424., 21., self.search_body);
                 let total = format!(
                     "Total {}{} t/s  ·  {}{} TOK",
                     rate.map(|r| format!("{r:.1}")).unwrap_or("—".into()),
@@ -803,7 +786,18 @@ impl App {
                     if current || self.chat_cursor == self.scroll + slot {
                         p.border(r, if current { 0x527b69 } else { 0x59849c }, 7.);
                     }
+                    let icon_hit = Hit::ChatIcon(row.id.clone());
+                    area(icon_hit.clone(), rect(18., y + 4., 30., 30.));
                     area(Hit::Recent(row.id.clone()), r);
+                    p.fill(
+                        rect(18., y + 4., 30., 30.),
+                        if self.hover == Some(icon_hit) {
+                            0x496173
+                        } else {
+                            0x303b43
+                        },
+                        7.,
+                    );
                     p.label(
                         &self.catalog.icon(&row.label),
                         rect(22., y + 2., 25., 34.),
@@ -811,7 +805,7 @@ impl App {
                         TEXT,
                         true,
                     );
-                    let label_width = if busy { width - 365. } else { width - 142. };
+                    let label_width = if busy { width - 365. } else { width - 305. };
                     let body_only = self.body_only.contains(&row.id);
                     p.label(
                         self.catalog.strip(&row.label),
@@ -846,6 +840,18 @@ impl App {
                         p.label(
                             &metrics,
                             rect(width - 310., y + 2., 220., 34.),
+                            11.,
+                            MUTED,
+                            false,
+                        );
+                    } else {
+                        p.label(
+                            &format!(
+                                "{} TOK   ·   {}",
+                                data::compact(row.tokens),
+                                row.total_seconds.map(data::duration).unwrap_or("—".into())
+                            ),
+                            rect(width - 250., y + 2., 160., 34.),
                             11.,
                             MUTED,
                             false,
@@ -899,21 +905,18 @@ impl App {
                     ""
                 };
                 p.line(16., height - 38., width - 16., height - 38., 0x354148, 1.);
-                let count = if self.body_pending {
+                let count = if self.index_pending || self.body_pending {
                     format!(
                         "Indexing {} / {} · {:.0} MiB",
                         self.body_state.indexed,
                         self.body_state.available,
                         self.body_state.bytes_read as f64 / 1048576.
                     )
-                } else if self.search_body
-                    && !self.search.trim().is_empty()
-                    && !self.body_state.error.is_empty()
-                {
-                    "Body unavailable · title results only".into()
-                } else if self.search_body && !self.search.trim().is_empty() {
+                } else if !self.body_state.error.is_empty() {
+                    "Index unavailable · retry pending".into()
+                } else if self.body_state.complete {
                     format!(
-                        "{} / {} chats · Body {}/{} local{}",
+                        "{} / {} chats · Indexed {}/{}{}",
                         self.chat_filters.len(),
                         self.rows.len(),
                         self.body_state.available,
@@ -933,12 +936,12 @@ impl App {
                 };
                 p.label(
                     &count,
-                    rect(16., height - 29., 240., 24.),
+                    rect(16., height - 29., 350., 24.),
                     11.,
                     MUTED,
                     false,
                 );
-                let tw = p.width(&total, 11.).min(width - 290.);
+                let tw = p.width(&total, 11.).min(width - 380.);
                 p.label(
                     &total,
                     rect(width - 16. - tw, height - 29., tw + 1., 24.),
@@ -950,7 +953,12 @@ impl App {
             Some(Popup::Icons) => {
                 area(Hit::Random, rect(12., 9., 36., 32.));
                 p.label("🎲", rect(17., 9., 30., 32.), 20., TEXT, true);
-                p.label("Session icon", rect(57., 9., 250., 32.), 14., TEXT, false);
+                let icon_title = self
+                    .icon_target
+                    .as_ref()
+                    .map(|(_, label)| self.catalog.strip(label))
+                    .unwrap_or("Session icon");
+                p.label(icon_title, rect(57., 9., 250., 32.), 14., TEXT, false);
                 area(Hit::Clear, rect(width - 68., 10., 54., 30.));
                 p.label("Clear", rect(width - 62., 10., 48., 30.), 12., MUTED, false);
                 for r in [rect(14., 49., 190., 29.), rect(214., 49., 155., 29.)] {
@@ -1047,11 +1055,21 @@ impl App {
                         },
                         7.,
                     );
+                    let icon_hit = Hit::ChatIcon(row.id.clone());
+                    area(icon_hit.clone(), rect(23., y + 5., 33., 30.));
                     area(Hit::Fixed(row.id.clone()), r);
                     if selected || self.chat_cursor == self.scroll + slot {
                         p.border(r, if selected { 0x5ca985 } else { 0x59849c }, 7.);
                     }
-                    p.fill(rect(23., y + 5., 30., 30.), 0x333c43, 7.);
+                    p.fill(
+                        rect(23., y + 5., 30., 30.),
+                        if self.hover == Some(icon_hit) {
+                            0x496173
+                        } else {
+                            0x333c43
+                        },
+                        7.,
+                    );
                     p.label(
                         &self.catalog.icon(&row.label),
                         rect(26., y + 4., 28., 32.),
@@ -1059,7 +1077,7 @@ impl App {
                         TEXT,
                         true,
                     );
-                    let with_metrics = busy && row.tokens.is_some();
+                    let with_metrics = row.tokens.is_some() || row.total_seconds.is_some();
                     p.label(
                         self.catalog.strip(&row.label),
                         rect(
@@ -1074,11 +1092,19 @@ impl App {
                     );
                     if with_metrics {
                         p.label(
-                            &format!(
-                                "{} TOK  ·  {} t/s",
-                                data::compact(row.tokens),
-                                row.rate().map(|v| format!("{v:.1}")).unwrap_or("—".into())
-                            ),
+                            &if busy {
+                                format!(
+                                    "{} TOK  ·  {} t/s",
+                                    data::compact(row.tokens),
+                                    row.rate().map(|v| format!("{v:.1}")).unwrap_or("—".into())
+                                )
+                            } else {
+                                format!(
+                                    "{} TOK  ·  {} total",
+                                    data::compact(row.tokens),
+                                    row.total_seconds.map(data::duration).unwrap_or("—".into())
+                                )
+                            },
                             rect(62., y + 22., width - 202., 16.),
                             10.,
                             MUTED,
@@ -1396,21 +1422,41 @@ impl App {
                 .unwrap_or(self.chat_cursor)
                 .min(self.chat_filters.len().saturating_sub(1));
         }
-        if self.body_pending {
+        if self.index_pending || self.body_pending {
             if let Some(service) = &self.body_service {
                 let result = service.status();
                 if result.generation == self.body_generation {
                     self.body_state = result;
                     if self.body_state.complete {
-                        self.body_pending = false;
-                        self.body_hits = self.body_state.hits.clone();
-                        self.update_body_only();
-                        self.chat_filters = self.filtered_chats();
-                        self.chat_cursor = 0;
-                        self.scroll = 0;
+                        self.index_pending = false;
+                        self.index_due = Instant::now() + std::time::Duration::from_secs(60);
+                        if self.body_pending {
+                            self.body_pending = false;
+                            self.body_hits = self.body_state.hits.clone();
+                            self.update_body_only();
+                            self.chat_filters = self.filtered_chats();
+                            self.chat_cursor = 0;
+                            self.scroll = 0;
+                        }
                     }
                 }
             }
+        }
+        // Prewarm independently of the Body switch and panel visibility. A live
+        // query takes priority; ordinary title typing never cancels this work.
+        if !self.testing
+            && !self.index_pending
+            && !self.body_pending
+            && Instant::now() >= self.index_due
+            && !live.recent.rows.is_empty()
+        {
+            let service = self
+                .body_service
+                .get_or_insert_with(|| body::Service::new(self.paths.clone(), self.stop.clone()));
+            self.body_generation =
+                service.submit("", false, live.recent.rows.iter().map(|r| r.id.clone()));
+            self.index_pending = true;
+            self.body_state = service.status();
         }
         let host = host::bounds(live.host);
         if !self.testing {
@@ -1528,11 +1574,16 @@ impl App {
         let _ = Shell_NotifyIconW(if add { NIM_ADD } else { NIM_DELETE }, &data);
     }
     unsafe fn close_popup(&mut self) {
-        if let Some(service) = &self.body_service {
-            service.cancel();
+        if self.body_pending {
+            if let Some(service) = &self.body_service {
+                service.cancel();
+            }
+            self.body_generation = 0;
+            self.index_pending = false;
+            self.index_due = Instant::now();
         }
         self.body_pending = false;
-        self.body_generation = 0;
+        self.icon_target = None;
         if self.chat_scroll_drag.take().is_some() {
             let _ = ReleaseCapture();
         }
@@ -1582,6 +1633,18 @@ impl App {
         // A newly created child needs one layout even if the panel bounds match.
         self.popup_layout = None;
         self.popup_kind = Some(kind);
+        if kind != Popup::Recent && self.body_pending {
+            if let Some(service) = &self.body_service {
+                service.cancel();
+            }
+            self.body_pending = false;
+            self.index_pending = false;
+            self.body_generation = 0;
+            self.index_due = Instant::now();
+        }
+        if kind != Popup::Icons {
+            self.icon_target = None;
+        }
         self.hover = None;
         let live = self.snapshot();
         self.popup_size = match kind {
@@ -1815,7 +1878,7 @@ impl App {
     }
     fn diagnostic(&self) {
         self.paths.write(if self.testing { "rust-test-body-status.json" } else { "body-search-status.json" },
-            &json!({"enabled":self.search_body,"pending":self.body_pending,"complete":self.body_state.complete,
+            &json!({"enabled":self.search_body,"pending":self.body_pending,"indexing":self.index_pending,"complete":self.body_state.complete,
                 "indexed":self.body_state.indexed,"available_local":self.body_state.available,"total_chats":self.body_state.total,
                 "bytes_read":self.body_state.bytes_read,"skipped_oversized_messages":self.body_state.skipped,"error":self.body_state.error,
                 "cache_exists":self.paths.runtime.join("body-search.sqlite").exists(),"on_demand":true}));
@@ -1830,7 +1893,17 @@ impl App {
                 let _ = self.popup(Popup::Recent);
             }
             Hit::Icon => {
-                if self.current(&self.snapshot()).is_some() {
+                let live = self.snapshot();
+                if let Some(current) = self.current(&live) {
+                    self.icon_target = Some((current.id.clone(), current.label.clone()));
+                    let _ = self.popup(Popup::Icons);
+                }
+            }
+            Hit::ChatIcon(id) => {
+                if let Some(row) = self.rows.iter().find(|r| r.id == id) {
+                    let target = (row.id.clone(), row.label.clone());
+                    self.close_popup();
+                    self.icon_target = Some(target);
                     let _ = self.popup(Popup::Icons);
                 }
             }
@@ -1867,15 +1940,18 @@ impl App {
             }
             Hit::Random | Hit::Clear | Hit::Emoji(_) => {
                 let live = self.snapshot();
-                let Some(current) = self.current(&live) else {
+                let Some((id, label)) = self
+                    .icon_target
+                    .clone()
+                    .or_else(|| self.current(&live).map(|s| (s.id.clone(), s.label.clone())))
+                else {
                     return None;
                 };
-                let id = current.id.clone();
                 let icon = match hit {
                     Hit::Clear => String::new(),
                     Hit::Emoji(index) => self.catalog.entries[index].emoji.clone(),
                     _ => {
-                        let current_icon = self.catalog.icon(&current.label);
+                        let current_icon = self.catalog.icon(&label);
                         self.catalog
                             .entries
                             .iter()
@@ -1947,13 +2023,16 @@ impl App {
     }
     fn filter_fixed(&mut self) {
         self.chat_search.sync(&self.rows, &self.catalog);
-        if let Some(service) = &self.body_service {
-            service.cancel();
+        if self.body_pending {
+            if let Some(service) = &self.body_service {
+                service.cancel();
+            }
+            self.body_generation = 0;
+            self.index_pending = false;
+            self.index_due = Instant::now();
         }
         self.body_hits.clear();
         self.body_only.clear();
-        self.body_state = body::Status::default();
-        self.body_generation = 0;
         self.body_pending = false;
         if self.search_body
             && self.popup_kind == Some(Popup::Recent)
@@ -1969,6 +2048,8 @@ impl App {
                 self.rows.iter().map(|r| r.id.clone()),
             );
             self.body_pending = true;
+            self.index_pending = true;
+            self.body_state = service.status();
         }
         self.chat_filters = self.filtered_chats();
         self.chat_cursor = 0;
@@ -2028,10 +2109,13 @@ impl App {
                 return None;
             }
             let slot = self.scroll + ((y - 60.) / 43.) as usize;
-            return self
-                .chat_filters
-                .get(slot)
-                .map(|&index| Hit::Recent(self.rows[index].id.clone()));
+            return self.chat_filters.get(slot).map(|&index| {
+                if (18. ..48.).contains(&x) {
+                    Hit::ChatIcon(self.rows[index].id.clone())
+                } else {
+                    Hit::Recent(self.rows[index].id.clone())
+                }
+            });
         }
         if (width - 74. ..width - 16.).contains(&x) && (9. ..39.).contains(&y) {
             return Some(Hit::Back);
@@ -2043,9 +2127,13 @@ impl App {
             return None;
         }
         let slot = self.scroll + ((y - 100.) / 44.) as usize;
-        self.chat_filters
-            .get(slot)
-            .map(|&index| Hit::Fixed(self.rows[index].id.clone()))
+        self.chat_filters.get(slot).map(|&index| {
+            if (23. ..56.).contains(&x) {
+                Hit::ChatIcon(self.rows[index].id.clone())
+            } else {
+                Hit::Fixed(self.rows[index].id.clone())
+            }
+        })
     }
     unsafe fn fixed_key(&mut self, key: u32) -> bool {
         if !matches!(self.popup_kind, Some(Popup::Fixed | Popup::Recent)) {
@@ -2194,10 +2282,16 @@ unsafe extern "system" fn wndproc(
                     );
                 } else {
                     let areas = if is_bar { &app.hits } else { &app.popup_hits };
-                    let hover = areas
-                        .iter()
-                        .find(|a| a.contains(x, y))
-                        .map(|a| a.hit.clone());
+                    let hover = if !is_bar
+                        && matches!(app.popup_kind, Some(Popup::Recent | Popup::Fixed))
+                    {
+                        app.fixed_hit_at(x, y)
+                    } else {
+                        areas
+                            .iter()
+                            .find(|a| a.contains(x, y))
+                            .map(|a| a.hit.clone())
+                    };
                     if app.hover != hover {
                         app.hover = hover;
                         let _ = InvalidateRect(hwnd, None, false);
@@ -2593,6 +2687,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
                 tps: Some(42.3),
                 rate_at: Some(now()),
                 started_at: Some(now() - 754.),
+                total_seconds: Some(8365. + i as f64 * 113.),
                 updated_at: now() - i as f64 * 60.,
                 ..Default::default()
             })
@@ -2713,6 +2808,55 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             448,
             &paths.runtime.join("rust-recent-verification.png"),
         )?;
+        assert_eq!(
+            app.fixed_hit_at(30., 81.),
+            Some(Hit::ChatIcon(rows[0].id.clone()))
+        );
+        assert_eq!(
+            app.fixed_hit_at(80., 81.),
+            Some(Hit::Recent(rows[0].id.clone()))
+        );
+        let identity_before_icon = app.identity(&app.snapshot());
+        let follow_before_icon = app.snapshot().auto_thread;
+        assert!(app.hit(Hit::ChatIcon(rows[7].id.clone())).is_none());
+        assert_eq!(app.popup_kind, Some(Popup::Icons));
+        assert_eq!(app.identity(&app.snapshot()), identity_before_icon);
+        assert_eq!(app.snapshot().auto_thread, follow_before_icon);
+        assert_eq!(app.icon_target.as_ref().unwrap().0, rows[7].id);
+        capture(
+            &app,
+            Some(Popup::Icons),
+            384,
+            450,
+            &paths.runtime.join("rust-chat-icon-verification.png"),
+        )?;
+        let chosen = app.filters[0];
+        assert!(
+            matches!(app.hit(Hit::Emoji(chosen)), Some(Action::Icon(id, icon)) if id == rows[7].id && icon == app.catalog.entries[chosen].emoji)
+        );
+        assert!(app.hit(Hit::ChatIcon(rows[7].id.clone())).is_none());
+        assert!(
+            matches!(app.hit(Hit::Random), Some(Action::Icon(id, icon)) if id == rows[7].id && icon != app.catalog.icon(&rows[7].label))
+        );
+        app.popup(Popup::Recent)?;
+        app.index_pending = true;
+        app.body_state = body::Status {
+            indexed: 17,
+            available: 40,
+            total: 40,
+            bytes_read: 12 * 1048576,
+            ..Default::default()
+        };
+        assert!(!app.search_body);
+        capture(
+            &app,
+            Some(Popup::Recent),
+            650,
+            448,
+            &paths.runtime.join("rust-background-index-verification.png"),
+        )?;
+        app.index_pending = false;
+        app.body_state = body::Status::default();
         app.search = "mingcheng 2".into();
         app.filter_fixed();
         capture(
@@ -2745,7 +2889,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             448,
             &paths.runtime.join("rust-recent-body-verification.png"),
         )?;
-        app.paths.write("rust-body-ui-test.json",&json!({"default_off":true,"no_startup_index":true,"body_checkbox":true,"busy_title_body_ranking":true,"body_match_badge":true}));
+        app.paths.write("rust-body-ui-test.json",&json!({"default_off":true,"background_prewarm":true,"ios_switches":true,"busy_title_body_ranking":true,"body_match_badge":true}));
         app.search_body = false;
         app.search.clear();
         app.filter_fixed();
@@ -2812,6 +2956,17 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert!(picker_hits
             .iter()
             .any(|a| a.hit == Hit::Fixed(rows[1].id.clone())));
+        assert_eq!(
+            app.fixed_hit_at(35., 252.),
+            Some(Hit::ChatIcon(rows[3].id.clone()))
+        );
+        let pinned_before_icon = app.snapshot().fixed_thread;
+        assert!(app.hit(Hit::ChatIcon(rows[3].id.clone())).is_none());
+        assert_eq!(app.snapshot().fixed_thread, pinned_before_icon);
+        assert!(!app.snapshot().auto_thread);
+        assert!(
+            matches!(app.hit(Hit::Clear), Some(Action::Icon(id, icon)) if id == rows[3].id && icon.is_empty())
+        );
         app.popup(Popup::Details)?;
         capture(
             &app,
@@ -2821,7 +2976,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             &paths.runtime.join("rust-details-verification.png"),
         )?;
         *state.lock().unwrap() = before;
-        app.popup(Popup::Icons)?;
+        let _ = app.hit(Hit::Icon);
+        assert_eq!(app.icon_target.as_ref().unwrap().0, "fixture-0");
         let _ = SendMessageW(app.combo, CB_SHOWDROPDOWN, WPARAM(1), LPARAM(0));
         for _ in 0..100 {
             app.place_popup();

@@ -66,6 +66,8 @@ pub struct Row {
     pub rate_at: Option<f64>,
     #[serde(default)]
     pub started_at: Option<f64>,
+    #[serde(default)]
+    pub total_seconds: Option<f64>,
 }
 fn unknown() -> String {
     "Unknown".into()
@@ -333,13 +335,14 @@ impl Store {
     }
     pub fn sessions(&self) -> Result<Vec<Row>> {
         let db = self.db("state_5.sqlite")?;
-        let mut query=db.prepare("SELECT id,coalesce(nullif(name,''),title),updated_at FROM threads WHERE archived=0 AND agent_path IS NULL ORDER BY updated_at DESC,id")?;
+        let mut query=db.prepare("SELECT id,coalesce(nullif(name,''),title),updated_at,tokens_used FROM threads WHERE archived=0 AND agent_path IS NULL ORDER BY updated_at DESC,id")?;
         let rows = query
             .query_map([], |r| {
                 Ok(Row {
                     id: r.get(0)?,
                     label: r.get(1)?,
                     updated_at: r.get(2)?,
+                    tokens: r.get(3)?,
                     state: unknown(),
                     ..Row::default()
                 })
@@ -469,7 +472,9 @@ impl Store {
         // snapshot is bounded. Fetch token logs only for confirmed busy chats.
         let mut rows = self.sessions()?;
         let mut turns = history.prepare("SELECT status FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1")?;
+        let mut durations = history.prepare("SELECT SUM(CASE WHEN started_at IS NOT NULL AND completed_at >= started_at THEN completed_at-started_at END) FROM thread_turns WHERE thread_id=?")?;
         for row in &mut rows {
+            row.total_seconds = durations.query_row([&row.id], |r| r.get(0))?;
             let entry = entries
                 .get(row.id.as_str())
                 .copied()
@@ -606,6 +611,8 @@ mod tests {
         let (paths, dir) = fixture("identity");
         let db = Connection::open(dir.join("state_5.sqlite")).unwrap();
         db.execute_batch("CREATE TABLE threads(id TEXT,name TEXT,title TEXT,archived INTEGER,agent_path TEXT,updated_at INTEGER); INSERT INTO threads VALUES('one',NULL,'unique',0,NULL,10),('old',NULL,'unique',1,NULL,9),('child',NULL,'unique',0,'agent',8),('two',NULL,'duplicate',0,NULL,7),('three',NULL,'duplicate',0,NULL,6);").unwrap();
+        db.execute_batch("ALTER TABLE threads ADD COLUMN tokens_used INTEGER DEFAULT 12345;")
+            .unwrap();
         drop(db);
         let store = Store::new(&paths);
         assert_eq!(store.resolve("unique").unwrap().as_deref(), Some("one"));
@@ -638,13 +645,21 @@ mod tests {
         )
         .unwrap();
         tx.commit().unwrap();
+        db.execute_batch("ALTER TABLE threads ADD COLUMN tokens_used INTEGER DEFAULT 27190000;")
+            .unwrap();
         let history = Connection::open(dir.join("thread_history_1.sqlite")).unwrap();
         history.execute_batch("CREATE TABLE thread_turns(thread_id TEXT,status TEXT,rollout_ordinal INTEGER); INSERT INTO thread_turns VALUES('chat-0','completed',1);").unwrap();
+        history.execute_batch("ALTER TABLE thread_turns ADD COLUMN started_at REAL; ALTER TABLE thread_turns ADD COLUMN completed_at REAL;
+            UPDATE thread_turns SET started_at=100,completed_at=160;
+            INSERT INTO thread_turns VALUES('chat-0','completed',2,10000,10120),('chat-0','failed',3,20000,20030),('chat-0','interrupted',4,30000,NULL),('chat-0','completed',5,40000,39999);").unwrap();
         let mut store = Store::new(&paths);
         let recent = store.recent(&serde_json::json!({"threads":[{"kind":"codex","hostId":"local","id":"chat-79","status":"active"}]})).unwrap();
         assert_eq!(recent.rows.len(), 80);
         assert_eq!(recent.rows[0].id, "chat-0");
         assert_eq!(recent.rows[0].state, "Done");
+        assert_eq!(recent.rows[0].tokens, Some(27190000));
+        assert_eq!(recent.rows[0].total_seconds, Some(210.));
+        assert_eq!(recent.rows[1].total_seconds, None);
         assert_eq!(recent.rows[79].id, "chat-79");
         assert_eq!(recent.rows[79].state, "Busy");
         assert_eq!(recent.all_rows[0].id, "chat-79");

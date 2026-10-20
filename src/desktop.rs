@@ -390,7 +390,8 @@ impl Workers {
                             if let Some(snapshot) = live.snapshot.as_mut().filter(|v| v.id == *id) {
                                 snapshot.label = label.clone();
                             }
-                            for row in &mut live.recent.rows {
+                            let recent = &mut live.recent;
+                            for row in recent.rows.iter_mut().chain(&mut recent.all_rows).chain(&mut recent.busy_metrics) {
                                 if row.id == *id {
                                     row.label = label.clone();
                                 }

@@ -85,9 +85,13 @@ restore a hidden instance or start an exited one.
 
 ## Diagnostics and disclosure
 
-Body search is opt-in. The first nonempty Body query lazily starts one background
-worker, with 200 ms debounce and latest-query cancellation (including SQLite
-interrupts). It prefers Codex's existing `thread_items` cache, selects only
+Body matching is opt-in, while indexing prewarms automatically after startup
+and checks for incremental updates 60 seconds after completion. Closing panels
+or typing a title-only query does not cancel prewarming. One low-priority worker
+handles both indexing and queries, with 200 ms debounce and latest-query
+cancellation (including SQLite interrupts). An empty query indexes without
+matching content; interactive Body queries take priority. The footer reports
+index progress even with Body off. It prefers Codex's existing `thread_items` cache, selects only
 user/agent messages, and resumes through the existing per-thread updated-ordinal
 index. Changed messages replace their old indexed chunks; checkpoints keep tied
 ordinals together. Local rollouts are the fallback, streamed through a 64 KiB
@@ -102,6 +106,12 @@ or literal wildcard characters. The page cache is 2 MiB; the database cap is
 local rollouts are reflected in the footer's local-body count. No body-pinyin
 expansion is performed. Completed query results are published together; background
 status refreshes keep the chosen result order stable. Cache data is never published.
+
+Idle rows use `threads.tokens_used` and sum valid completed-minus-started durations
+from `thread_turns`; gaps, missing endpoints and negative durations are excluded.
+Both chat-list icon hit targets are separate from row navigation. The icon editor
+captures the target ID and label on opening; choosing an icon never changes the
+follow/fixed selection. Successful renames update all three row caches immediately.
 
 `live-status.json` records runtime, PID, visible identity, quota, caches, font
 selection and docking bounds. Read bounded stderr excerpts for desktop errors.

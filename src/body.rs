@@ -1,4 +1,4 @@
-//! On-demand, bounded-memory cache of visible chat text. Never runs while Body is off.
+//! Background, bounded-memory cache of visible chat text; queries remain opt-in.
 use crate::{Paths, Stop};
 use anyhow::Result;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -124,7 +124,10 @@ impl Service {
                         state.indexed += 1;
                         publish(&output, &state, &control);
                     }
-                    state.hits = index.search(&request.query, request.exact, &control)?;
+                    // An empty query prewarms the cache without matching every message.
+                    if !request.query.trim().is_empty() {
+                        state.hits = index.search(&request.query, request.exact, &control)?;
+                    }
                     state.hits.retain(|id| request.ids.contains(id));
                     index.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
                     Ok(())
@@ -875,8 +878,6 @@ mod tests {
             ..Paths::discover().unwrap()
         };
         let service = Service::new(paths, f.stop.clone());
-        service.submit("old-query", false, ["chat".to_string()].into_iter());
-        let latest = service.submit("memory", false, ["chat".to_string()].into_iter());
         let wait = |generation| {
             for _ in 0..1000 {
                 let status = service.status();
@@ -887,10 +888,17 @@ mod tests {
             }
             panic!("Background body search timed out");
         };
+        let indexed = wait(service.submit("", false, ["chat".to_string()].into_iter()));
+        assert!(indexed.error.is_empty(), "{}", indexed.error);
+        assert_eq!(indexed.indexed, 1);
+        assert!(indexed.hits.is_empty());
+        assert!(indexed.bytes_read > 0);
+        service.submit("old-query", false, ["chat".to_string()].into_iter());
+        let latest = service.submit("memory", false, ["chat".to_string()].into_iter());
         let cold = wait(latest);
         assert!(cold.error.is_empty(), "{}", cold.error);
         assert!(cold.hits.contains("chat"));
-        assert!(cold.bytes_read > 0);
+        assert_eq!(cold.bytes_read, 0);
         let warm = wait(service.submit("相机", false, ["chat".to_string()].into_iter()));
         assert!(warm.hits.contains("chat"));
         assert_eq!(warm.bytes_read, 0);
