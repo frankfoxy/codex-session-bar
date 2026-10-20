@@ -1,6 +1,24 @@
 use crate::data::{Catalog, Row};
 use pinyin::ToPinyinMulti;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+pub fn ranked_matches(
+    rows: &[Row],
+    titles: &[usize],
+    bodies: &HashSet<String>,
+    searching: bool,
+) -> Vec<usize> {
+    let titles: HashSet<_> = titles.iter().copied().collect();
+    let mut matches: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| (titles.contains(&i) || bodies.contains(&r.id)).then_some(i))
+        .collect();
+    if searching {
+        matches.sort_by_key(|&i| (rows[i].state != "Busy", !titles.contains(&i), i));
+    }
+    matches
+}
 
 #[derive(Default)]
 pub struct ChatSearch {
@@ -132,6 +150,29 @@ fn phonetic_match(pieces: &[Vec<String>], query: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn busy_then_title_then_body_and_recency_breaks_ties() {
+        let rows: Vec<_> = ["Done", "Busy", "Done", "Busy", "Busy"]
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Row {
+                id: i.to_string(),
+                state: (*s).into(),
+                ..Row::default()
+            })
+            .collect();
+        let bodies = ["1".to_string(), "2".to_string(), "3".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            ranked_matches(&rows, &[0, 4], &bodies, true),
+            [4, 1, 3, 0, 2]
+        );
+        assert_eq!(
+            ranked_matches(&rows, &[0, 1, 2, 3, 4], &HashSet::new(), false),
+            [0, 1, 2, 3, 4]
+        );
+    }
     #[test]
     fn chinese_pinyin_initials_mixed_text_and_polyphones() {
         let title = SearchText::new("📷 GEV 重庆相机采集", "GEV 重庆相机采集");

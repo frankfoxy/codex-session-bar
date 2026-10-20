@@ -1,8 +1,9 @@
 use crate::{
+    body,
     data::{self, Catalog, Row},
     desktop::{Action, Workers},
     host, now,
-    search::ChatSearch,
+    search::{ranked_matches, ChatSearch},
     Paths, Settings, State, Stop,
 };
 use anyhow::Result;
@@ -10,7 +11,7 @@ use rand::seq::IteratorRandom;
 use serde_json::json;
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     mem::size_of,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -142,6 +143,7 @@ enum Hit {
     Dock,
     Follow,
     Exact,
+    Body,
     Quit,
 }
 #[derive(Clone)]
@@ -344,6 +346,13 @@ struct App {
     chat_filters: Vec<usize>,
     chat_search: ChatSearch,
     search_exact: bool,
+    search_body: bool,
+    body_service: Option<body::Service>,
+    body_generation: u64,
+    body_pending: bool,
+    body_state: body::Status,
+    body_hits: HashSet<String>,
+    body_only: HashSet<String>,
     chat_scroll_drag: Option<f32>,
     chat_cursor: usize,
     groups: Vec<String>,
@@ -446,6 +455,13 @@ impl App {
             chat_filters: Vec::new(),
             chat_search: ChatSearch::default(),
             search_exact: false,
+            search_body: false,
+            body_service: None,
+            body_generation: 0,
+            body_pending: false,
+            body_state: body::Status::default(),
+            body_hits: HashSet::new(),
+            body_only: HashSet::new(),
             chat_scroll_drag: None,
             chat_cursor: 0,
             groups,
@@ -729,6 +745,23 @@ impl App {
                     false,
                 );
                 let (tokens, rate, partial) = live.recent.totals();
+                area(Hit::Body, rect(384., 14., 94., 34.));
+                p.border(
+                    rect(390., 23., 16., 16.),
+                    if self.search_body { GREEN } else { MUTED },
+                    3.,
+                );
+                if self.search_body {
+                    p.line(393., 31., 397., 35., GREEN, 1.6);
+                    p.line(397., 35., 403., 27., GREEN, 1.6);
+                }
+                p.label(
+                    "Body",
+                    rect(415., 14., 58., 34.),
+                    12.,
+                    if self.search_body { GREEN } else { MUTED },
+                    false,
+                );
                 let total = format!(
                     "Total {}{} t/s  ·  {}{} TOK",
                     rate.map(|r| format!("{r:.1}")).unwrap_or("—".into()),
@@ -779,13 +812,28 @@ impl App {
                         true,
                     );
                     let label_width = if busy { width - 365. } else { width - 142. };
+                    let body_only = self.body_only.contains(&row.id);
                     p.label(
                         self.catalog.strip(&row.label),
-                        rect(49., y + 2., label_width, 34.),
+                        rect(
+                            49.,
+                            y + 2.,
+                            label_width - if body_only { 39. } else { 0. },
+                            34.,
+                        ),
                         13.,
                         TEXT,
                         false,
                     );
+                    if body_only {
+                        p.label(
+                            "Body",
+                            rect(49. + label_width - 34., y + 2., 34., 34.),
+                            10.,
+                            0x81b5d1,
+                            false,
+                        );
+                    }
                     if busy {
                         let speed = row.rate().map(|r| format!("{r:.1}")).unwrap_or("—".into());
                         let metrics = format!(
@@ -823,7 +871,9 @@ impl App {
                 }
                 if self.chat_filters.is_empty() {
                     p.label(
-                        if !self.rows.is_empty() {
+                        if self.body_pending {
+                            "Searching chat bodies…"
+                        } else if !self.rows.is_empty() {
                             "No matching chats"
                         } else if live.recent.error.is_empty() {
                             "Loading recent chats…"
@@ -849,12 +899,40 @@ impl App {
                     ""
                 };
                 p.line(16., height - 38., width - 16., height - 38., 0x354148, 1.);
-                p.label(
-                    &format!(
+                let count = if self.body_pending {
+                    format!(
+                        "Indexing {} / {} · {:.0} MiB",
+                        self.body_state.indexed,
+                        self.body_state.available,
+                        self.body_state.bytes_read as f64 / 1048576.
+                    )
+                } else if self.search_body
+                    && !self.search.trim().is_empty()
+                    && !self.body_state.error.is_empty()
+                {
+                    "Body unavailable · title results only".into()
+                } else if self.search_body && !self.search.trim().is_empty() {
+                    format!(
+                        "{} / {} chats · Body {}/{} local{}",
+                        self.chat_filters.len(),
+                        self.rows.len(),
+                        self.body_state.available,
+                        self.rows.len(),
+                        if self.body_state.skipped > 0 {
+                            " · partial"
+                        } else {
+                            ""
+                        }
+                    )
+                } else {
+                    format!(
                         "{} / {} chats{hint}",
                         self.chat_filters.len(),
                         self.rows.len()
-                    ),
+                    )
+                };
+                p.label(
+                    &count,
                     rect(16., height - 29., 240., 24.),
                     11.,
                     MUTED,
@@ -1302,9 +1380,13 @@ impl App {
             // and selection rather than resetting the user's scroll position.
             let top = self.chat_filters.get(self.scroll).copied();
             let selected = self.chat_filters.get(self.chat_cursor).copied();
-            self.chat_filters =
-                self.chat_search
-                    .filter(&self.rows, &self.search, self.search_exact);
+            self.update_body_only();
+            let next = self.filtered_chats();
+            let allowed: HashSet<_> = next.iter().copied().collect();
+            let previous: HashSet<_> = self.chat_filters.iter().copied().collect();
+            self.chat_filters.retain(|i| allowed.contains(i));
+            self.chat_filters
+                .extend(next.into_iter().filter(|i| !previous.contains(i)));
             self.scroll = top
                 .and_then(|i| self.chat_filters.iter().position(|&v| v == i))
                 .unwrap_or(self.scroll)
@@ -1313,6 +1395,22 @@ impl App {
                 .and_then(|i| self.chat_filters.iter().position(|&v| v == i))
                 .unwrap_or(self.chat_cursor)
                 .min(self.chat_filters.len().saturating_sub(1));
+        }
+        if self.body_pending {
+            if let Some(service) = &self.body_service {
+                let result = service.status();
+                if result.generation == self.body_generation {
+                    self.body_state = result;
+                    if self.body_state.complete {
+                        self.body_pending = false;
+                        self.body_hits = self.body_state.hits.clone();
+                        self.update_body_only();
+                        self.chat_filters = self.filtered_chats();
+                        self.chat_cursor = 0;
+                        self.scroll = 0;
+                    }
+                }
+            }
         }
         let host = host::bounds(live.host);
         if !self.testing {
@@ -1430,6 +1528,11 @@ impl App {
         let _ = Shell_NotifyIconW(if add { NIM_ADD } else { NIM_DELETE }, &data);
     }
     unsafe fn close_popup(&mut self) {
+        if let Some(service) = &self.body_service {
+            service.cancel();
+        }
+        self.body_pending = false;
+        self.body_generation = 0;
         if self.chat_scroll_drag.take().is_some() {
             let _ = ReleaseCapture();
         }
@@ -1711,6 +1814,11 @@ impl App {
         }
     }
     fn diagnostic(&self) {
+        self.paths.write(if self.testing { "rust-test-body-status.json" } else { "body-search-status.json" },
+            &json!({"enabled":self.search_body,"pending":self.body_pending,"complete":self.body_state.complete,
+                "indexed":self.body_state.indexed,"available_local":self.body_state.available,"total_chats":self.body_state.total,
+                "bytes_read":self.body_state.bytes_read,"skipped_oversized_messages":self.body_state.skipped,"error":self.body_state.error,
+                "cache_exists":self.paths.runtime.join("body-search.sqlite").exists(),"on_demand":true}));
         let live = self.snapshot();
         let current = self.current(&live);
         let (_, title, status, _, _) = unsafe { self.bar_text(&live) };
@@ -1810,6 +1918,12 @@ impl App {
                 let _ = InvalidateRect(self.popup, None, false);
                 let _ = SetFocus(self.edit);
             }
+            Hit::Body => {
+                self.search_body = !self.search_body;
+                self.filter_fixed();
+                let _ = InvalidateRect(self.popup, None, false);
+                let _ = SetFocus(self.edit);
+            }
             Hit::Quit => {
                 self.quit = true;
                 self.stop.store(true, Ordering::Relaxed);
@@ -1833,11 +1947,55 @@ impl App {
     }
     fn filter_fixed(&mut self) {
         self.chat_search.sync(&self.rows, &self.catalog);
-        self.chat_filters = self
-            .chat_search
-            .filter(&self.rows, &self.search, self.search_exact);
+        if let Some(service) = &self.body_service {
+            service.cancel();
+        }
+        self.body_hits.clear();
+        self.body_only.clear();
+        self.body_state = body::Status::default();
+        self.body_generation = 0;
+        self.body_pending = false;
+        if self.search_body
+            && self.popup_kind == Some(Popup::Recent)
+            && !self.search.trim().is_empty()
+            && !self.testing
+        {
+            let service = self
+                .body_service
+                .get_or_insert_with(|| body::Service::new(self.paths.clone(), self.stop.clone()));
+            self.body_generation = service.submit(
+                &self.search,
+                self.search_exact,
+                self.rows.iter().map(|r| r.id.clone()),
+            );
+            self.body_pending = true;
+        }
+        self.chat_filters = self.filtered_chats();
         self.chat_cursor = 0;
         self.scroll = 0;
+    }
+    fn filtered_chats(&self) -> Vec<usize> {
+        if self.body_pending {
+            return Vec::new();
+        }
+        let titles = self
+            .chat_search
+            .filter(&self.rows, &self.search, self.search_exact);
+        ranked_matches(
+            &self.rows,
+            &titles,
+            &self.body_hits,
+            !self.search.trim().is_empty(),
+        )
+    }
+    fn update_body_only(&mut self) {
+        let titles: HashSet<_> = self
+            .chat_search
+            .filter(&self.rows, &self.search, self.search_exact)
+            .into_iter()
+            .map(|i| self.rows[i].id.clone())
+            .collect();
+        self.body_only = self.body_hits.difference(&titles).cloned().collect();
     }
     fn move_fixed_cursor(&mut self, delta: isize) {
         self.chat_cursor = self
@@ -1854,6 +2012,9 @@ impl App {
     fn fixed_hit_at(&self, x: f32, y: f32) -> Option<Hit> {
         let width = self.popup_size[0] as f32;
         if self.popup_kind == Some(Popup::Recent) {
+            if (384. ..478.).contains(&x) && (14. ..48.).contains(&y) {
+                return Some(Hit::Body);
+            }
             if (288. ..368.).contains(&x) && (14. ..48.).contains(&y) {
                 return Some(Hit::Exact);
             }
@@ -2449,6 +2610,14 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert_eq!(app.catalog.defaults.len(), 90);
         assert!(app.catalog.entries.len() > 3900);
         app.popup(Popup::Recent)?;
+        assert!(!app.search_body);
+        assert!(app.body_service.is_none());
+        assert_eq!(app.fixed_hit_at(420., 30.), Some(Hit::Body));
+        let _ = app.hit(Hit::Body);
+        assert!(app.search_body);
+        assert!(app.body_service.is_none());
+        let _ = app.hit(Hit::Body);
+        assert!(!app.search_body);
         assert_eq!(app.rows.len(), 40);
         assert_eq!(app.popup_size, [650, 448]);
         app.search = "huihuamingcheng 25".into();
@@ -2553,6 +2722,31 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             448,
             &paths.runtime.join("rust-recent-search-verification.png"),
         )?;
+        app.search_body = true;
+        app.body_hits = [rows[0].id.clone(), rows[39].id.clone()]
+            .into_iter()
+            .collect();
+        app.body_state = body::Status {
+            complete: true,
+            available: 40,
+            total: 40,
+            indexed: 40,
+            ..body::Status::default()
+        };
+        app.update_body_only();
+        app.chat_filters = app.filtered_chats();
+        assert_eq!(app.chat_filters[0], 1); // Busy + title match.
+        assert_eq!(app.chat_filters[1], 0); // Busy + body match precedes idle title matches.
+        assert_eq!(*app.chat_filters.last().unwrap(), 39);
+        capture(
+            &app,
+            Some(Popup::Recent),
+            650,
+            448,
+            &paths.runtime.join("rust-recent-body-verification.png"),
+        )?;
+        app.paths.write("rust-body-ui-test.json",&json!({"default_off":true,"no_startup_index":true,"body_checkbox":true,"busy_title_body_ranking":true,"body_match_badge":true}));
+        app.search_body = false;
         app.search.clear();
         app.filter_fixed();
         app.popup_kind = Some(Popup::Icons);

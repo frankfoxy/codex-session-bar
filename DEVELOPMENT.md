@@ -85,6 +85,24 @@ restore a hidden instance or start an exited one.
 
 ## Diagnostics and disclosure
 
+Body search is opt-in. The first nonempty Body query lazily starts one background
+worker, with 200 ms debounce and latest-query cancellation (including SQLite
+interrupts). It prefers Codex's existing `thread_items` cache, selects only
+user/agent messages, and resumes through the existing per-thread updated-ordinal
+index. Changed messages replace their old indexed chunks; checkpoints keep tied
+ordinals together. Local rollouts are the fallback, streamed through a 64 KiB
+reader with complete-line offsets committed every 8 MiB. Only visible
+user/assistant message text is retained.
+Append-only updates resume at those offsets; truncation, replacement and same-size
+rewrites invalidate the affected chat. Incomplete trailing events are retried.
+The private cache is `tmp/codex-session-bar/body-search.sqlite`: FTS5 trigram,
+`detail=none`, indexed LIKE for substrings and cached-text fallback for short words
+or literal wildcard characters. The page cache is 2 MiB; the database cap is
+256 MiB. Visible events above 4 MiB are counted as partial coverage; unavailable
+local rollouts are reflected in the footer's local-body count. No body-pinyin
+expansion is performed. Completed query results are published together; background
+status refreshes keep the chosen result order stable. Cache data is never published.
+
 `live-status.json` records runtime, PID, visible identity, quota, caches, font
 selection and docking bounds. Read bounded stderr excerpts for desktop errors.
 Never commit runtime diagnostics, credentials, settings, local databases,
