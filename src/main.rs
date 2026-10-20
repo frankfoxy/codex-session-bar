@@ -119,7 +119,7 @@ pub fn read_json(path: &Path, bound: u64) -> serde_json::Value {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub thread: String,
@@ -129,6 +129,57 @@ pub struct Settings {
     pub host_offset: Option<[i32; 2]>,
     #[serde(default)]
     pub position_version: u32,
+    #[serde(default = "default_recent_rows")]
+    pub recent_rows: usize,
+    #[serde(default)]
+    pub recent_shortcut: Shortcut,
+}
+fn default_recent_rows() -> usize { 10 }
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            thread: String::new(), auto_thread: true, host_offset: None,
+            position_version: 0, recent_rows: default_recent_rows(),
+            recent_shortcut: Shortcut::default(),
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Shortcut {
+    pub enabled: bool,
+    pub key: u16,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+impl Default for Shortcut {
+    fn default() -> Self { Self { enabled: true, key: b'J' as u16, ctrl: true, alt: true, shift: false } }
+}
+impl Shortcut {
+    pub fn valid(&self) -> bool {
+        !self.enabled || ((self.ctrl || self.alt)
+            && ((b'A' as u16..=b'Z' as u16).contains(&self.key)
+                || (b'0' as u16..=b'9' as u16).contains(&self.key)
+                || (0x70..=0x87).contains(&self.key)))
+    }
+    pub fn label(&self) -> String {
+        if !self.enabled { return "Shortcut disabled".into(); }
+        let mut parts = Vec::new();
+        if self.ctrl { parts.push("Ctrl".into()); }
+        if self.alt { parts.push("Alt".into()); }
+        if self.shift { parts.push("Shift".into()); }
+        parts.push(if (0x70..=0x87).contains(&self.key) {
+            format!("F{}", self.key - 0x70 + 1)
+        } else { char::from_u32(self.key as u32).unwrap_or('?').to_string() });
+        parts.join("+")
+    }
+    pub fn control_word(&self) -> u16 {
+        self.key | (((self.shift as u16) | ((self.ctrl as u16) << 1) | ((self.alt as u16) << 2)) << 8)
+    }
+    pub fn from_control_word(word: u16, enabled: bool) -> Self {
+        Self { enabled, key: word & 0xff, shift: word & 0x100 != 0, ctrl: word & 0x200 != 0, alt: word & 0x400 != 0 }
+    }
 }
 fn yes() -> bool {
     true
@@ -210,5 +261,36 @@ fn main() {
         }
         eprintln!("{error:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+    #[test]
+    fn older_settings_gain_defaults_without_losing_window_or_chat() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "thread":"saved-chat", "host_offset":[35,2], "auto_thread":false
+        })).unwrap();
+        assert_eq!(settings.thread, "saved-chat");
+        assert_eq!(settings.host_offset, Some([35,2]));
+        assert!(!settings.auto_thread);
+        assert_eq!(settings.recent_rows, 10);
+        assert_eq!(settings.recent_shortcut.label(), "Ctrl+Alt+J");
+    }
+    #[test]
+    fn shortcut_capture_roundtrips_and_rejects_global_plain_keys() {
+        let mut shortcut = Shortcut::from_control_word(0x274, true);
+        assert_eq!(shortcut.label(), "Ctrl+F5");
+        assert!(shortcut.valid());
+        assert_eq!(shortcut.control_word(), 0x274);
+        shortcut = Shortcut::from_control_word(b'K' as u16, true);
+        assert!(!shortcut.valid());
+        shortcut.enabled = false;
+        assert!(shortcut.valid());
+        let settings: Settings = serde_json::from_value(serde_json::json!({"recent_rows":14,"recent_shortcut":shortcut})).unwrap();
+        let restored: Settings = serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert_eq!(restored.recent_rows, 14);
+        assert_eq!(restored.recent_shortcut, settings.recent_shortcut);
     }
 }

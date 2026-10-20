@@ -4,9 +4,9 @@ use crate::{
     desktop::{Action, Workers},
     guard, host, now,
     search::{ranked_matches, ChatSearch},
-    Paths, Settings, State, Stop,
+    Paths, Settings, Shortcut, State, Stop,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rand::seq::IteratorRandom;
 use serde_json::json;
 use std::{
@@ -47,7 +47,8 @@ const MUTED: u32 = 0xa8b8c4;
 const ORANGE: u32 = 0xf5a34b;
 const GREEN: u32 = 0x65d69b;
 const NEW_RESULT: u32 = 0x70b7ff;
-const DETAILS_HEIGHT: i32 = 408;
+const DETAILS_HEIGHT: i32 = 310;
+const PREFERENCES_HEIGHT: i32 = 464;
 thread_local! {static APP:RefCell<Option<App>>=const{RefCell::new(None)};}
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
@@ -135,6 +136,11 @@ enum Hit {
     NewResults(usize),
     Grip,
     Hide,
+    Preferences,
+    Rows(i32),
+    ShortcutEnabled,
+    ApplyPreferences,
+    ResetPreferences,
     Details,
     Recent(String),
     ChatIcon(String),
@@ -168,6 +174,7 @@ enum Popup {
     Icons,
     Details,
     Fixed,
+    Preferences,
 }
 
 struct Painter {
@@ -382,6 +389,28 @@ impl Painter {
             MUTED
         };
         match hit {
+            Hit::Preferences => {
+                for i in 0..24 {
+                    let a = i as f32 * std::f32::consts::TAU / 24.;
+                    let b = (i + 1) as f32 * std::f32::consts::TAU / 24.;
+                    let radius = |n: i32| if n % 3 == 0 { 9. } else { 7. };
+                    self.line(x + 11. + a.cos() * radius(i), y + 11. + a.sin() * radius(i),
+                        x + 11. + b.cos() * radius(i + 1), y + 11. + b.sin() * radius(i + 1), c, 1.5);
+                }
+                self.border(rect(x + 8., y + 8., 6., 6.), c, 3.);
+            }
+            Hit::ApplyPreferences => {
+                self.line(x + 4., y + 11., x + 9., y + 16., GREEN, 1.8);
+                self.line(x + 9., y + 16., x + 19., y + 6., GREEN, 1.8);
+            }
+            Hit::Hide => {
+                self.line(x + 11., y + 2., x + 11., y + 13., c, 1.5);
+                self.line(x + 7., y + 9., x + 11., y + 13., c, 1.5);
+                self.line(x + 15., y + 9., x + 11., y + 13., c, 1.5);
+                self.line(x + 3., y + 16., x + 3., y + 20., c, 1.5);
+                self.line(x + 3., y + 20., x + 19., y + 20., c, 1.5);
+                self.line(x + 19., y + 20., x + 19., y + 16., c, 1.5);
+            }
             Hit::Body => {
                 self.line(x + 1., y + 3., x + 18., y + 3., c, 1.4);
                 self.line(x + 1., y + 8., x + 10., y + 8., c, 1.4);
@@ -389,7 +418,7 @@ impl Painter {
                 self.border(rect(x + 12., y + 9., 7., 7.), TEXT, 3.5);
                 self.line(x + 18., y + 15., x + 22., y + 19., TEXT, 1.5);
             }
-            Hit::Refresh => {
+            Hit::Refresh | Hit::ResetPreferences => {
                 // Two opposing arcs and aligned arrowheads form a clear refresh
                 // glyph; the old single arc resembled a power switch.
                 for start in [-165_f32, 15.] {
@@ -477,6 +506,9 @@ struct App {
     icon_panel: Option<IconPanel>,
     shortcut_registered: bool,
     shortcut_error: String,
+    shortcut_id: i32,
+    preferences_draft: Option<Settings>,
+    preferences_note: String,
     rows: Vec<Row>,
     hits: Vec<Area>,
     popup_hits: Vec<Area>,
@@ -545,13 +577,18 @@ impl Drop for Tips {
 fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
     match hit {
         Hit::Icon | Hit::ChatIcon(_) => "Change chat icon",
-        Hit::Title => "Recent chats · Ctrl+Alt+J",
+        Hit::Title => "Recent chats",
         Hit::NewResults(count) => {
             return format!("{count} newly completed chats · blue dot = unread result · open chat to mark as read")
         }
         Hit::Grip => "Drag session bar",
-        Hit::Hide => "Hide to tray · Ctrl+Alt+J to reopen",
-        Hit::Details => "Session settings",
+        Hit::Hide => "Hide to tray · restore from the tray icon or recent-chats shortcut",
+        Hit::Preferences => "Settings · list size, shortcut and extensions",
+        Hit::Rows(n) => if *n < 0 { "Show fewer rows" } else { "Show more rows" },
+        Hit::ShortcutEnabled => "Enable or disable the global recent-chats shortcut",
+        Hit::ApplyPreferences => "Apply and save settings",
+        Hit::ResetPreferences => "Restore default list size and shortcut · apply to save",
+        Hit::Details => "Session details",
         Hit::Recent(_) => "Open chat in Codex · blue dot = newly completed, unread result",
         Hit::Fixed(_) => "Use this fixed chat · blue dot = newly completed, unread result",
         Hit::ChooseFixed => "Choose a fixed chat",
@@ -578,11 +615,13 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
 impl App {
     unsafe fn new(
         paths: Paths,
-        settings: Settings,
+        mut settings: Settings,
         state: State,
         stop: Stop,
         testing: bool,
     ) -> Result<Self> {
+        settings.recent_rows = settings.recent_rows.clamp(4, 20);
+        if !settings.recent_shortcut.valid() { settings.recent_shortcut = Shortcut::default(); }
         let _ = InitCommonControlsEx(&INITCOMMONCONTROLSEX {
             dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_WIN95_CLASSES,
@@ -654,6 +693,9 @@ impl App {
             icon_panel: None,
             shortcut_registered: false,
             shortcut_error: String::new(),
+            shortcut_id: RECENT_HOTKEY,
+            preferences_draft: None,
+            preferences_note: String::new(),
             popup_layout: None,
             rows: Vec::new(),
             hits: Vec::new(),
@@ -711,14 +753,11 @@ impl App {
             w!("Microsoft YaHei UI"),
         );
         if !testing {
-            match RegisterHotKey(
-                bar,
-                RECENT_HOTKEY,
-                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
-                b'J' as u32,
-            ) {
-                Ok(()) => app.shortcut_registered = true,
-                Err(error) => app.shortcut_error = error.to_string(),
+            if app.settings.recent_shortcut.enabled {
+                match app.register_shortcut(app.shortcut_id, &app.settings.recent_shortcut) {
+                    Ok(()) => app.shortcut_registered = true,
+                    Err(error) => app.shortcut_error = error.to_string(),
+                }
             }
             app.tray(true);
             SetTimer(bar, 1, 80, None);
@@ -727,6 +766,72 @@ impl App {
     }
     fn snapshot(&self) -> crate::Shared {
         self.state.lock().unwrap().clone()
+    }
+    unsafe fn register_shortcut(&self, id: i32, shortcut: &Shortcut) -> Result<()> {
+        let mut modifiers = MOD_NOREPEAT;
+        if shortcut.ctrl { modifiers |= MOD_CONTROL; }
+        if shortcut.alt { modifiers |= MOD_ALT; }
+        if shortcut.shift { modifiers |= MOD_SHIFT; }
+        RegisterHotKey(self.bar, id, modifiers, shortcut.key as u32)?;
+        Ok(())
+    }
+    fn list_page_rows(&self) -> usize {
+        if self.popup_kind == Some(Popup::Recent) {
+            ((self.popup_size[1] - 92) / 43).clamp(1, 20) as usize
+        } else { 8 }
+    }
+    unsafe fn recent_panel_height(&self) -> i32 {
+        let requested = self.settings.recent_rows.clamp(4, 20) as i32;
+        if self.testing { return 92 + requested * 43; }
+        let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let monitor = MonitorFromWindow(self.bar, MONITOR_DEFAULTTONEAREST);
+        let available = if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            ((info.rcWork.bottom - info.rcWork.top) as f32 / self.dpi) as i32 - 16
+        } else { 92 + requested * 43 };
+        92 + requested.min(((available - 92) / 43).max(1)) * 43
+    }
+    fn write_settings(&self, settings: &Settings) -> Result<()> {
+        if self.testing { return Ok(()); }
+        let mut value = settings.clone();
+        let live = self.snapshot();
+        value.auto_thread = live.auto_thread;
+        value.thread = live.fixed_thread;
+        value.position_version = 3;
+        let pending = self.paths.runtime.join("rust-settings.pending");
+        std::fs::write(&pending, serde_json::to_vec_pretty(&value)?)
+            .context("Could not write settings")?;
+        std::fs::rename(pending, self.paths.app.join("settings.json"))
+            .context("Could not save settings")?;
+        Ok(())
+    }
+    unsafe fn apply_preferences(&mut self) -> Result<()> {
+        let mut next = self.preferences_draft.clone().context("Settings are not open")?;
+        let word = SendMessageW(self.edit, HKM_GETHOTKEY, WPARAM(0), LPARAM(0)).0 as u16;
+        next.recent_shortcut = Shortcut::from_control_word(word, next.recent_shortcut.enabled);
+        anyhow::ensure!(next.recent_shortcut.valid(), "Use Ctrl or Alt with a letter, number or F1–F24");
+        next.recent_rows = next.recent_rows.clamp(4, 20);
+        let changed = next.recent_shortcut != self.settings.recent_shortcut;
+        let new_registration = !self.testing && next.recent_shortcut.enabled && (changed || !self.shortcut_registered);
+        let next_id = if self.shortcut_id == RECENT_HOTKEY { RECENT_HOTKEY + 1 } else { RECENT_HOTKEY };
+        if new_registration {
+            self.register_shortcut(next_id, &next.recent_shortcut)
+                .context("Shortcut unavailable; the previous shortcut is unchanged")?;
+        }
+        if let Err(error) = self.write_settings(&next) {
+            if new_registration { let _ = UnregisterHotKey(self.bar, next_id); }
+            return Err(error);
+        }
+        if !self.testing && (changed || new_registration) {
+            if self.shortcut_registered { let _ = UnregisterHotKey(self.bar, self.shortcut_id); }
+            self.shortcut_registered = next.recent_shortcut.enabled;
+            if new_registration { self.shortcut_id = next_id; }
+            self.shortcut_error.clear();
+        }
+        self.settings = next.clone();
+        self.preferences_draft = Some(next);
+        self.preferences_note = "Saved · changes are active".into();
+        self.diagnostic();
+        Ok(())
     }
     fn identity(&self, live: &crate::Shared) -> String {
         if live.auto_thread {
@@ -936,9 +1041,8 @@ impl App {
                 p.line(x + 8., 15., x + 12., 19., MUTED, 1.4);
                 p.line(x + 12., 19., x + 16., 15., MUTED, 1.4);
                 x += 29.;
-                area(Hit::Hide, rect(x, 3., 25., 28.));
-                p.line(x + 8., 13., x + 16., 21., MUTED, 1.3);
-                p.line(x + 16., 13., x + 8., 21., MUTED, 1.3);
+                area(Hit::Preferences, rect(x, 3., 25., 28.));
+                p.action_icon(&Hit::Preferences, x + 2., 6.);
             }
             Some(Popup::Recent) => {
                 p.fill(rect(12., 9., 244., 30.), 0x1c2125, 6.);
@@ -992,7 +1096,7 @@ impl App {
                     .chat_filters
                     .iter()
                     .skip(self.scroll)
-                    .take(8)
+                    .take(self.list_page_rows())
                     .enumerate()
                 {
                     let row = &self.rows[index];
@@ -1137,11 +1241,13 @@ impl App {
                         false,
                     );
                 }
-                if self.chat_filters.len() > 8 {
-                    let thumb = (337. * 8. / self.chat_filters.len() as f32).max(20.);
+                let page_rows = self.list_page_rows();
+                let track_height = page_rows as f32 * 43. - 7.;
+                if self.chat_filters.len() > page_rows {
+                    let thumb = (track_height * page_rows as f32 / self.chat_filters.len() as f32).max(20.);
                     let offset =
-                        (337. - thumb) * self.scroll as f32 / (self.chat_filters.len() - 8) as f32;
-                    p.fill(rect(width - 11., 50., 4., 337.), 0x303c44, 2.);
+                        (track_height - thumb) * self.scroll as f32 / (self.chat_filters.len() - page_rows) as f32;
+                    p.fill(rect(width - 11., 50., 4., track_height), 0x303c44, 2.);
                     p.fill(rect(width - 11., 50. + offset, 4., thumb), 0x6f8b9d, 2.);
                 }
                 let hint = if live.recent.stale || now() - live.recent.loaded_at > 10. {
@@ -1546,6 +1652,7 @@ impl App {
                 for (hit, x) in [
                     (Hit::Refresh, 16.),
                     (Hit::Dock, 58.),
+                    (Hit::Preferences, 100.),
                     (Hit::Quit, width - 52.),
                 ] {
                     if hit == Hit::Refresh {
@@ -1567,31 +1674,64 @@ impl App {
                     false,
                 );
                 p.label(
-                    "Ctrl+Alt+J: recent chats · × hides to tray",
+                    &format!("{}: recent chats · hide from settings or tray", self.settings.recent_shortcut.label()),
                     rect(16., 270., width - 32., 25.),
                     11.,
                     MUTED,
                     false,
                 );
-                p.line(16., 305., width - 16., 305., 0x3b484f, 1.);
+            }
+            Some(Popup::Preferences) => {
+                let draft = self.preferences_draft.as_ref().unwrap_or(&self.settings);
+                p.label("Settings", rect(16., 8., width - 120., 28.), 14., TEXT, false);
+                p.label(concat!("v", env!("CARGO_PKG_VERSION")), rect(width - 75., 8., 60., 28.), 11., MUTED, false);
+                p.label("Recent chats", rect(20., 46., width - 40., 24.), 12., MUTED, false);
+                p.label("Visible rows", rect(20., 78., 260., 30.), 13., TEXT, false);
+                p.fill(rect(width - 150., 78., 130., 30.), 0x1c2125, 6.);
+                for (delta, x) in [(-1, width - 146.), (1, width - 54.)] {
+                    area(Hit::Rows(delta), rect(x, 78., 30., 30.));
+                    p.line(x + 10., 93., x + 20., 93., MUTED, 1.5);
+                    if delta > 0 { p.line(x + 15., 88., x + 15., 98., MUTED, 1.5); }
+                }
+                p.label(&draft.recent_rows.to_string(), rect(width - 108., 78., 50., 30.), 13., TEXT, false);
+                p.label("4–20 rows · all chats remain available by scrolling", rect(20., 113., width - 40., 24.), 11., MUTED, false);
+                p.line(20., 145., width - 20., 145., 0x354148, 1.);
+                p.label("Global shortcut", rect(20., 156., width - 95., 28.), 13., TEXT, false);
+                area(Hit::ShortcutEnabled, rect(width - 72., 155., 52., 30.));
+                p.toggle(width - 60., 162., draft.recent_shortcut.enabled);
+                p.label("Open recent chats", rect(20., 195., 220., 30.), 12., MUTED, false);
+                p.border(rect(247., 193., width - 267., 34.), 0x475b66, 5.);
+                if self.testing {
+                    p.label(&draft.recent_shortcut.label(), rect(258., 194., width - 289., 32.), 12., TEXT, false);
+                }
+                p.label("Click the field, then press Ctrl / Alt + a letter, number or F-key", rect(20., 231., width - 40., 24.), 11., MUTED, false);
+                p.label(&self.preferences_note, rect(20., 260., width - 40., 30.), 11.,
+                    if self.preferences_note.starts_with("Saved") { GREEN } else { ORANGE }, false);
+                for (hit, x) in [(Hit::Hide, 16.), (Hit::ResetPreferences, 58.), (Hit::Quit, 100.), (Hit::ApplyPreferences, width - 52.)] {
+                    p.fill(rect(x, 300., 36., 32.), if hit == Hit::ApplyPreferences { 0x293f37 } else { 0x293238 }, 5.);
+                    area(hit.clone(), rect(x, 300., 36., 32.));
+                    p.border(rect(x, 300., 36., 32.), 0x47535b, 5.);
+                    p.action_icon(&hit, x + 6., 306.);
+                }
+                p.line(16., 352., width - 16., 352., 0x3b484f, 1.);
                 p.label(
                     "Extensions",
-                    rect(20., 310., width - 40., 25.),
+                    rect(20., 358., width - 40., 25.),
                     12.,
                     MUTED,
                     false,
                 );
-                let guard_row = rect(16., 340., width - 32., 31.);
+                let guard_row = rect(16., 391., width - 32., 31.);
                 p.fill(guard_row, 0x293238, 6.);
                 area(Hit::Guard, guard_row);
                 p.label(
                     "Codex Git memory protection",
-                    rect(27., 340., width - 100., 31.),
+                    rect(27., 391., width - 100., 31.),
                     12.,
                     TEXT,
                     false,
                 );
-                p.toggle(width - 60., 348., live.guard.enabled);
+                p.toggle(width - 60., 399., live.guard.enabled);
                 p.label(
                     &format!(
                         "{} · {} processes / {:.0} GiB · 5s",
@@ -1599,7 +1739,7 @@ impl App {
                         live.guard.max_processes,
                         live.guard.max_private_mib as f64 / 1024.
                     ),
-                    rect(20., 373., width - 40., 25.),
+                    rect(20., 426., width - 40., 25.),
                     11.,
                     if live.guard.available { MUTED } else { ORANGE },
                     false,
@@ -1652,7 +1792,9 @@ impl App {
                         right: (a.r.right * scale).round() as i32,
                         bottom: (a.r.bottom * scale).round() as i32,
                     },
-                    wide(&tip_text(&a.hit, &self.catalog)),
+                    wide(&if a.hit == Hit::Title {
+                        format!("Recent chats · {}", self.settings.recent_shortcut.label())
+                    } else { tip_text(&a.hit, &self.catalog) }),
                 )
             })
             .collect();
@@ -1784,7 +1926,7 @@ impl App {
         let identity = self.identity(&live);
         if identity != self.last_identity {
             self.last_identity = identity;
-            if self.popup_kind.is_some() {
+            if self.popup_kind.is_some() && self.popup_kind != Some(Popup::Preferences) {
                 self.close_popup();
             }
         }
@@ -1811,7 +1953,7 @@ impl App {
             self.scroll = top
                 .and_then(|i| self.chat_filters.iter().position(|&v| v == i))
                 .unwrap_or(self.scroll)
-                .min(self.chat_filters.len().saturating_sub(8));
+                .min(self.chat_filters.len().saturating_sub(self.list_page_rows()));
             self.chat_cursor = selected
                 .and_then(|i| self.chat_filters.iter().position(|&v| v == i))
                 .unwrap_or(self.chat_cursor)
@@ -1945,7 +2087,7 @@ impl App {
             let _ = InvalidateRect(self.bar, None, false);
             if matches!(
                 self.popup_kind,
-                Some(Popup::Recent) | Some(Popup::Details) | Some(Popup::Fixed)
+                Some(Popup::Recent) | Some(Popup::Details) | Some(Popup::Fixed) | Some(Popup::Preferences)
             ) {
                 let _ = InvalidateRect(self.popup, None, false);
             }
@@ -2356,12 +2498,24 @@ impl App {
         self.popup_size = match kind {
             Popup::Recent => {
                 self.rows = live.recent.rows.clone();
-                [560, 436]
+                [560, self.recent_panel_height()]
             }
             Popup::Icons => [384, 450],
             Popup::Details => [560, DETAILS_HEIGHT],
             Popup::Fixed => [560, 500],
+            Popup::Preferences => [560, PREFERENCES_HEIGHT],
         };
+        if kind == Popup::Preferences {
+            self.preferences_draft = Some(self.settings.clone());
+            self.preferences_note = self.shortcut_error.clone();
+            self.edit = CreateWindowExW(
+                WINDOW_EX_STYLE(0), w!("msctls_hotkey32"), w!(""),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP, 258, 198, 278, 24,
+                self.popup, HMENU(104isize as *mut _), GetModuleHandleW(None)?, None,
+            )?;
+            SendMessageW(self.edit, HKM_SETHOTKEY, WPARAM(self.settings.recent_shortcut.control_word() as usize), LPARAM(0));
+            let _ = EnableWindow(self.edit, self.settings.recent_shortcut.enabled);
+        }
         if kind == Popup::Icons {
             self.scroll = 0;
             self.search.clear();
@@ -2557,6 +2711,8 @@ impl App {
                 (self.edit, 27, 55, 506, 24)
             } else if self.popup_kind == Some(Popup::Recent) {
                 (self.edit, 23, 13, 218, 22)
+            } else if self.popup_kind == Some(Popup::Preferences) {
+                (self.edit, 258, 198, 278, 24)
             } else {
                 (self.edit, 14, 49, 190, 29)
             },
@@ -2575,24 +2731,11 @@ impl App {
         }
     }
     fn settings(&self) {
-        if self.testing {
-            return;
-        }
-        let mut value = self.settings.clone();
-        let live = self.snapshot();
-        value.auto_thread = live.auto_thread;
-        value.thread = live.fixed_thread;
-        value.position_version = 3;
-        let pending = self.paths.runtime.join("rust-settings.pending");
-        if let Ok(b) = serde_json::to_vec_pretty(&value) {
-            if std::fs::write(&pending, b).is_ok() {
-                let _ = std::fs::rename(pending, self.paths.app.join("settings.json"));
-            }
-        }
+        let _ = self.write_settings(&self.settings);
     }
     fn diagnostic(&self) {
         self.paths.write(if self.testing { "rust-test-shortcut-status.json" } else { "shortcut-status.json" },
-            &json!({"binding":"Ctrl+Alt+J","registered":self.shortcut_registered,"error":self.shortcut_error}));
+            &json!({"binding":self.settings.recent_shortcut.label(),"enabled":self.settings.recent_shortcut.enabled,"recent_visible_rows":self.settings.recent_rows,"registered":self.shortcut_registered,"error":self.shortcut_error}));
         self.paths.write(if self.testing { "rust-test-body-status.json" } else { "body-search-status.json" },
             &json!({"enabled":self.search_body,"pending":self.body_pending,"indexing":self.index_pending,"complete":self.body_state.complete,
                 "local_only":true,"progress_percent":self.body_state.progress_percent(),
@@ -2606,6 +2749,32 @@ impl App {
     }
     unsafe fn hit(&mut self, hit: Hit) -> Option<Action> {
         match hit {
+            Hit::Preferences => { let _ = self.popup(Popup::Preferences); }
+            Hit::Rows(delta) => {
+                if let Some(draft) = self.preferences_draft.as_mut() {
+                    draft.recent_rows = (draft.recent_rows as i32 + delta).clamp(4, 20) as usize;
+                    self.preferences_note = "Apply to save changes".into();
+                }
+            }
+            Hit::ShortcutEnabled => {
+                if let Some(draft) = self.preferences_draft.as_mut() {
+                    draft.recent_shortcut.enabled = !draft.recent_shortcut.enabled;
+                    let _ = EnableWindow(self.edit, draft.recent_shortcut.enabled);
+                    self.preferences_note = "Apply to save changes".into();
+                }
+            }
+            Hit::ResetPreferences => {
+                if let Some(draft) = self.preferences_draft.as_mut() {
+                    draft.recent_rows = 10;
+                    draft.recent_shortcut = Shortcut::default();
+                    SendMessageW(self.edit, HKM_SETHOTKEY, WPARAM(draft.recent_shortcut.control_word() as usize), LPARAM(0));
+                    let _ = EnableWindow(self.edit, true);
+                    self.preferences_note = "Defaults restored · apply to save".into();
+                }
+            }
+            Hit::ApplyPreferences => {
+                if let Err(error) = self.apply_preferences() { self.preferences_note = format!("{error:#}"); }
+            }
             Hit::Title | Hit::NewResults(_) => {
                 let _ = self.popup(Popup::Recent);
             }
@@ -2838,8 +3007,8 @@ impl App {
         if self.chat_cursor < self.scroll {
             self.scroll = self.chat_cursor;
         }
-        if self.chat_cursor >= self.scroll + 8 {
-            self.scroll = self.chat_cursor - 7;
+        if self.chat_cursor >= self.scroll + self.list_page_rows() {
+            self.scroll = self.chat_cursor + 1 - self.list_page_rows();
         }
     }
     fn fixed_hit_at(&self, x: f32, y: f32) -> Option<Hit> {
@@ -2852,7 +3021,7 @@ impl App {
                 return Some(Hit::Refresh);
             }
             if !(12. ..width - 18.).contains(&x)
-                || !(48. ..392.).contains(&y)
+                || !(48. ..48. + self.list_page_rows() as f32 * 43.).contains(&y)
                 || (y - 48.) % 43. >= 39.
             {
                 return None;
@@ -2903,8 +3072,8 @@ impl App {
         match key {
             k if k == VK_UP.0 as u32 => self.move_fixed_cursor(-1),
             k if k == VK_DOWN.0 as u32 => self.move_fixed_cursor(1),
-            k if k == VK_PRIOR.0 as u32 => self.move_fixed_cursor(-8),
-            k if k == VK_NEXT.0 as u32 => self.move_fixed_cursor(8),
+            k if k == VK_PRIOR.0 as u32 => self.move_fixed_cursor(-(self.list_page_rows() as isize)),
+            k if k == VK_NEXT.0 as u32 => self.move_fixed_cursor(self.list_page_rows() as isize),
             k if k == VK_RETURN.0 as u32 => {
                 if let Some(&index) = self.chat_filters.get(self.chat_cursor) {
                     let hit = if self.popup_kind == Some(Popup::Recent) {
@@ -2934,18 +3103,19 @@ impl App {
         true
     }
     fn chat_scroll_geometry(&self) -> Option<(f32, f32, f32)> {
-        if self.chat_filters.len() <= 8 {
+        let page_rows = self.list_page_rows();
+        if self.chat_filters.len() <= page_rows {
             return None;
         }
         let (top, height) = match self.popup_kind {
-            Some(Popup::Recent) => (50., 337.),
+            Some(Popup::Recent) => (50., page_rows as f32 * 43. - 7.),
             Some(Popup::Fixed) => (100., 350.),
             _ => return None,
         };
         Some((
             top,
             height,
-            (height * 8. / self.chat_filters.len() as f32).max(20.),
+            (height * page_rows as f32 / self.chat_filters.len() as f32).max(20.),
         ))
     }
     unsafe fn begin_chat_scroll(&mut self, x: f32, y: f32) -> bool {
@@ -2956,7 +3126,7 @@ impl App {
         if !(width - 17. ..width - 4.).contains(&x) || !(top..top + height).contains(&y) {
             return false;
         }
-        let offset = (height - thumb) * self.scroll as f32 / (self.chat_filters.len() - 8) as f32;
+        let offset = (height - thumb) * self.scroll as f32 / (self.chat_filters.len() - self.list_page_rows()) as f32;
         self.chat_scroll_drag = Some(if (top + offset..top + offset + thumb).contains(&y) {
             y - top - offset
         } else {
@@ -2971,9 +3141,9 @@ impl App {
             (self.chat_scroll_drag, self.chat_scroll_geometry())
         {
             self.scroll = (((y - top - grab) / (height - thumb)).clamp(0., 1.)
-                * (self.chat_filters.len() - 8) as f32)
+                * (self.chat_filters.len() - self.list_page_rows()) as f32)
                 .round() as usize;
-            self.chat_cursor = self.chat_cursor.clamp(self.scroll, self.scroll + 7);
+            self.chat_cursor = self.chat_cursor.clamp(self.scroll, self.scroll + self.list_page_rows() - 1);
             let _ = InvalidateRect(self.popup, None, false);
         }
     }
@@ -3005,8 +3175,8 @@ unsafe extern "system" fn wndproc(
         let x = (lparam.0 as i16) as f32 / scale;
         let y = ((lparam.0 >> 16) as i16) as f32 / scale;
         match message {
-            WM_HOTKEY if is_bar && wparam.0 == RECENT_HOTKEY as usize => {
-                app.recent_shortcut();
+            WM_HOTKEY if is_bar && wparam.0 == app.shortcut_id as usize => {
+                if app.popup_kind != Some(Popup::Preferences) { app.recent_shortcut(); }
                 Some(LRESULT(0))
             }
             WM_MOUSEACTIVATE if is_bar => Some(LRESULT(MA_NOACTIVATE as isize)),
@@ -3124,13 +3294,13 @@ unsafe extern "system" fn wndproc(
             {
                 let delta = ((wparam.0 >> 16) as i16) as i32;
                 app.scroll = if delta < 0 {
-                    (app.scroll + 3).min(app.chat_filters.len().saturating_sub(8))
+                    (app.scroll + 3).min(app.chat_filters.len().saturating_sub(app.list_page_rows()))
                 } else {
                     app.scroll.saturating_sub(3)
                 };
                 app.chat_cursor = app.chat_cursor.clamp(
                     app.scroll,
-                    (app.scroll + 7).min(app.chat_filters.len().saturating_sub(1)),
+                    (app.scroll + app.list_page_rows() - 1).min(app.chat_filters.len().saturating_sub(1)),
                 );
                 let _ = InvalidateRect(app.popup, None, false);
                 Some(LRESULT(0))
@@ -3162,6 +3332,9 @@ unsafe extern "system" fn wndproc(
                     let len = GetWindowTextW(app.edit, &mut text);
                     app.search = String::from_utf16_lossy(&text[..len as usize]);
                     app.filter_fixed();
+                    let _ = InvalidateRect(app.popup, None, false);
+                } else if id == 104 && code == EN_CHANGE {
+                    app.preferences_note = "Apply to save changes".into();
                     let _ = InvalidateRect(app.popup, None, false);
                 }
                 Some(LRESULT(0))
@@ -3198,6 +3371,8 @@ unsafe extern "system" fn wndproc(
                 } else if event == WM_RBUTTONUP {
                     if let Ok(menu) = CreatePopupMenu() {
                         let _ = AppendMenuW(menu, MF_STRING, 1, w!("Open session bar"));
+                        let _ = AppendMenuW(menu, MF_STRING, 3, w!("Settings"));
+                        let _ = AppendMenuW(menu, MF_STRING, 4, w!("Hide to tray"));
                         let _ = AppendMenuW(menu, MF_STRING, 2, w!("Quit session bar"));
                         let mut point = POINT::default();
                         let _ = GetCursorPos(&mut point);
@@ -3217,6 +3392,12 @@ unsafe extern "system" fn wndproc(
                             app.tick();
                         } else if chosen.0 == 2 {
                             let _ = app.hit(Hit::Quit);
+                        } else if chosen.0 == 3 {
+                            app.hidden = false;
+                            app.tick();
+                            let _ = app.popup(Popup::Preferences);
+                        } else if chosen.0 == 4 {
+                            let _ = app.hit(Hit::Hide);
                         }
                     }
                 }
@@ -3346,7 +3527,7 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
                 app.settings();
                 app.tray(false);
                 if app.shortcut_registered {
-                    let _ = UnregisterHotKey(app.bar, RECENT_HOTKEY);
+                    let _ = UnregisterHotKey(app.bar, app.shortcut_id);
                 }
                 let _ = DestroyWindow(app.popup);
                 let _ = DestroyWindow(app.bar);
@@ -3419,6 +3600,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             paths.clone(),
             Settings {
                 auto_thread: true,
+                recent_rows: 8,
                 ..Default::default()
             },
             state.clone(),
@@ -3836,15 +4018,15 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             live.guard.available = true;
             live.guard.note = "0 Git · 0 MiB · blocked 0".into();
         }
-        assert!(capture(
+        let detail_hits = capture(
             &app,
             Some(Popup::Details),
             560,
             DETAILS_HEIGHT as u32,
             &paths.runtime.join("rust-details-verification.png")
-        )?
-        .iter()
-        .any(|a| a.hit == Hit::ChooseFixed));
+        )?;
+        assert!(detail_hits.iter().any(|a| a.hit == Hit::ChooseFixed));
+        assert!(!detail_hits.iter().any(|a| a.hit == Hit::Guard));
         let before = app.snapshot();
         app.last_identity = app.identity(&before);
         app.popup(Popup::Fixed)?;
@@ -3946,6 +4128,88 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert_eq!(app.popup_kind, Some(Popup::Recent));
         app.recent_shortcut();
         assert!(app.popup_kind.is_none());
+        assert!(app.hit(Hit::Preferences).is_none());
+        assert_eq!(app.popup_kind, Some(Popup::Preferences));
+        let original_rows = app.settings.recent_rows;
+        app.hit(Hit::Rows(2));
+        assert_eq!(app.settings.recent_rows, original_rows);
+        app.close_popup();
+        app.hit(Hit::Preferences);
+        assert_eq!(app.preferences_draft.as_ref().unwrap().recent_rows, original_rows);
+        app.hit(Hit::ResetPreferences);
+        SendMessageW(app.edit, HKM_SETHOTKEY, WPARAM(b'K' as usize), LPARAM(0));
+        app.hit(Hit::ApplyPreferences);
+        assert!(!app.preferences_note.starts_with("Saved"));
+        assert_eq!(app.settings.recent_rows, original_rows);
+        let new_shortcut = Shortcut { key: b'K' as u16, ..Shortcut::default() };
+        SendMessageW(app.edit, HKM_SETHOTKEY, WPARAM(new_shortcut.control_word() as usize), LPARAM(0));
+        app.hit(Hit::ApplyPreferences);
+        assert!(app.preferences_note.starts_with("Saved"));
+        assert_eq!(app.settings.recent_rows, 10);
+        assert_eq!(app.settings.recent_shortcut.label(), "Ctrl+Alt+K");
+        app.popup(Popup::Recent)?;
+        assert_eq!(app.popup_size, [560, 522]);
+        assert_eq!(app.list_page_rows(), 10);
+        assert_eq!(app.fixed_hit_at(80., 48. + 9. * 43. + 10.), Some(Hit::Recent(rows[9].id.clone())));
+        assert!(app.begin_chat_scroll(550., 450.));
+        app.drag_chat_scroll(10000.);
+        assert_eq!(app.scroll, 30);
+        app.chat_scroll_drag = None;
+        let _ = ReleaseCapture();
+        app.scroll = 0;
+        app.chat_cursor = 0;
+        capture(&app, Some(Popup::Recent), 560, 522, &paths.runtime.join("rust-recent-configured-verification.png"))?;
+        app.popup(Popup::Preferences)?;
+        app.hit(Hit::ShortcutEnabled);
+        app.hit(Hit::ApplyPreferences);
+        assert!(!app.settings.recent_shortcut.enabled);
+        app.hit(Hit::ResetPreferences);
+        app.hit(Hit::ApplyPreferences);
+        assert_eq!(app.settings.recent_shortcut, Shortcut::default());
+        let preferences_hits = capture(&app, Some(Popup::Preferences), 560, PREFERENCES_HEIGHT as u32,
+            &paths.runtime.join("rust-preferences-verification.png"))?;
+        assert!(preferences_hits.iter().any(|a| a.hit == Hit::Guard));
+        assert!(preferences_hits.iter().any(|a| a.hit == Hit::ApplyPreferences));
+        assert!(app.hits.iter().any(|a| a.hit == Hit::Preferences));
+        assert!(!app.hits.iter().any(|a| a.hit == Hit::Hide));
+        // Exercise real Windows registration and persistence only in an isolated
+        // fixture. Existing app shortcuts and user settings remain untouched.
+        let original_paths = app.paths.clone();
+        let original_settings = app.settings.clone();
+        let fixture = paths.runtime.join(format!("preferences-native-{}", std::process::id()));
+        anyhow::ensure!(fixture.starts_with(&paths.runtime), "Invalid preference fixture");
+        std::fs::create_dir_all(&fixture)?;
+        app.paths.app = fixture.clone();
+        app.paths.runtime = fixture.clone();
+        app.testing = false;
+        app.shortcut_registered = false;
+        app.settings.recent_shortcut.enabled = false;
+        let native_shortcut = Shortcut { key: 0x87, shift: true, ..Shortcut::default() };
+        app.preferences_draft = Some(original_settings.clone());
+        SendMessageW(app.edit, HKM_SETHOTKEY, WPARAM(native_shortcut.control_word() as usize), LPARAM(0));
+        app.apply_preferences()?;
+        assert!(app.shortcut_registered);
+        assert_eq!(app.settings.recent_shortcut, native_shortcut);
+        let blocked = Shortcut { key: 0x86, ..native_shortcut.clone() };
+        app.register_shortcut(RECENT_HOTKEY + 2, &blocked)?;
+        SendMessageW(app.edit, HKM_SETHOTKEY, WPARAM(blocked.control_word() as usize), LPARAM(0));
+        assert!(app.apply_preferences().is_err());
+        assert_eq!(app.settings.recent_shortcut, native_shortcut);
+        assert!(app.register_shortcut(RECENT_HOTKEY + 3, &native_shortcut).is_err());
+        let persisted: Settings = serde_json::from_value(crate::read_json(&fixture.join("settings.json"), 16384))?;
+        assert_eq!(persisted.recent_shortcut, native_shortcut);
+        assert_eq!(persisted.recent_rows, 10);
+        let _ = UnregisterHotKey(app.bar, RECENT_HOTKEY + 2);
+        app.preferences_draft.as_mut().unwrap().recent_shortcut.enabled = false;
+        app.apply_preferences()?;
+        assert!(!app.shortcut_registered);
+        app.testing = true;
+        app.paths = original_paths;
+        app.settings = original_settings;
+        app.shortcut_id = RECENT_HOTKEY;
+        paths.write("rust-preferences-test.json", &json!({"apply_and_discard":true,"invalid_shortcut_preserves_settings":true,
+            "shortcut_enable_disable":true,"native_hotkey_conflict_preserves_previous_registration_and_file":true,
+            "default_recent_rows":10,"configured_scroll_last_row":true,"extensions_only_in_settings":true}));
         paths.write("rust-popover-shortcut-test.json", &json!({"list_window_preserved":true,"list_search_scroll_selection_preserved":true,"native_icon_click_routed":true,"icon_combo_survives_100_refreshes":true,"recent_shortcut_toggle":true,"index_percent_local_only":true,"body_snippet_highlight":true}));
         let _ = app.hit(Hit::Hide);
         assert!(app.hidden);
