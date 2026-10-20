@@ -88,6 +88,9 @@ struct Tracker {
     document: Option<IUIAutomationElement>,
     hwnd: isize,
     checked: Instant,
+    resolved_name: String,
+    resolved_id: Option<String>,
+    resolved_at: Instant,
 }
 impl Tracker {
     unsafe fn new() -> Result<Self> {
@@ -98,6 +101,9 @@ impl Tracker {
             document: None,
             hwnd: 0,
             checked: Instant::now() - Duration::from_secs(2),
+            resolved_name: String::new(),
+            resolved_id: None,
+            resolved_at: Instant::now() - Duration::from_secs(10),
         })
     }
     unsafe fn poll(&mut self, store: &Store) -> Result<(isize, Option<String>, String)> {
@@ -117,6 +123,7 @@ impl Tracker {
                 windows[0]
             };
             if h != self.hwnd || self.document.is_none() {
+                self.resolved_name.clear();
                 self.hwnd = h;
                 let root = self.ui.ElementFromHandle(HWND(h as *mut _))?;
                 let condition = self.ui.CreatePropertyCondition(
@@ -134,7 +141,14 @@ impl Tracker {
             self.document = None;
             return Ok((self.hwnd, None, String::new()));
         }
-        let id = store.resolve(&name)?;
+        let retry = if self.resolved_id.is_some() { Duration::from_secs(5) } else { Duration::from_millis(500) };
+        if self.resolved_name != name || self.resolved_at.elapsed() >= retry {
+            if let Ok(culture)=document.CurrentCulture(){crate::locale::follow(culture as u16);}
+            self.resolved_id = store.resolve(&name)?;
+            self.resolved_name = name.clone();
+            self.resolved_at = Instant::now();
+        }
+        let id = self.resolved_id.clone();
         if document.CurrentName()?.to_string() != name {
             return Ok((self.hwnd, None, String::new()));
         }
@@ -267,6 +281,7 @@ pub fn start(paths: &Paths, state: &State, stop: &Stop) -> Vec<thread::JoinHandl
                     Ok((hwnd, id, label)) => {
                         let mut live = s.lock().unwrap();
                         if live.view != id || live.view_label != label {
+                            live.refresh_events.notify();
                             live.detected_at = now();
                             if live.auto_thread {
                                 live.snapshot = None;
@@ -289,24 +304,33 @@ pub fn start(paths: &Paths, state: &State, stop: &Stop) -> Vec<thread::JoinHandl
                     }
                 }
             }
-            thread::sleep(Duration::from_millis(100));
+            let delay=s.lock().unwrap().refresh_options.host_ms;
+            thread::sleep(Duration::from_millis(delay));
         }
     }));
     let (s, done) = (state.clone(), stop.clone());
     handles.push(thread::spawn(move || unsafe {
         let mut tracker = None;
+        let mut last_geometry = None;
+        let mut layout_checked = Instant::now() - Duration::from_secs(600);
         while !done.load(Ordering::Relaxed) {
             if tracker.is_none() {
                 tracker = Tracker::new().ok();
             }
             let hwnd = s.lock().unwrap().host;
             if hwnd != 0 {
-                if let Some(t) = &tracker {
+                let geometry = bounds(hwnd).map(|r| (hwnd,r[2]-r[0],GetDpiForWindow(HWND(hwnd as *mut _))));
+                let fallback=s.lock().unwrap().refresh_options.fallback_secs;
+                if geometry!=last_geometry || layout_checked.elapsed()>=Duration::from_secs(fallback) {
+                  if let Some(t) = &tracker {
                     if let Ok(Some(slot)) = t.titlebar(hwnd) {
                         let mut live = s.lock().unwrap();
                         live.slot = Some(slot);
                         live.slot_host = hwnd;
+                        last_geometry=geometry;
+                        layout_checked=Instant::now();
                     }
+                  }
                 }
             }
             for _ in 0..10 {

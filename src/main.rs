@@ -8,6 +8,8 @@ mod guard;
 mod search;
 mod tags;
 mod ui;
+mod refresh;
+mod locale;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -138,6 +140,8 @@ pub struct Settings {
     pub compact_recent: bool,
     #[serde(default="default_title_width")]
     pub recent_title_width: u32,
+    #[serde(default)]
+    pub refresh: refresh::Settings,
 }
 fn default_recent_rows() -> usize { 10 }
 fn default_title_width()->u32{200}
@@ -149,6 +153,7 @@ impl Default for Settings {
             recent_shortcut: Shortcut::default(),
             compact_recent: false,
             recent_title_width:default_title_width(),
+            refresh:refresh::Settings::default(),
         }
     }
 }
@@ -195,6 +200,9 @@ fn yes() -> bool {
 
 #[derive(Clone, Default, Serialize)]
 pub struct Shared {
+    #[serde(skip)]
+    pub refresh_events: Arc<refresh::Events>,
+    pub refresh_options: refresh::Settings,
     pub guard: guard::View,
     pub host: isize,
     pub view: Option<String>,
@@ -251,6 +259,7 @@ fn run() -> Result<()> {
     let state = Arc::new(Mutex::new(Shared {
         auto_thread: settings.auto_thread,
         fixed_thread: settings.thread.clone(),
+        refresh_options: settings.refresh.clone(),
         recent: data::load_recent(&paths).into(),
         ..Shared::default()
     }));

@@ -3,6 +3,26 @@
 const TAG_SIDEBAR: f32 = 236.;
 const TAG_CLOUD_TOP: f32 = RECENT_TOP as f32 + 20.;
 const TAG_REGION_MAX: f32 = 128.;
+const TAG_PROJECT_MAX: f32 = 224.;
+const SIDEBAR_TIMER: usize = 0x5341;
+const SIDEBAR_DURATION_MS: u64 = 120;
+#[derive(Clone, Copy)]
+struct SidebarAnimation {
+    began: Instant,
+    from: f32,
+    to: f32,
+}
+impl SidebarAnimation {
+    fn value_at(self, time: Instant) -> f32 {
+        let t = (time.saturating_duration_since(self.began).as_secs_f32()
+            / (SIDEBAR_DURATION_MS as f32 / 1000.))
+            .clamp(0., 1.);
+        self.from + (self.to - self.from) * (1. - (1. - t).powi(3))
+    }
+    fn finished_at(self, time: Instant) -> bool {
+        time.saturating_duration_since(self.began).as_millis() >= SIDEBAR_DURATION_MS as u128
+    }
+}
 #[derive(Clone, Copy)]
 struct RecentColumns {
     title_left: f32,
@@ -54,6 +74,108 @@ fn recent_panel_x(
 }
 
 impl App {
+    unsafe fn cancel_sidebar_animation(&mut self) {
+        let _ = KillTimer(self.popup, SIDEBAR_TIMER);
+        if let Some(animation) = self.sidebar_animation.take() {
+            self.sidebar_open = animation.to > 0.;
+        }
+    }
+    unsafe fn apply_recent_region(&self, time: Instant) {
+        let scale = self.dpi;
+        let w = (self.popup_size[0] as f32 * scale).round() as i32;
+        let h = (self.popup_size[1] as f32 * scale).round() as i32;
+        let clip = self
+            .sidebar_animation
+            .map(|a| ((1. - a.value_at(time)) * TAG_SIDEBAR * scale).round() as i32)
+            .unwrap_or(0);
+        let region = CreateRoundRectRgn(
+            clip,
+            0,
+            w + 1,
+            h + 1,
+            (18. * scale) as i32,
+            (18. * scale) as i32,
+        );
+        if SetWindowRgn(self.popup, region, false) == 0 {
+            let _ = DeleteObject(region);
+        }
+    }
+    unsafe fn set_sidebar_open(&mut self, open: bool) {
+        // The conversation area is laid out only at the endpoints. Animation
+        // frames change the window's left clipping edge, never its contents.
+        // Keep the popup and conversation controls visible throughout. In
+        // particular WM_SETREDRAW(FALSE) on a top-level window removes its
+        // WS_VISIBLE style and makes DWM briefly discard the conversation.
+        self.popup_layout_batch = true;
+        self.close_tag_editor();
+        self.sidebar_open = open;
+        self.popup_size = [self.recent_width(), self.recent_panel_height()];
+        for i in 0..3 {
+            self.tag_scroll[i] = self.tag_scroll[i].min(self.tag_scroll_max(i));
+        }
+        self.scroll = self.scroll.min(
+            self.chat_filters
+                .len()
+                .saturating_sub(self.list_page_rows()),
+        );
+        self.place_popup();
+        let _ = self.ensure_tag_search();
+        self.popup_layout_batch = false;
+        let _=RedrawWindow(self.popup,None,HRGN::default(),RDW_INVALIDATE);
+    }
+    unsafe fn invalidate_sidebar_animation(&self) {
+        let sidebar=RECT { left:0, top:0, right:((TAG_SIDEBAR+2.)*self.dpi).ceil() as i32,
+            bottom:(self.popup_size[1] as f32*self.dpi).ceil() as i32 };
+        let _=RedrawWindow(self.popup,Some(&sidebar),HRGN::default(),RDW_INVALIDATE|RDW_ALLCHILDREN);
+    }
+    unsafe fn toggle_sidebar(&mut self, animate: bool) {
+        self.chat_menu=None;
+        let time = Instant::now();
+        let from = self
+            .sidebar_animation
+            .map(|a| a.value_at(time))
+            .unwrap_or(if self.sidebar_open { 1. } else { 0. });
+        let open = !self
+            .sidebar_animation
+            .map(|a| a.to > 0.)
+            .unwrap_or(self.sidebar_open);
+        self.close_icon_panel();
+        self.close_tag_editor();
+        if !animate {
+            self.sidebar_animation = None;
+            let _ = KillTimer(self.popup, SIDEBAR_TIMER);
+            self.set_sidebar_open(open);
+            return;
+        }
+        self.sidebar_animation = Some(SidebarAnimation {
+            began: time,
+            from,
+            to: if open { 1. } else { 0. },
+        });
+        if !self.sidebar_open {
+            self.set_sidebar_open(true);
+        } else {
+            self.apply_recent_region(time);
+        }
+        SetTimer(self.popup, SIDEBAR_TIMER, 16, None);
+    }
+    unsafe fn advance_sidebar_animation(&mut self, time: Instant) {
+        let Some(animation) = self.sidebar_animation else {
+            return;
+        };
+        if animation.finished_at(time) {
+            let _ = KillTimer(self.popup, SIDEBAR_TIMER);
+            self.sidebar_animation = None;
+            if animation.to == 0. {
+                self.set_sidebar_open(false);
+            } else {
+                self.apply_recent_region(time);
+            }
+        } else {
+            self.apply_recent_region(time);
+        }
+        self.invalidate_sidebar_animation();
+    }
     unsafe fn shortcut_allowed(&self) -> bool {
         self.shortcut_allowed_in(GetForegroundWindow())
     }
@@ -170,15 +292,23 @@ impl App {
                 .get(i)
                 .map(|r| r.height)
                 .unwrap_or(0.)
-                .clamp(32., TAG_REGION_MAX);
+                .clamp(
+                    32.,
+                    if i == 0 {
+                        TAG_PROJECT_MAX
+                    } else {
+                        TAG_REGION_MAX
+                    },
+                );
         }
         let budget = (available - 3. * 28.).max(36.);
         let sum: f32 = heights.iter().sum();
         if sum > budget {
             let floor = (budget / 3.).min(32.);
-            let extra: f32 = heights.iter().map(|h| h - floor).sum();
-            let ratio = ((budget - 3. * floor) / extra.max(1.)).clamp(0., 1.);
-            for h in &mut heights {
+            heights[0] = heights[0].min((budget - 2. * floor).max(floor));
+            let extra: f32 = heights[1..].iter().map(|h| h - floor).sum();
+            let ratio = ((budget - heights[0] - 2. * floor) / extra.max(1.)).clamp(0., 1.);
+            for h in &mut heights[1..] {
                 *h = floor + (*h - floor) * ratio;
             }
         }
@@ -558,7 +688,7 @@ impl App {
         rect(176., 51.5, 24., 24.)
     }
     fn pointed_row(&self) -> Option<usize> {
-        if self.tag_editor.is_some() || self.tag_overflow.is_some() {
+        if self.chat_menu.is_some() || self.tag_editor.is_some() || self.tag_overflow.is_some() {
             return None;
         }
         let (x, y) = self.list_pointer?;
@@ -623,7 +753,7 @@ impl App {
         p.border(rect(toolbar + 51., 9., 250., 32.), 0x43515a, 6.);
         p.search_icon(toolbar + 66., 23., MUTED);
         if self.testing {
-            p.label(
+            p.ui_label(
                 if self.search.is_empty() {
                     search_cue(1)
                 } else {
@@ -663,7 +793,7 @@ impl App {
             .iter()
             .filter(|&&i| self.rows[i].newly_completed())
             .count();
-        p.label(
+        p.ui_label(
             &format!(
                 "{} chats{}{}",
                 self.chat_filters.len(),
@@ -706,7 +836,7 @@ impl App {
             p.border(rect(16., 9., TAG_SIDEBAR - 32., 32.), 0x43515a, 5.);
             p.tag_icon(23., 16., MUTED, 0.66);
             if self.testing {
-                p.label(
+                p.ui_label(
                     if self.tag_query.is_empty() {
                         search_cue(2)
                     } else {
@@ -723,7 +853,7 @@ impl App {
                 area(Hit::ClearTagSearch, r);
                 p.search_clear(r, self.hover == Some(Hit::ClearTagSearch));
             }
-            p.label(
+            p.ui_label(
                 "Name · pinyin · initials",
                 rect(18., 46., TAG_SIDEBAR - 34., 19.),
                 9.,
@@ -732,7 +862,7 @@ impl App {
             );
             for (region_index, region) in self.tag_regions.iter().enumerate() {
                 let viewport = self.tag_region_viewport(region_index);
-                p.label(
+                p.ui_label(
                     ["Projects", "Groups", "Custom tags"][region_index],
                     rect(16., viewport.top - 25., TAG_SIDEBAR - 40., 22.),
                     10.,
@@ -740,7 +870,7 @@ impl App {
                     false,
                 );
                 if region.items.is_empty() {
-                    p.label(
+                    p.ui_label(
                         "—",
                         rect(20., viewport.top + 1., TAG_SIDEBAR - 40., 24.),
                         11.,
@@ -785,7 +915,7 @@ impl App {
                         false,
                     );
                     if selected {
-                        p.label("✓", rect(x + w - 16., y + 2., 13., 24.), 10., fg, false);
+                        p.ui_label("✓", rect(x + w - 16., y + 2., 13., 24.), 10., fg, false);
                     }
                     area(Hit::TagFilter(tag.key.clone()), rect(x, y, w, 28.));
                 }
@@ -951,7 +1081,7 @@ impl App {
                     MUTED,
                 );
             }
-            p.label(
+            p.ui_label(
                 &row.status_text(),
                 rect(
                     width - 85.,
@@ -1014,7 +1144,7 @@ impl App {
             if tag_layout.hidden > 0 {
                 area(Hit::TagOverflow(row.id.clone()), button);
                 p.fill(button, 0x34424a, 4.);
-                p.label("…", button, 16., TEXT, false);
+                p.ui_label("…", button, 16., TEXT, false);
             } else {
                 area(Hit::TagEdit(row.id.clone()), button);
                 p.border(
@@ -1041,7 +1171,7 @@ impl App {
             }
         }
         if self.chat_filters.is_empty() {
-            p.label(
+            p.ui_label(
                 if self.body_pending {
                     "Searching chat bodies…"
                 } else {
@@ -1070,20 +1200,20 @@ impl App {
         ];
         let lw: f32 = legend
             .iter()
-            .map(|(text, _)| p.width(text, 10.) + 31.)
+            .map(|(text, _)| p.width(crate::locale::text(text).as_ref(), 10.) + 31.)
             .sum();
         let mut lx = width - 16. - lw;
         let (tok, rate, partial) = live.recent.totals();
-        let total = format!(
+        let total = crate::locale::text(&format!(
             "Total {}{} t/s · {} TOK",
             rate.map(|v| format!("{v:.1}")).unwrap_or("—".into()),
             if partial { "*" } else { "" },
             data::compact(tok)
-        );
+        )).into_owned();
         let tw = p.width(&total, 10.);
         let tx = lx - 14. - tw;
-        p.label(
-            &format!(
+        p.ui_label(
+            &if !self.copy_note.is_empty(){self.copy_note.clone()}else{format!(
                 "{} / {} chats · Index {:.0}%{}",
                 self.chat_filters.len(),
                 self.rows.len(),
@@ -1093,7 +1223,7 @@ impl App {
                 } else {
                     " · retry pending"
                 }
-            ),
+            )},
             rect(16., height - 29., (tx - 28.).max(30.), 24.),
             10.,
             MUTED,
@@ -1107,10 +1237,11 @@ impl App {
             false,
         );
         for (text, kind) in legend {
-            let w = p.width(text, 10.) + 26.;
+            let text=crate::locale::text(text);
+            let w = p.width(&text, 10.) + 26.;
             self.paint_tag(
                 &tags::Tag {
-                    label: text.into(),
+                    label: text.into_owned(),
                     kind,
                     ..Default::default()
                 },
@@ -1128,7 +1259,7 @@ impl App {
             p.fill(r, 0x2a3237, 9.);
             p.border(r, 0x52646f, 9.);
             let (chips, content_height) = self.tag_overflow_chips();
-            p.label(
+            p.ui_label(
                 &format!("All tags · {}", chips.len()),
                 rect(x + 14., y + 6., w - 110., 28.),
                 14.,
@@ -1206,7 +1337,7 @@ impl App {
             area(Hit::TagBackground, r);
             p.fill(r, 0x2a3237, 9.);
             p.border(r, 0x52646f, 9.);
-            p.label(
+            p.ui_label(
                 "Chat tags",
                 rect(x + 14., y + 7., w - 55., 28.),
                 14.,
@@ -1215,7 +1346,7 @@ impl App {
             );
             area(Hit::TagClose, rect(x + w - 39., y + 6., 30., 28.));
             p.action_icon(&Hit::Clear, x + w - 34., y + 9.);
-            p.label(
+            p.ui_label(
                 "Project / group · synced, read-only",
                 rect(x + 14., y + 36., w - 28., 22.),
                 10.,
@@ -1233,7 +1364,7 @@ impl App {
                     }
                 }
             }
-            p.label(
+            p.ui_label(
                 "Custom tags",
                 rect(x + 14., y + 87., w - 28., 22.),
                 11.,
@@ -1256,7 +1387,7 @@ impl App {
                     .get(id)
                     .is_some_and(|keys| keys.contains(&tag.key));
                 let tw = (p.width(&tag.label, 11.) + 40.).min(w - 30.);
-                p.label(
+                p.ui_label(
                     if selected { "✓" } else { "+" },
                     rect(x + 16., ty, 20., 22.),
                     12.,
@@ -1277,7 +1408,7 @@ impl App {
                 let _ = tw;
             }
             if self.custom_tags.definitions.is_empty() {
-                p.label(
+                p.ui_label(
                     "Create your first custom tag below",
                     rect(x + 15., y + 115., w - 30., 24.),
                     11.,
@@ -1296,7 +1427,7 @@ impl App {
             p.fill(rect(x + 14., y + h - 53., w - 62., 29.), 0x1c2125, 5.);
             p.border(rect(x + 14., y + h - 53., w - 62., 29.), 0x52646f, 5.);
             if self.testing {
-                p.label(
+                p.ui_label(
                     if self.tag_draft.is_empty() {
                         "Add or select a tag…"
                     } else {
@@ -1309,14 +1440,14 @@ impl App {
                 );
             }
             area(Hit::TagAdd, rect(x + w - 41., y + h - 53., 28., 29.));
-            p.label(
+            p.ui_label(
                 "+",
                 rect(x + w - 35., y + h - 53., 24., 29.),
                 20.,
                 TEXT,
                 false,
             );
-            p.label(
+            p.ui_label(
                 &self.tag_note,
                 rect(x + 14., y + h - 24., w - 28., 19.),
                 10.,
@@ -1324,6 +1455,7 @@ impl App {
                 false,
             );
         }
+        self.draw_chat_menu(&mut hits);
         hits
     }
     unsafe fn close_tag_editor(&mut self) {
@@ -1375,6 +1507,7 @@ impl App {
                 LPARAM(1),
             );
             let _ = SetWindowTheme(self.tag_input, w!("DarkMode_CFD"), PCWSTR::null());
+            let _=SendMessageW(self.tag_input,EM_SETCUEBANNER,WPARAM(1),LPARAM(wide_ui("Add or select a tag…").as_ptr() as isize));
             let _ = SetFocus(self.tag_input);
         }
         Ok(())
@@ -1774,6 +1907,10 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     let regions = (0..3)
         .map(|i| app.tag_region_viewport(i))
         .collect::<Vec<_>>();
+    assert!(
+        regions[0].bottom - regions[0].top > TAG_REGION_MAX,
+        "Projects receive a larger viewport than other categories"
+    );
     assert!((0..3).all(|i| app.tag_scroll_max(i) > 0.));
     app.scroll_tag_region(0, 48.);
     assert!(app.tag_scroll[0] > 0.);
@@ -1788,7 +1925,12 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
         let r = app.tag_region_viewport(i);
         r.top == regions[i].top
             && r.bottom == regions[i].bottom
-            && r.bottom - r.top <= TAG_REGION_MAX
+            && r.bottom - r.top
+                <= if i == 0 {
+                    TAG_PROJECT_MAX
+                } else {
+                    TAG_REGION_MAX
+                }
     }));
     let r = app.tag_region_viewport(0);
     assert!(app.begin_tag_scroll(TAG_SIDEBAR - 6., r.top + 10.));
@@ -2294,6 +2436,152 @@ unsafe fn verify_tag_overflow(app: &mut App, paths: &Paths) -> Result<()> {
     app.sidebar_open = false;
     app.popup_size[0] = 1040;
     paths.write("rust-tag-overflow-test.json",&json!({"two_rows":true,"more_than_three_tags":true,"ellipsis_after_last_chip":true,"all_assigned_tags_shown":true,"overflow_scroll_to_last_tag":true,"filter_hit_targets":true,"escape_preserves_list_search_cursor_scroll":true,"editor_keeps_list_open":true,"narrow_and_sidebar_layouts":true}));
+    Ok(())
+}
+
+unsafe fn verify_sidebar_animation(app: &mut App, paths: &Paths) -> Result<()> {
+    app.close_popup();
+    app.sidebar_open = false;
+    app.settings.compact_recent = false;
+    app.popup(Popup::Recent)?;
+    let original_bar = host::bounds(app.bar.0 as isize).unwrap();
+    let _ = SetWindowPos(
+        app.bar,
+        HWND_TOPMOST,
+        (360. * app.dpi) as i32,
+        (40. * app.dpi) as i32,
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+    app.place_popup();
+    let search = host::bounds(app.edit.0 as isize).unwrap();
+    let collapsed = host::bounds(app.popup.0 as isize).unwrap();
+    let chat_x = collapsed[0] + (app.recent_left() * app.dpi).round() as i32;
+    let saved = (
+        app.search.clone(),
+        app.scroll,
+        app.chat_cursor,
+        app.chat_filters.clone(),
+    );
+    for open in [true, false] {
+        app.toggle_sidebar(true);
+        let animation = app.sidebar_animation.unwrap();
+        assert_eq!(animation.to, if open { 1. } else { 0. });
+        let expanded = host::bounds(app.popup.0 as isize).unwrap();
+        let mut previous_clip = if open { i32::MAX } else { 0 };
+        for step in 0..=8 {
+            let time = animation.began + std::time::Duration::from_millis(step * 15);
+            let _=ValidateRect(app.popup,None);
+            app.advance_sidebar_animation(time);
+            if step<8 {
+                let mut dirty=RECT::default();
+                if GetUpdateRect(app.popup,Some(&mut dirty),false).as_bool() {
+                    assert!(dirty.right<=((TAG_SIDEBAR+2.)*app.dpi).ceil() as i32,"Animation must not invalidate the conversation list");
+                }
+            }
+            let bounds = host::bounds(app.popup.0 as isize).unwrap();
+            assert_eq!(host::bounds(app.edit.0 as isize).unwrap(), search);
+            assert_eq!(
+                bounds[0] + (app.recent_left() * app.dpi).round() as i32,
+                chat_x
+            );
+            if step < 8 || open {
+                assert_eq!(bounds, expanded, "Only the clip changes during animation");
+            }
+            let region = CreateRectRgn(0, 0, 0, 0);
+            assert_ne!(GetWindowRgn(app.popup, region).0, 0);
+            let mut region_bounds = RECT::default();
+            GetRgnBox(region, &mut region_bounds);
+            let _ = DeleteObject(region);
+            if step < 8 || open {
+                if open {
+                    assert!(region_bounds.left <= previous_clip);
+                } else {
+                    assert!(region_bounds.left >= previous_clip);
+                }
+                previous_clip = region_bounds.left;
+            }
+            for (hit, x) in [
+                (Hit::TagSidebar, 27.),
+                (Hit::Body, 340.),
+                (Hit::Compact, 410.),
+                (Hit::Refresh, 470.),
+            ] {
+                let local = app.recent_toolbar_left() + x;
+                assert_eq!(app.fixed_hit_at(local, 25.), Some(hit));
+                assert_eq!(
+                    bounds[0] + (local * app.dpi).round() as i32,
+                    collapsed[0] + (x * app.dpi).round() as i32
+                );
+            }
+        }
+        assert!(app.sidebar_animation.is_none());
+        assert_eq!(app.sidebar_open, open);
+    }
+    app.toggle_sidebar(true);
+    app.sidebar_animation.as_mut().unwrap().began =
+        Instant::now() - std::time::Duration::from_millis(45);
+    let progress = app.sidebar_animation.unwrap().value_at(Instant::now());
+    app.toggle_sidebar(true);
+    let reversed = app.sidebar_animation.unwrap();
+    assert_eq!(reversed.to, 0.);
+    assert!(
+        (reversed.from - progress).abs() < 0.08,
+        "Rapid toggles reverse without a position jump"
+    );
+    app.advance_sidebar_animation(
+        reversed.began + std::time::Duration::from_millis(SIDEBAR_DURATION_MS),
+    );
+    assert_eq!(
+        (
+            app.search.clone(),
+            app.scroll,
+            app.chat_cursor,
+            app.chat_filters.clone()
+        ),
+        saved
+    );
+    app.toggle_sidebar(true);
+    app.close_popup();
+    assert!(app.sidebar_animation.is_none());
+    let _ = SetWindowPos(
+        app.bar,
+        HWND_TOPMOST,
+        original_bar[0],
+        original_bar[1],
+        0,
+        0,
+        SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+    paths.write("rust-sidebar-animation-test.json", &json!({"duration_ms":SIDEBAR_DURATION_MS,"frames_only_update_clip":true,"conversation_toolbar_and_search_stay_fixed":true,"rapid_reverse_preserves_progress":true,"close_stops_timer":true,"list_context_preserved":true}));
+    Ok(())
+}
+
+unsafe fn verify_refresh_preferences(app: &mut App, paths: &Paths) -> Result<()> {
+    app.close_popup();
+    let saved = app.settings.clone();
+    app.popup(Popup::Preferences)?;
+    app.hit(Hit::RefreshPreferences);
+    assert!(app.preferences_advanced);
+    capture(
+        app,
+        Some(Popup::Preferences),
+        560,
+        PREFERENCES_HEIGHT as u32,
+        &paths.runtime.join("rust-refresh-settings-verification.png"),
+    )?;
+    app.hit(Hit::RefreshInterval(1, 1));
+    assert_eq!(app.settings.refresh, saved.refresh);
+    app.hit(Hit::ApplyPreferences);
+    assert_eq!(app.settings.refresh.list_secs, saved.refresh.list_secs + 1);
+    assert_eq!(app.snapshot().refresh_options, app.settings.refresh);
+    app.hit(Hit::RefreshBack);
+    assert!(!app.preferences_advanced);
+    app.close_popup();
+    app.settings = saved.clone();
+    app.state.lock().unwrap().refresh_options = saved.refresh;
+    paths.write("rust-refresh-settings-test.json",&json!({"draft_and_apply":true,"settings_reach_workers_without_restart":true,"event_status_visible":true,"intervals_editable":6}));
     Ok(())
 }
 

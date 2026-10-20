@@ -227,14 +227,6 @@ fn payload(value: &Value) -> Result<Value> {
     }
     bail!("Desktop response did not include structured data")
 }
-fn wait(stop: &Stop, millis: u64) {
-    for _ in 0..millis / 50 {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
 fn context(state: &Shared) -> String {
     state
         .view
@@ -252,11 +244,13 @@ impl Workers {
     pub fn start(paths: &Paths, state: &State, stop: &Stop, catalog: &Catalog) -> Self {
         let mut handles = Vec::new();
         let (sender, receiver) = mpsc::channel();
+        handles.push(crate::refresh::watch(paths, state.lock().unwrap().refresh_events.clone(), stop.clone()));
         let (p, s, done) = (paths.clone(), state.clone(), stop.clone());
         handles.push(thread::spawn(move || {
             let mut store = Store::new(&p);
             let mut last_id = String::new();
-            let mut refreshed = Instant::now() - Duration::from_secs(1);
+            let mut gate = crate::refresh::Gate::new();
+            let events = s.lock().unwrap().refresh_events.clone();
             while !done.load(Ordering::Relaxed) {
                 let (id, auto) = {
                     let live = s.lock().unwrap();
@@ -270,12 +264,13 @@ impl Workers {
                     )
                 };
                 if let Some(id) = id.filter(|id| !id.is_empty()) {
-                    if id == last_id && refreshed.elapsed() < Duration::from_millis(500) {
-                        wait(&done, 50);
+                    let cfg = s.lock().unwrap().refresh_options.clone();
+                    if id == last_id && !gate.due(events.generation(), cfg.current_secs, cfg.fallback_secs) {
+                        gate.pause(&events,cfg.current_secs);
                         continue;
                     }
                     last_id = id.clone();
-                    refreshed = Instant::now();
+                    gate.mark(events.generation());
                     match store.read(&id) {
                         Ok(snapshot) => {
                             let mut live = s.lock().unwrap();
@@ -293,18 +288,29 @@ impl Workers {
                         }
                     }
                 }
-                wait(&done, 50);
+                events.wait(events.generation(),Duration::from_secs(1));
             }
         }));
         let (p, s, done) = (paths.clone(), state.clone(), stop.clone());
         handles.push(thread::spawn(move||{
             let mut rpc=Rpc::new(&p,done.clone());let mut store=Store::new(&p);let mut last_quota=0.;
+            let mut last_cache=Instant::now()-Duration::from_secs(600);
+            let events=s.lock().unwrap().refresh_events.clone();let mut gate=crate::refresh::Gate::new();
             while !done.load(Ordering::Relaxed) {
+                let cfg=s.lock().unwrap().refresh_options.clone();
+                let forced=s.lock().unwrap().quota_at<0.;
+                if !forced && !gate.due(events.generation(),cfg.list_secs,cfg.fallback_secs) && now()-last_quota<60. {
+                    gate.pause(&events,cfg.list_secs);continue;
+                }
+                gate.mark(events.generation());
                 let ctx=context(&s.lock().unwrap());
                 match rpc.tool("list_threads",json!({"limit":50}),&ctx).and_then(|payload|store.recent(&payload)) {
                     Ok(mut recent)=>{
                         recent.carry_read_state(&s.lock().unwrap().recent);
-                        p.write("recent-cache.json",&json!({"schema":1,"rows":recent.rows,"all_rows":recent.all_rows,"busy_count":recent.busy_count,"busy_metrics":recent.busy_metrics,"loaded_at":recent.loaded_at,"stale":false}));
+                        if last_cache.elapsed()>=Duration::from_secs(cfg.cache_secs) {
+                            p.write("recent-cache.json",&json!({"schema":1,"rows":recent.rows,"all_rows":recent.all_rows,"busy_count":recent.busy_count,"busy_metrics":recent.busy_metrics,"loaded_at":recent.loaded_at,"stale":false}));
+                            last_cache=Instant::now();
+                        }
                         s.lock().unwrap().recent=std::sync::Arc::new(recent);
                     },
                     Err(e)=>{let mut live=s.lock().unwrap();let recent=std::sync::Arc::make_mut(&mut live.recent);recent.stale=true;recent.error=format!("{e:#}");}
@@ -315,7 +321,7 @@ impl Workers {
                         Err(e)=>{s.lock().unwrap().quota_error=format!("{e:#}");last_quota=now()-45.;}
                     }
                 }
-                wait(&done,2000);
+                events.wait(events.generation(),Duration::from_secs(1));
             }
         }));
         let (p, s, done, cat) = (paths.clone(), state.clone(), stop.clone(), catalog.clone());

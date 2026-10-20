@@ -56,7 +56,7 @@ const RECENT_TOP: i32 = 48;
 const RECENT_FRAME: i32 = 92;
 const SEARCH_CUE_SUBCLASS: usize = 0x5343;
 fn search_cue(kind: usize) -> &'static str {
-    if kind == 2 { "搜索标签 / 拼音…" } else { "搜索会话 / 拼音…" }
+    match (kind,crate::locale::chinese()) {(2,true)=>"搜索标签 / 拼音…",(2,false)=>"Search tags / pinyin…",(_,true)=>"搜索会话 / 拼音…",_=>"Search chats / pinyin…"}
 }
 unsafe fn paint_search_cue(hwnd: HWND, dc: HDC, kind: usize) {
     if GetWindowTextLengthW(hwnd) != 0 || dc.is_invalid() { return; }
@@ -99,6 +99,7 @@ fn private_bytes()->u64{unsafe{
     let mut counters=PROCESS_MEMORY_COUNTERS_EX::default();counters.cb=size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
     if GetProcessMemoryInfo(GetCurrentProcess(),&mut counters as *mut _ as *mut PROCESS_MEMORY_COUNTERS,counters.cb).is_ok(){counters.PrivateUsage as u64}else{0}
 }}
+fn wide_ui(text:&str)->Vec<u16>{wide(crate::locale::text(text).as_ref())}
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
@@ -190,10 +191,16 @@ enum Hit {
     TitleWidth(i32),
     ShortcutEnabled,
     ApplyPreferences,
+    RefreshPreferences,
+    RefreshBack,
+    RefreshInterval(usize, i32),
     ResetPreferences,
     Details,
     Recent(String),
     ChatIcon(String),
+    ChatCopy(usize),
+    ChatMenuClose,
+    ChatMenuBackground,
     ChooseFixed,
     Fixed(String),
     Back,
@@ -330,6 +337,9 @@ impl Painter {
         )?;
         self.formats.borrow_mut().insert(key, f.clone());
         Ok(f)
+    }
+    unsafe fn ui_label(&self, text: &str, r: D2D_RECT_F, size: f32, rgb: u32, emoji: bool) {
+        self.label(crate::locale::text(text).as_ref(),r,size,rgb,emoji);
     }
     unsafe fn label(&self, text: &str, r: D2D_RECT_F, size: f32, rgb: u32, emoji: bool) {
         let _ = (|| -> Result<()> {
@@ -616,6 +626,10 @@ struct App {
     popup_kind: Option<Popup>,
     icon_target: Option<(String, String)>,
     icon_panel: Option<IconPanel>,
+    chat_menu: Option<ChatMenu>,
+    chat_copy: Option<std::sync::mpsc::Receiver<std::result::Result<String,String>>>,
+    copy_note: String,
+    copy_note_until: Instant,
     shortcut_registered: bool,
     shortcut_error: String,
     shortcut_id: i32,
@@ -623,6 +637,7 @@ struct App {
     shortcut_context: bool,
     preferences_draft: Option<Settings>,
     preferences_note: String,
+    preferences_advanced: bool,
     guard_events: Vec<guard::LogEntry>,
     guard_log_error: String,
     rows: Vec<Row>,
@@ -653,6 +668,7 @@ struct App {
     tag_scroll_drag: Option<(usize,f32)>,
     tag_catalog_due: Instant,
     sidebar_open: bool,
+    sidebar_animation: Option<SidebarAnimation>,
     tag_editor: Option<String>,
     tag_overflow: Option<String>,
     tag_overflow_y:f32,
@@ -683,6 +699,7 @@ struct App {
     last_draw: Instant,
     last_diag: Instant,
     last_identity: String,
+    ui_language: u16,
     last_signature: String,
     last_host: Option<[i32; 4]>,
     event: HANDLE,
@@ -718,6 +735,11 @@ impl Drop for Tips {
 fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
     match hit {
         Hit::Icon | Hit::ChatIcon(_) => "Change chat icon",
+        Hit::ChatCopy(0) => "Copy a link to this chat",
+        Hit::ChatCopy(1) => "Copy the conversation text as Markdown",
+        Hit::ChatCopy(_) => "Copy the chat working directory",
+        Hit::ChatMenuClose => "Close menu · keep the chat list open",
+        Hit::ChatMenuBackground => "Chat copy actions",
         Hit::Title => "Recent chats",
         Hit::NewResults(count) => {
             return format!("{count} newly completed chats · blue dot = unread result · open chat to mark as read")
@@ -727,6 +749,9 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::Preferences => "Settings · list size, shortcut and extensions",
         Hit::Rows(n) => if *n < 0 { "Show fewer rows" } else { "Show more rows" },
         Hit::ShortcutEnabled => "Enable shortcut · only while Codex or Session Bar has focus",
+        Hit::RefreshPreferences => "Refresh settings · source events, rate limits, fallback and diagnostics",
+        Hit::RefreshBack => "Back to settings · keep unsaved changes",
+        Hit::RefreshInterval(_,delta) => if *delta>0 {"Increase refresh interval · apply to save"} else {"Decrease refresh interval · apply to save"},
         Hit::ApplyPreferences => "Apply and save settings",
         Hit::ResetPreferences => "Restore default list size and shortcut · apply to save",
         Hit::Details => "Session details",
@@ -782,6 +807,9 @@ impl App {
         stop: Stop,
         testing: bool,
     ) -> Result<Self> {
+        if !testing {crate::locale::initialize();}
+        settings.refresh.clamp();
+        state.lock().unwrap().refresh_options=settings.refresh.clone();
         settings.recent_rows = settings.recent_rows.clamp(4, 20);
         settings.recent_title_width=settings.recent_title_width.clamp(140,280);
         if !settings.recent_shortcut.valid() { settings.recent_shortcut = Shortcut::default(); }
@@ -855,6 +883,10 @@ impl App {
             popup_kind: None,
             icon_target: None,
             icon_panel: None,
+            chat_menu: None,
+            chat_copy: None,
+            copy_note: String::new(),
+            copy_note_until: Instant::now(),
             shortcut_registered: false,
             shortcut_error: String::new(),
             shortcut_id: RECENT_HOTKEY,
@@ -862,6 +894,7 @@ impl App {
             shortcut_context: false,
             preferences_draft: None,
             preferences_note: String::new(),
+            preferences_advanced: false,
             guard_events: Vec::new(),
             guard_log_error: String::new(),
             popup_layout: None,
@@ -894,6 +927,7 @@ impl App {
             tag_scroll_drag: None,
             tag_catalog_due: Instant::now(),
             sidebar_open: false,
+            sidebar_animation: None,
             tag_editor: None,
             tag_overflow:None,tag_overflow_y:100.,tag_overflow_scroll:0.,
             tag_editor_y: 100.,
@@ -920,6 +954,7 @@ impl App {
             last_draw: Instant::now() - std::time::Duration::from_secs(3),
             last_diag: Instant::now() - std::time::Duration::from_secs(3),
             last_identity: String::new(),
+            ui_language:crate::locale::status().0,
             last_signature: String::new(),
             last_host: None,
             event,
@@ -1004,6 +1039,7 @@ impl App {
         let word = SendMessageW(self.edit, HKM_GETHOTKEY, WPARAM(0), LPARAM(0)).0 as u16;
         next.recent_shortcut = Shortcut::from_control_word(word, next.recent_shortcut.enabled);
         anyhow::ensure!(next.recent_shortcut.valid(), "Use Ctrl or Alt with a letter, number or F1–F24");
+        next.refresh.clamp();
         next.recent_rows = next.recent_rows.clamp(4, 20);
         next.recent_title_width=next.recent_title_width.clamp(140,280);
         let changed = next.recent_shortcut != self.settings.recent_shortcut;
@@ -1024,6 +1060,7 @@ impl App {
             if new_registration { self.shortcut_id = next_id; }
             self.shortcut_error.clear();
         }
+        { let mut live=self.state.lock().unwrap();live.refresh_options=next.refresh.clone();live.refresh_events.notify(); }
         self.settings = next.clone();
         self.preferences_draft = Some(next);
         self.preferences_note = "Saved · changes are active".into();
@@ -1054,16 +1091,16 @@ impl App {
                 if let Some(label) = &visible {
                     self.catalog.strip(label).into()
                 } else if self.identity(live).is_empty() {
-                    "Recent chats".into()
+                    crate::locale::text("Recent chats").into_owned()
                 } else {
-                    "Switching…".into()
+                    crate::locale::text("Switching…").into_owned()
                 }
             });
         let icon = current
             .map(|s| self.catalog.icon(&s.label))
             .or_else(|| visible.as_ref().map(|s| self.catalog.icon(s)))
             .unwrap_or("◈".into());
-        let stale = live.recent.stale || now() - live.recent.loaded_at > 10.;
+        let stale = live.recent.stale || now() - live.recent.loaded_at > self.settings.refresh.fallback_secs as f64 + 10.;
         let busy = live
             .recent
             .busy_count
@@ -1090,7 +1127,7 @@ impl App {
         let speed = rate
             .map(|v| format!("{v:.1}{} t/s", if partial { "*" } else { "" }))
             .unwrap_or("— t/s".into());
-        (icon, title, busy, tok, speed)
+        (icon, title, crate::locale::text(&busy).into_owned(), tok, speed)
     }
     unsafe fn render(&self, kind: Option<Popup>, width: f32, height: f32) -> Vec<Area> {
         let p = &self.painter;
@@ -1256,7 +1293,7 @@ impl App {
                     })
                     .unwrap_or((&self.search, &self.category, &self.filters, self.scroll));
                 area(Hit::Random, rect(12., 9., 36., 32.));
-                p.label("🎲", rect(17., 9., 30., 32.), 20., TEXT, true);
+                p.ui_label("🎲", rect(17., 9., 30., 32.), 20., TEXT, true);
                 area(Hit::Auto, rect(50., 9., 34., 32.));
                 p.action_icon(&Hit::Auto, 56., 14.);
                 let icon_title = self
@@ -1264,14 +1301,14 @@ impl App {
                     .as_ref()
                     .map(|(_, label)| self.catalog.strip(label))
                     .unwrap_or("Session icon");
-                p.label(icon_title, rect(92., 9., 235., 32.), 14., TEXT, false);
+                p.label(&if self.icon_target.is_none(){crate::locale::text(icon_title)}else{std::borrow::Cow::Borrowed(icon_title)}, rect(92., 9., 235., 32.), 14., TEXT, false);
                 area(Hit::Clear, rect(width - 46., 10., 32., 30.));
                 p.action_icon(&Hit::Clear, width - 41., 15.);
                 for r in [rect(14., 49., 190., 29.), rect(214., 49., 155., 29.)] {
                     p.fill(r, 0x1c2125, 3.);
                     p.border(r, 0x47535b, 3.);
                 }
-                p.label(
+                p.ui_label(
                     if search.is_empty() {
                         "Search all emoji…"
                     } else {
@@ -1286,8 +1323,8 @@ impl App {
                     let r=Self::emoji_clear_rect();area(Hit::ClearEmojiSearch,r);
                     p.search_clear(r,self.hover==Some(Hit::ClearEmojiSearch));
                 }
-                p.label(category, rect(222., 49., 131., 29.), 13., TEXT, false);
-                p.label("⌄", rect(350., 49., 16., 29.), 13., MUTED, false);
+                p.ui_label(category, rect(222., 49., 131., 29.), 13., TEXT, false);
+                p.ui_label("⌄", rect(350., 49., 16., 29.), 13., MUTED, false);
                 let columns = 10;
                 let cell = 36.;
                 let start = scroll * columns;
@@ -1303,7 +1340,7 @@ impl App {
                         true,
                     );
                 }
-                p.label(
+                p.ui_label(
                     &if search.trim().is_empty() {
                         format!("{} icons · scroll for more", filters.len())
                     } else {
@@ -1316,7 +1353,7 @@ impl App {
                 );
             }
             Some(Popup::Fixed) => {
-                p.label(
+                p.ui_label(
                     "Choose a fixed chat",
                     rect(16., 9., 350., 30.),
                     14.,
@@ -1328,7 +1365,7 @@ impl App {
                 p.fill(rect(16., 49., width - 32., 35.), 0x1c2125, 6.);
                 p.border(rect(16., 49., width - 32., 35.), 0x43515a, 6.);
                 if self.testing {
-                    p.label(
+                    p.ui_label(
                         if self.search.is_empty() {
                             "Search chats…"
                         } else {
@@ -1426,7 +1463,7 @@ impl App {
                             false,
                         );
                     }
-                    p.label(
+                    p.ui_label(
                         &row.status_text(),
                         rect(width - 126., y + 3., 85., 34.),
                         11.,
@@ -1439,14 +1476,14 @@ impl App {
                         false,
                     );
                     if selected {
-                        p.label("✓", rect(width - 39., y + 3., 20., 34.), 14., GREEN, false);
+                        p.ui_label("✓", rect(width - 39., y + 3., 20., 34.), 14., GREEN, false);
                     }
                     if row.newly_completed() {
                         p.circle(20., y + 20., 3., NEW_RESULT);
                     }
                 }
                 if self.chat_filters.is_empty() {
-                    p.label(
+                    p.ui_label(
                         "No matching chats",
                         rect(27., 120., width - 54., 44.),
                         13.,
@@ -1461,11 +1498,11 @@ impl App {
                         (350. - thumb) * self.scroll as f32 / (self.chat_filters.len() - 8) as f32;
                     p.fill(rect(width - 9., 101. + offset, 3., thumb), 0x77929f, 1.5);
                 }
-                p.label(
-                    &format!(
+                p.ui_label(
+                    &if !self.copy_note.is_empty(){self.copy_note.clone()}else{format!(
                         "{} chats  ·  Scroll to browse  ·  Enter to select",
                         self.chat_filters.len()
-                    ),
+                    )},
                     rect(18., height - 35., width - 36., 26.),
                     11.,
                     MUTED,
@@ -1507,7 +1544,7 @@ impl App {
                         false,
                     );
                 } else {
-                    p.label(
+                    p.ui_label(
                         "Choose a fixed chat…",
                         rect(27., 77., width - 76., 32.),
                         13.,
@@ -1517,7 +1554,7 @@ impl App {
                 }
                 p.line(width - 38., 90., width - 33., 95., MUTED, 1.4);
                 p.line(width - 33., 95., width - 28., 90., MUTED, 1.4);
-                p.label(
+                p.ui_label(
                     "Session details",
                     rect(16., 8., width - 80., 28.),
                     14.,
@@ -1541,7 +1578,7 @@ impl App {
                     p.line(22., 55., 26., 59., GREEN, 1.5);
                     p.line(26., 59., 31., 51., GREEN, 1.5);
                 }
-                p.label(
+                p.ui_label(
                     "Follow current chat",
                     rect(42., 42., width - 60., 27.),
                     12.,
@@ -1549,7 +1586,7 @@ impl App {
                     false,
                 );
                 if let Some(s) = self.current(&live) {
-                    p.label(
+                    p.ui_label(
                         &format!(
                             "Session tokens: {}   ·   Output: {}",
                             data::compact(s.tokens()),
@@ -1572,7 +1609,7 @@ impl App {
                         false,
                     );
                 } else {
-                    p.label(
+                    p.ui_label(
                         if self.identity(&live).is_empty() {
                             "No chat selected · showing all Busy chats"
                         } else {
@@ -1600,7 +1637,7 @@ impl App {
                         .collect::<Vec<_>>()
                         .join("   ")
                 };
-                p.label(&quota, rect(16., 167., width - 32., 25.), 12., MUTED, false);
+                p.ui_label(&quota, rect(16., 167., width - 32., 25.), 12., MUTED, false);
                 for (hit, x) in [
                     (Hit::Refresh, 16.),
                     (Hit::Dock, 58.),
@@ -1614,7 +1651,7 @@ impl App {
                     p.border(rect(x, 202., 36., 32.), 0x47535b, 5.);
                     p.action_icon(&hit, x + 6., 208.);
                 }
-                p.label(
+                p.ui_label(
                     &live.action_note,
                     rect(16., 239., width - 32., 25.),
                     11.,
@@ -1625,7 +1662,7 @@ impl App {
                     },
                     false,
                 );
-                p.label(
+                p.ui_label(
                     &format!("{}: recent chats · hide from settings or tray", self.settings.recent_shortcut.label()),
                     rect(16., 270., width - 32., 25.),
                     11.,
@@ -1634,18 +1671,18 @@ impl App {
                 );
             }
             Some(Popup::GuardLogs) => {
-                p.label("Protection log", rect(18., 8., width - 130., 30.), 14., TEXT, false);
+                p.ui_label("Protection log", rect(18., 8., width - 130., 30.), 14., TEXT, false);
                 for (hit, x) in [(Hit::GuardRefresh, width - 92.), (Hit::BackPreferences, width - 48.)] {
                     area(hit.clone(), rect(x, 8., 32., 30.));
                     p.action_icon(&hit, x + 5., 12.);
                 }
-                p.label(&format!("Storms {}  ·  {}  ·  Ended {} processes",
+                p.ui_label(&format!("Storms {}  ·  {}  ·  Ended {} processes",
                     live.guard.storm_count.map(|v|v.to_string()).unwrap_or_else(|| "—".into()),
                     if !live.guard.available { "Unavailable" } else if !live.guard.enabled { "Protection off" } else if live.guard.storm_active { "Active" } else { "Stable" },
                     live.guard.terminated), rect(18., 44., width - 36., 24.), 12., TEXT, false);
                 let since = chrono::DateTime::parse_from_rfc3339(&live.guard.tracking_since).ok()
                     .map(|t| t.format("%m-%d %H:%M").to_string());
-                p.label(&since.map(|s|format!("Episode tracking since {s} · earlier alarms are not counted"))
+                p.ui_label(&since.map(|s|format!("Episode tracking since {s} · earlier alarms are not counted"))
                     .unwrap_or_else(|| "Episode counter unavailable · update Memory Watch".into()),
                     rect(18., 72., width - 36., 22.), 11., MUTED, false);
                 for (slot, entry) in self.guard_events.iter().skip(self.scroll).take(8).enumerate() {
@@ -1657,7 +1694,7 @@ impl App {
                     p.label(&entry.detail, rect(142., y + 20., width - 170., 17.), 10., MUTED, false);
                 }
                 if self.guard_events.is_empty() {
-                    p.label(if self.guard_log_error.is_empty() { "No recent events · open the folder for archived logs" } else { &self.guard_log_error },
+                    p.ui_label(if self.guard_log_error.is_empty() { "No recent events · open the folder for archived logs" } else { &self.guard_log_error },
                         rect(24., 125., width - 48., 45.), 12., MUTED, false);
                 }
                 if self.guard_events.len() > 8 {
@@ -1666,16 +1703,36 @@ impl App {
                     p.fill(rect(width - 10., 106., 3., 333.), 0x354148, 1.5);
                     p.fill(rect(width - 10., 106. + offset, 3., thumb), 0x77929f, 1.5);
                 }
-                p.label(&format!("{} recent events · scroll · latest log tail", self.guard_events.len()), rect(18., height - 39., width - 90., 28.), 11., MUTED, false);
+                p.ui_label(&format!("{} recent events · scroll · latest log tail", self.guard_events.len()), rect(18., height - 39., width - 90., 28.), 11., MUTED, false);
                 area(Hit::GuardFolder, rect(width - 54., height - 40., 36., 30.));
                 p.action_icon(&Hit::GuardFolder, width - 48., height - 36.);
             }
             Some(Popup::Preferences) => {
                 let draft = self.preferences_draft.as_ref().unwrap_or(&self.settings);
-                p.label("Settings", rect(16., 8., width - 120., 28.), 14., TEXT, false);
+                if self.preferences_advanced {
+                    area(Hit::RefreshBack,rect(14.,8.,32.,30.));p.action_icon(&Hit::BackPreferences,18.,13.);
+                    p.ui_label("Refresh settings",rect(54.,8.,width-70.,28.),14.,TEXT,false);
+                    let watching=self.testing||live.refresh_events.watching.load(Ordering::Relaxed);
+                    p.ui_label(if watching{"File-change events · debounced · slow fallback"}else{"File notifications unavailable · fallback active"},rect(20.,45.,width-40.,24.),11.,if watching{GREEN}else{ORANGE},false);
+                    for (field,label,step) in [(0,"Current chat minimum",1),(1,"Chat list minimum",1),(2,"Fallback refresh",15),(3,"Cache save interval",15),(4,"Diagnostic status",5),(5,"Window identity check",250)] {
+                        let y=78.+field as f32*42.;p.ui_label(label,rect(20.,y,width-180.,30.),12.,TEXT,false);
+                        p.fill(rect(width-150.,y,130.,30.),0x1c2125,6.);
+                        for(delta,x)in[(-step,width-146.),(step,width-54.)]{
+                            area(Hit::RefreshInterval(field,delta),rect(x,y,30.,30.));p.line(x+10.,y+15.,x+20.,y+15.,MUTED,1.5);
+                            if delta>0{p.line(x+15.,y+10.,x+15.,y+20.,MUTED,1.5);}
+                        }
+                        p.ui_label(&draft.refresh.value(field),rect(width-116.,y,62.,30.),11.,TEXT,false);
+                    }
+                    p.ui_label("Minimums coalesce events; unchanged chats wait for fallback.",rect(20.,338.,width-40.,24.),11.,MUTED,false);
+                    p.ui_label("Window following and typing stay responsive.",rect(20.,361.,width-40.,24.),11.,MUTED,false);
+                    let button=rect(width-52.,390.,36.,32.);area(Hit::ApplyPreferences,button);p.fill(button,0x293f37,5.);p.action_icon(&Hit::ApplyPreferences,width-46.,396.);
+                    p.ui_label(&self.preferences_note,rect(20.,423.,width-40.,25.),11.,if self.preferences_note.starts_with("Saved"){GREEN}else{ORANGE},false);
+                    return hits;
+                }
+                p.ui_label("Settings", rect(16., 8., width - 120., 28.), 14., TEXT, false);
                 p.label(concat!("v", env!("CARGO_PKG_VERSION")), rect(width - 75., 8., 60., 28.), 11., MUTED, false);
-                p.label("Recent chats", rect(20., 46., width - 40., 24.), 12., MUTED, false);
-                p.label("Visible rows", rect(20., 78., 260., 30.), 13., TEXT, false);
+                p.ui_label("Recent chats", rect(20., 46., width - 40., 24.), 12., MUTED, false);
+                p.ui_label("Visible rows", rect(20., 78., 260., 30.), 13., TEXT, false);
                 p.fill(rect(width - 150., 78., 130., 30.), 0x1c2125, 6.);
                 for (delta, x) in [(-1, width - 146.), (1, width - 54.)] {
                     area(Hit::Rows(delta), rect(x, 78., 30., 30.));
@@ -1683,25 +1740,25 @@ impl App {
                     if delta > 0 { p.line(x + 15., 88., x + 15., 98., MUTED, 1.5); }
                 }
                 p.label(&draft.recent_rows.to_string(), rect(width - 108., 78., 50., 30.), 13., TEXT, false);
-                p.label("Title column width",rect(20.,113.,260.,26.),12.,MUTED,false);
+                p.ui_label("Title column width",rect(20.,113.,260.,26.),12.,MUTED,false);
                 p.fill(rect(width-150.,113.,130.,26.),0x1c2125,6.);
                 for(delta,x)in[(-20,width-146.),(20,width-54.)]{
                     area(Hit::TitleWidth(delta),rect(x,113.,30.,26.));
                     p.line(x+10.,126.,x+20.,126.,MUTED,1.5);
                     if delta>0{p.line(x+15.,121.,x+15.,131.,MUTED,1.5);}
                 }
-                p.label(&format!("{} px",draft.recent_title_width),rect(width-111.,113.,57.,26.),11.,TEXT,false);
+                p.ui_label(&format!("{} px",draft.recent_title_width),rect(width-111.,113.,57.,26.),11.,TEXT,false);
                 p.line(20., 145., width - 20., 145., 0x354148, 1.);
-                p.label("Global shortcut", rect(20., 156., width - 95., 28.), 13., TEXT, false);
+                p.ui_label("Global shortcut", rect(20., 156., width - 95., 28.), 13., TEXT, false);
                 area(Hit::ShortcutEnabled, rect(width - 72., 155., 52., 30.));
                 p.toggle(width - 60., 162., draft.recent_shortcut.enabled);
-                p.label("Open recent chats", rect(20., 195., 220., 30.), 12., MUTED, false);
+                p.ui_label("Open recent chats", rect(20., 195., 220., 30.), 12., MUTED, false);
                 p.border(rect(247., 193., width - 267., 34.), 0x475b66, 5.);
                 if self.testing {
                     p.label(&draft.recent_shortcut.label(), rect(258., 194., width - 289., 32.), 12., TEXT, false);
                 }
-                p.label("Click the field, then press Ctrl / Alt + a letter, number or F-key", rect(20., 231., width - 40., 24.), 11., MUTED, false);
-                p.label(&self.preferences_note, rect(20., 260., width - 40., 30.), 11.,
+                p.ui_label("Click the field, then press Ctrl / Alt + a letter, number or F-key", rect(20., 231., width - 40., 24.), 11., MUTED, false);
+                p.ui_label(&self.preferences_note, rect(20., 260., width - 40., 30.), 11.,
                     if self.preferences_note.starts_with("Saved") { GREEN } else { ORANGE }, false);
                 for (hit, x) in [(Hit::Hide, 16.), (Hit::ResetPreferences, 58.), (Hit::Quit, 100.), (Hit::ApplyPreferences, width - 52.)] {
                     p.fill(rect(x, 300., 36., 32.), if hit == Hit::ApplyPreferences { 0x293f37 } else { 0x293238 }, 5.);
@@ -1709,8 +1766,10 @@ impl App {
                     p.border(rect(x, 300., 36., 32.), 0x47535b, 5.);
                     p.action_icon(&hit, x + 6., 306.);
                 }
+                let timing=rect(150.,300.,36.,32.);area(Hit::RefreshPreferences,timing);p.fill(timing,0x293238,5.);p.border(timing,0x47535b,5.);
+                p.border(rect(158.,307.,20.,20.),MUTED,10.);p.line(168.,310.,168.,317.,MUTED,1.5);p.line(168.,317.,173.,320.,MUTED,1.5);
                 p.line(16., 352., width - 16., 352., 0x3b484f, 1.);
-                p.label(
+                p.ui_label(
                     "Extensions",
                     rect(20., 358., width - 40., 25.),
                     12.,
@@ -1721,7 +1780,7 @@ impl App {
                 p.fill(guard_row, 0x293238, 6.);
                 area(Hit::Guard, rect(16., 391., width - 192., 31.));
                 area(Hit::Guard, rect(width - 73., 391., 57., 31.));
-                p.label(
+                p.ui_label(
                     "Codex Git memory protection",
                     rect(27., 391., width - 210., 31.),
                     12.,
@@ -1738,7 +1797,7 @@ impl App {
                 area(Hit::GuardLogs, rect(width - 113., 391., 32., 31.));
                 p.action_icon(&Hit::GuardLogs, width - 108., 396.);
                 p.toggle(width - 60., 399., live.guard.enabled);
-                p.label(
+                p.ui_label(
                     &format!(
                         "{} · {} processes / {:.0} GiB · 5s",
                         live.guard.note,
@@ -1752,6 +1811,7 @@ impl App {
                 );
             }
         }
+        if kind==Some(Popup::Fixed){self.draw_chat_menu(&mut hits);}
         hits
     }
     unsafe fn paint(&mut self, hwnd: HWND) {
@@ -1798,7 +1858,7 @@ impl App {
                         right: (a.r.right * scale).round() as i32,
                         bottom: (a.r.bottom * scale).round() as i32,
                     },
-                    wide(&if a.hit == Hit::Title {
+                    wide_ui(&if a.hit == Hit::Title {
                         format!("Recent chats · {}", self.settings.recent_shortcut.label())
                     } else if a.hit == Hit::GuardLogs {
                         let guard = self.snapshot().guard;
@@ -1931,6 +1991,25 @@ impl App {
         }
     }
     unsafe fn tick(&mut self) {
+        self.finish_chat_copy();
+        let language=crate::locale::status().0;
+        if language!=self.ui_language {
+            self.ui_language=language;self.painter.release_layouts();self.tips.clear();
+            for (edit,combo) in [(self.edit,self.combo)].into_iter().chain(self.icon_panel.as_ref().map(|p|(p.edit,p.combo))) {
+                if !combo.is_invalid() {
+                    let selected=SendMessageW(combo,CB_GETCURSEL,WPARAM(0),LPARAM(0));
+                    let _=SendMessageW(combo,CB_RESETCONTENT,WPARAM(0),LPARAM(0));
+                    for group in &self.groups {let _=SendMessageW(combo,CB_ADDSTRING,WPARAM(0),LPARAM(wide_ui(group).as_ptr() as isize));}
+                    let _=SendMessageW(combo,CB_SETCURSEL,WPARAM(selected.0.max(0) as usize),LPARAM(0));
+                    if !edit.is_invalid(){let _=SendMessageW(edit,EM_SETCUEBANNER,WPARAM(1),LPARAM(wide_ui("Search all emoji…").as_ptr() as isize));}
+                }
+            }
+
+            let _=InvalidateRect(self.bar,None,false);let _=InvalidateRect(self.popup,None,false);
+            for child in [self.edit,self.tag_search_input]{if !child.is_invalid(){let _=InvalidateRect(child,None,true);}}
+            if !self.tag_input.is_invalid(){let _=SendMessageW(self.tag_input,EM_SETCUEBANNER,WPARAM(1),LPARAM(wide_ui("Add or select a tag…").as_ptr() as isize));}
+        }
+
         if !self.testing { self.sync_shortcut_scope(false); }
         if !self.event.is_invalid() && WaitForSingleObject(self.event, 0) == WAIT_OBJECT_0 {
             self.hidden = false;
@@ -2101,7 +2180,7 @@ impl App {
         if signature != self.last_signature || self.last_draw.elapsed().as_millis() >= 500 {
             self.last_signature = signature;
             let _ = InvalidateRect(self.bar, None, false);
-            if matches!(
+            if self.sidebar_animation.is_none() && matches!(
                 self.popup_kind,
                 Some(Popup::Recent) | Some(Popup::Details) | Some(Popup::Fixed) | Some(Popup::Preferences) | Some(Popup::GuardLogs)
             ) {
@@ -2109,7 +2188,7 @@ impl App {
             }
             self.last_draw = Instant::now();
         }
-        if self.last_diag.elapsed().as_secs_f64() >= 1. {
+        if self.last_diag.elapsed().as_secs() >= self.settings.refresh.diagnostic_secs {
             self.diagnostic();
             self.last_diag = Instant::now();
         }
@@ -2186,7 +2265,7 @@ impl App {
                     combo,
                     CB_ADDSTRING,
                     WPARAM(0),
-                    LPARAM(wide(group).as_ptr() as isize),
+                    LPARAM(wide_ui(group).as_ptr() as isize),
                 );
             }
             let _ = SendMessageW(combo, CB_SETCURSEL, WPARAM(0), LPARAM(0));
@@ -2194,7 +2273,7 @@ impl App {
                 edit,
                 EM_SETCUEBANNER,
                 WPARAM(1),
-                LPARAM(w!("Search all emoji…").as_ptr() as isize),
+                LPARAM(wide_ui("Search all emoji…").as_ptr() as isize),
             );
             for child in [edit, combo] {
                 let _ = SendMessageW(
@@ -2424,6 +2503,8 @@ impl App {
         Some(LRESULT(0))
     }
     unsafe fn close_popup(&mut self) {
+        self.chat_menu=None;
+        self.cancel_sidebar_animation();
         self.close_tag_editor();
         self.close_tag_search();
         if self.tag_scroll_drag.take().is_some(){let _=ReleaseCapture();}
@@ -2491,6 +2572,8 @@ impl App {
         true
     }
     unsafe fn popup(&mut self, kind: Popup) -> Result<()> {
+        self.chat_menu=None;
+        self.cancel_sidebar_animation();
         self.close_tag_editor();
         self.close_tag_search();
         let resume_preferences = kind == Popup::Preferences && self.popup_kind == Some(Popup::GuardLogs);
@@ -2548,6 +2631,7 @@ impl App {
             self.refresh_guard_events();
         }
         if kind == Popup::Preferences {
+            self.preferences_advanced=false;
             if !resume_preferences || self.preferences_draft.is_none() {
                 self.preferences_draft = Some(self.settings.clone());
                 self.preferences_note = self.shortcut_error.clone();
@@ -2602,7 +2686,7 @@ impl App {
                     self.combo,
                     CB_ADDSTRING,
                     WPARAM(0),
-                    LPARAM(wide(group).as_ptr() as isize),
+                    LPARAM(wide_ui(group).as_ptr() as isize),
                 );
             }
             let _ = SendMessageW(self.combo, CB_SETCURSEL, WPARAM(0), LPARAM(0));
@@ -2610,7 +2694,7 @@ impl App {
                 self.edit,
                 EM_SETCUEBANNER,
                 WPARAM(0),
-                LPARAM(w!("Search all emoji…").as_ptr() as isize),
+                LPARAM(wide_ui("Search all emoji…").as_ptr() as isize),
             );
         }
         if matches!(kind, Popup::Recent | Popup::Fixed) {
@@ -2698,6 +2782,7 @@ impl App {
         Ok(())
     }
     unsafe fn place_popup(&mut self) {
+        if self.sidebar_animation.is_some() && self.popup_layout.is_some() && !self.popup_layout_batch { return; }
         // Token/TPS text can change the bar's width and anchor while the user
         // is choosing. Let native combo tracking finish before moving its panel.
         if [
@@ -2729,16 +2814,22 @@ impl App {
         };
         let _ = GetMonitorInfoW(monitor, &mut info);
         let bounds = info.rcWork;
-        let x = if self.popup_kind == Some(Popup::Recent) {
+        let mut x = if self.popup_kind == Some(Popup::Recent) {
             recent_panel_x(bar[0], w, self.sidebar_open, scale, bounds.left, bounds.right)
         } else {
             bar[0].max(bounds.left).min((bounds.right - w).max(bounds.left))
         };
-        let y = if bar[1] - h - 6 >= bounds.top {
+        let mut y = if bar[1] - h - 6 >= bounds.top {
             bar[1] - h - 6
         } else {
             (bar[3] + 6).min((bounds.bottom - h).max(bounds.top))
         };
+        if self.popup_layout_batch && self.popup_kind==Some(Popup::Recent) {
+            if let Some((previous,_))=self.popup_layout {
+                x=(previous[0]+previous[2]-w).max(bounds.left).min((bounds.right-w).max(bounds.left));
+                y=previous[1].max(bounds.top).min((bounds.bottom-h).max(bounds.top));
+            }
+        }
         let layout = ([x, y, w, h], scale.to_bits());
         // Moving/resizing a native combo box closes its open drop-down, even
         // when the requested bounds are unchanged. Timer refreshes must not
@@ -2747,11 +2838,10 @@ impl App {
             return;
         }
         self.popup_layout = Some(layout);
-        let flags = if self.popup_layout_batch { SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS } else { SWP_NOACTIVATE };
+        let flags = if self.popup_layout_batch { SWP_NOACTIVATE | SWP_NOREDRAW } else { SWP_NOACTIVATE };
         let _ = SetWindowPos(self.popup, HWND_TOPMOST, x, y, w, h, flags);
-        if self.popup_layout_batch {
-            let region = CreateRoundRectRgn(0, 0, w + 1, h + 1, (18. * scale) as i32, (18. * scale) as i32);
-            if SetWindowRgn(self.popup, region, false) == 0 { let _ = DeleteObject(region); }
+        if self.popup_kind == Some(Popup::Recent) {
+            self.apply_recent_region(Instant::now());
         } else {
             Self::round_window(self.popup, w, h, (18. * scale) as i32);
         }
@@ -2797,10 +2887,23 @@ impl App {
         let live = self.snapshot();
         let current = self.current(&live);
         let (_, title, status, _, _) = unsafe { self.bar_text(&live) };
-        self.paths.write(if self.testing{"rust-test-status.json"}else{"live-status.json"},&json!({"pid":std::process::id(),"runtime":"rust","updated_at":now(),"thread":self.identity(&live),"overview":self.identity(&live).is_empty() && data::visible_chat_title(&live.view_label).is_none(),"display_title":title,"display_status":status,"tokens":current.and_then(|s|s.tokens()),"auto_thread":live.auto_thread,"topmost":true,"user_hidden":self.hidden,"host_hidden":self.host_hidden,"host_window":live.host,"host_rect":self.last_host,"host_offset":self.settings.host_offset,"titlebar_slot":live.slot,"quota":live.quota,"quota_error":live.quota_error,"recent_cache":{"rows":live.recent.rows.len(),"busy_count":live.recent.busy_count,"stale":live.recent.stale,"error":live.recent.error},"active_view":{"thread":live.view,"label":live.view_label,"available":live.view.is_some() || data::visible_chat_title(&live.view_label).is_some(),"identity_pending":live.auto_thread && live.view.is_none() && data::visible_chat_title(&live.view_label).is_some(),"source":"uia-current-page"},"action_note":live.action_note,"codex_git_guard":live.guard,"font":{"chinese":self.painter.chinese,"latin":"Segoe UI","emoji":"Segoe UI Emoji","renderer":"DirectWrite / software Direct2D","antialias":"ClearType","per_monitor_dpi":true}}));
+        self.paths.write(if self.testing{"rust-test-status.json"}else{"live-status.json"},&json!({"pid":std::process::id(),"runtime":"rust","ui_language":{"culture":crate::locale::status().0,"source":if crate::locale::status().1{"codex-uia"}else{"windows-default"}},"refresh":{"file_events":live.refresh_events.watching.load(Ordering::Relaxed),"settings":live.refresh_options},"updated_at":now(),"thread":self.identity(&live),"overview":self.identity(&live).is_empty() && data::visible_chat_title(&live.view_label).is_none(),"display_title":title,"display_status":status,"tokens":current.and_then(|s|s.tokens()),"auto_thread":live.auto_thread,"topmost":true,"user_hidden":self.hidden,"host_hidden":self.host_hidden,"host_window":live.host,"host_rect":self.last_host,"host_offset":self.settings.host_offset,"titlebar_slot":live.slot,"quota":live.quota,"quota_error":live.quota_error,"recent_cache":{"rows":live.recent.rows.len(),"busy_count":live.recent.busy_count,"stale":live.recent.stale,"error":live.recent.error},"active_view":{"thread":live.view,"label":live.view_label,"available":live.view.is_some() || data::visible_chat_title(&live.view_label).is_some(),"identity_pending":live.auto_thread && live.view.is_none() && data::visible_chat_title(&live.view_label).is_some(),"source":"uia-current-page"},"action_note":live.action_note,"codex_git_guard":live.guard,"font":{"chinese":self.painter.chinese,"latin":"Segoe UI","emoji":"Segoe UI Emoji","renderer":"DirectWrite / software Direct2D","antialias":"ClearType","per_monitor_dpi":true}}));
     }
     unsafe fn hit(&mut self, hit: Hit) -> Option<Action> {
         match hit {
+            Hit::ChatCopy(slot) => {
+                if slot==1 {
+                    if !self.testing {self.start_chat_copy();}
+                    self.chat_menu=None;let _=InvalidateRect(self.popup,None,false);return None;
+                }
+                if let Some(text)=self.chat_menu.as_ref().and_then(|menu|menu.text(slot)) {
+                    if !self.testing {match copy_clipboard(self.popup,&text){Ok(())=>self.set_copy_note("Copied".into()),Err(error)=>self.set_copy_note(format!("Copy failed: {error}"))}}
+                }
+                self.chat_menu=None;let _=InvalidateRect(self.popup,None,false);
+            }
+            Hit::ChatMenuClose => {self.chat_menu=None;let _=InvalidateRect(self.popup,None,false);}
+            Hit::ChatMenuBackground => {}
+
             Hit::ClearChatSearch => {
                 self.search.clear(); self.filter_fixed();
                 let _=SetWindowTextW(self.edit,w!("")); let _=SetFocus(self.edit);
@@ -2853,6 +2956,7 @@ impl App {
             }
             Hit::ResetPreferences => {
                 if let Some(draft) = self.preferences_draft.as_mut() {
+                    draft.refresh=crate::refresh::Settings::default();
                     draft.recent_rows = 10;
                     draft.recent_title_width=200;
                     draft.recent_shortcut = Shortcut::default();
@@ -2861,6 +2965,12 @@ impl App {
                     self.preferences_note = "Defaults restored · apply to save".into();
                 }
             }
+            Hit::RefreshPreferences => {
+                if let Some(draft)=self.preferences_draft.as_mut(){draft.recent_shortcut=Shortcut::from_control_word(SendMessageW(self.edit,HKM_GETHOTKEY,WPARAM(0),LPARAM(0)).0 as u16,draft.recent_shortcut.enabled);}
+                self.preferences_advanced=true;let _=ShowWindow(self.edit,SW_HIDE);
+            }
+            Hit::RefreshBack => {self.preferences_advanced=false;let _=ShowWindow(self.edit,SW_SHOW);}
+            Hit::RefreshInterval(field,delta) => {if let Some(draft)=self.preferences_draft.as_mut(){draft.refresh.adjust(field,delta);self.preferences_note="Apply to save changes".into();}}
             Hit::ApplyPreferences => {
                 if let Err(error) = self.apply_preferences() { self.preferences_note = format!("{error:#}"); }
             }
@@ -2947,7 +3057,7 @@ impl App {
                 return Some(Action::Icon(id, icon));
             }
             Hit::Refresh => {
-                self.state.lock().unwrap().quota_at = -1.;
+                {let mut live=self.state.lock().unwrap();live.quota_at=-1.;live.refresh_events.notify();}
                 return Some(Action::Refresh);
             }
             Hit::Dock => {
@@ -2990,34 +3100,9 @@ impl App {
                 }
                 let _ = InvalidateRect(self.popup, None, false);
             }
-            Hit::TagSidebar => {
-                // Suppress Windows' intermediate copy/move paints; present the
-                // completed parent and child layout together in one repaint.
-                let frozen: Vec<_> = [self.edit, self.tag_search_input, self.popup].into_iter()
-                    .filter(|&hwnd| !hwnd.is_invalid() && IsWindowVisible(hwnd).as_bool()).collect();
-                for &hwnd in &frozen { SendMessageW(hwnd, WM_SETREDRAW, WPARAM(0), LPARAM(0)); }
-                self.popup_layout_batch=true;
-                self.close_tag_editor();self.sidebar_open=!self.sidebar_open;
-                self.popup_size=[self.recent_width(),self.recent_panel_height()];self.popup_layout=None;
-                for i in 0..3{self.tag_scroll[i]=self.tag_scroll[i].min(self.tag_scroll_max(i));}
-                self.scroll=self.scroll.min(self.chat_filters.len().saturating_sub(self.list_page_rows()));self.place_popup();
-                let _=self.ensure_tag_search();
-                self.popup_layout_batch=false;
-                for &hwnd in &frozen {
-                    // A collapsed tag search stays hidden; WM_SETREDRAW(TRUE)
-                    // would otherwise restore its WS_VISIBLE style.
-                    if hwnd!=self.tag_search_input || self.sidebar_open {
-                        SendMessageW(hwnd, WM_SETREDRAW, WPARAM(1), LPARAM(0));
-                    } else {
-                        SendMessageW(hwnd, WM_SETREDRAW, WPARAM(1), LPARAM(0));
-                        let _=ShowWindow(hwnd, SW_HIDE);
-                    }
-                }
-                // Queue the paint after this input callback releases App's
-                // borrow, rather than dispatching a reentrant WM_PAINT.
-                let _=RedrawWindow(self.popup, None, HRGN::default(), RDW_INVALIDATE | RDW_ALLCHILDREN);
-            }
+            Hit::TagSidebar => { self.toggle_sidebar(!self.testing); }
             Hit::Compact => {
+                if self.sidebar_animation.is_some() { self.advance_sidebar_animation(Instant::now() + std::time::Duration::from_millis(SIDEBAR_DURATION_MS)); }
                 self.close_tag_editor();self.close_icon_panel();
                 self.settings.compact_recent=!self.settings.compact_recent;
                 self.popup_size=[self.recent_width(),self.recent_panel_height()];self.popup_layout=None;
@@ -3091,6 +3176,7 @@ impl App {
         let _ = InvalidateRect(self.popup, None, false);
     }
     fn filter_fixed(&mut self) {
+        self.chat_menu = None;
         self.chat_search.sync(&self.rows, &self.catalog);
         if self.body_pending {
             if let Some(service) = &self.body_service {
@@ -3153,6 +3239,7 @@ impl App {
         }
     }
     fn fixed_hit_at(&self, x: f32, y: f32) -> Option<Hit> {
+        if self.chat_menu.is_some(){return self.chat_menu_hit(x,y);}
         let width = self.popup_size[0] as f32;
         if self.popup_kind == Some(Popup::Recent) {
             // Recompute geometry from current scroll/filter state, never stale paint hits.
@@ -3215,6 +3302,7 @@ impl App {
         })
     }
     unsafe fn fixed_key(&mut self, key: u32) -> bool {
+        if self.chat_menu.is_some(){return self.chat_menu_key(key);}
         if self.tag_overflow.is_some(){
             if key==VK_ESCAPE.0 as u32{let _=self.hit(Hit::TagOverflowClose);return true;}
             if key==VK_RETURN.0 as u32{return true;}
@@ -3340,6 +3428,12 @@ unsafe extern "system" fn wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // All windows of this class are borderless popups. Preserve their existing
+    // right-hand pixels when the tag panel grows/shrinks on the left. Handle
+    // this before borrowing App because resize dispatches it synchronously.
+    if message==WM_NCCALCSIZE && wparam.0!=0 {
+        return LRESULT((WVR_ALIGNRIGHT|WVR_ALIGNTOP) as isize);
+    }
     let handled = APP.with(|slot| {
         let Ok(mut state) = slot.try_borrow_mut() else {
             return None;
@@ -3379,10 +3473,23 @@ unsafe extern "system" fn wndproc(
                 Some(LRESULT(0))
             }
             WM_ERASEBKGND => Some(LRESULT(1)),
+            WM_TIMER if !is_bar && wparam.0 == SIDEBAR_TIMER => {
+                app.advance_sidebar_animation(Instant::now());
+                Some(LRESULT(0))
+            }
             WM_TIMER => {
                 app.tick();
                 Some(LRESULT(0))
             }
+            WM_CONTEXTMENU if !is_bar && matches!(app.popup_kind,Some(Popup::Recent|Popup::Fixed)) => {
+                let mut point=POINT{x:lparam.0 as i16 as i32,y:(lparam.0>>16) as i16 as i32};
+                if lparam.0 == -1 {
+                    let (left,top,row)=if app.popup_kind==Some(Popup::Recent){(app.recent_left(),RECENT_TOP as f32,app.recent_row_height() as f32)}else{(16.,112.,40.)};
+                    point=POINT{x:((left+60.)*scale) as i32,y:((top+(app.chat_cursor.saturating_sub(app.scroll)) as f32*row+20.)*scale) as i32};
+                } else {let _=ScreenToClient(hwnd,&mut point);}
+                app.open_chat_menu(point.x as f32/scale,point.y as f32/scale);Some(LRESULT(0))
+            }
+            WM_MOUSEWHEEL if !is_bar && app.chat_menu.is_some()=>Some(LRESULT(0)),
             WM_MOUSELEAVE => {
                 app.hover=None; app.list_pointer=None; let _=InvalidateRect(hwnd,None,false); Some(LRESULT(0))
             }
@@ -3598,10 +3705,10 @@ unsafe extern "system" fn wndproc(
                     app.tick();
                 } else if event == WM_RBUTTONUP {
                     if let Ok(menu) = CreatePopupMenu() {
-                        let _ = AppendMenuW(menu, MF_STRING, 1, w!("Open session bar"));
-                        let _ = AppendMenuW(menu, MF_STRING, 3, w!("Settings"));
-                        let _ = AppendMenuW(menu, MF_STRING, 4, w!("Hide to tray"));
-                        let _ = AppendMenuW(menu, MF_STRING, 2, w!("Quit session bar"));
+                        let _ = AppendMenuW(menu, MF_STRING, 1, PCWSTR(wide_ui("Open session bar").as_ptr()));
+                        let _ = AppendMenuW(menu, MF_STRING, 3, PCWSTR(wide_ui("Settings").as_ptr()));
+                        let _ = AppendMenuW(menu, MF_STRING, 4, PCWSTR(wide_ui("Hide to tray").as_ptr()));
+                        let _ = AppendMenuW(menu, MF_STRING, 2, PCWSTR(wide_ui("Quit session bar").as_ptr()));
                         let mut point = POINT::default();
                         let _ = GetCursorPos(&mut point);
                         let _ = SetForegroundWindow(app.bar);
@@ -3779,6 +3886,9 @@ unsafe fn capture(
     height: u32,
     path: &std::path::Path,
 ) -> Result<Vec<Area>> {
+    capture_render(app, width, height, path, || app.render(kind, width as f32, height as f32))
+}
+unsafe fn capture_render(app: &App, width: u32, height: u32, path: &std::path::Path, draw: impl FnOnce() -> Vec<Area>) -> Result<Vec<Area>> {
     let dc = CreateCompatibleDC(None);
     let mut info = BITMAPINFO::default();
     info.bmiHeader = BITMAPINFOHEADER {
@@ -3804,7 +3914,7 @@ unsafe fn capture(
     )?;
     app.painter.target.SetDpi(96., 96.);
     app.painter.target.BeginDraw();
-    let hits = app.render(kind, width as f32, height as f32);
+    let hits = draw();
     app.painter.target.EndDraw(None, None)?;
     let raw = std::slice::from_raw_parts(bits as *const u8, (width * height * 4) as usize);
     let mut rgba = Vec::with_capacity(raw.len());
@@ -3816,6 +3926,37 @@ unsafe fn capture(
     let _ = DeleteObject(bitmap);
     let _ = DeleteDC(dc);
     Ok(hits)
+}
+unsafe fn capture_docking(app: &App, paths: &Paths) -> Result<()> {
+    let width = 1100.;
+    let bar_width = app.measure_bar() as f32;
+    capture_render(app, width as u32, 190, &paths.runtime.join("rust-docking-verification.png"), || {
+        let p = &app.painter;
+        p.fill(rect(0., 0., width, 190.), 0x181a1c, 0.);
+        p.fill(rect(0., 0., width, 44.), 0x202428, 0.);
+        p.line(0., 44., width, 44., 0x343c42, 1.);
+        p.ui_label("‹    ›    ◫     File    Edit    View    Help", rect(20., 5., 300., 34.), 12., MUTED, false);
+        for (x, text) in [(974., "−"), (1020., "□"), (1065., "×")] {
+            p.label(text, rect(x, 5., 28., 34.), 14., MUTED, false);
+        }
+        p.fill(rect(0., 45., 244., 145.), 0x202326, 0.);
+        p.line(244., 45., 244., 190., 0x343c42, 1.);
+        p.ui_label("Codex", rect(58., 61., 160., 28.), 16., TEXT, false);
+        p.ui_label("+  New chat", rect(58., 101., 160., 28.), 12., MUTED, false);
+        p.ui_label("Projects", rect(58., 139., 160., 28.), 12., MUTED, false);
+        p.ui_label("▱  xxx 会话名称", rect(270., 56., 600., 30.), 13., TEXT, false);
+        p.border(rect(273., 129., 796., 44.), 0x3b444c, 14.);
+        p.ui_label("Ask anything", rect(290., 134., 600., 30.), 13., MUTED, false);
+        let identity = windows::Foundation::Numerics::Matrix3x2 { M11:1., M22:1., ..Default::default() };
+        let position = windows::Foundation::Numerics::Matrix3x2 { M31:(320.+964.-bar_width)/2., M32:5., ..identity };
+        p.target.SetTransform(&position);
+        p.target.PushAxisAlignedClip(&rect(0., 0., bar_width, 34.), D2D1_ANTIALIAS_MODE_ALIASED);
+        let hits = app.render(None, bar_width, 34.);
+        p.target.PopAxisAlignedClip();
+        p.target.SetTransform(&identity);
+        hits
+    })?;
+    Ok(())
 }
 unsafe fn verify_native_search_cue(hwnd: HWND, kind: usize, path: &std::path::Path) -> Result<()> {
     let mut registered = 0;
@@ -4086,6 +4227,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             &paths.runtime.join("rust-bar-verification.png"),
         )?;
         assert!(bar_hits.iter().any(|area| area.hit == Hit::NewResults(2)));
+        capture_docking(&app, paths)?;
         app.popup_kind = Some(Popup::Recent);
         app.rows = rows.clone();
         app.search.clear();
@@ -4511,6 +4653,9 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         verify_memory_cache(&mut app,paths)?;
         verify_two_columns(&mut app,paths)?;
         verify_tag_overflow(&mut app,paths)?;
+        verify_sidebar_animation(&mut app,paths)?;
+        verify_refresh_preferences(&mut app,paths)?;
+        verify_chat_menu_and_language(&mut app,paths)?;
         let _ = app.hit(Hit::Hide);
         assert!(app.hidden);
         app.hidden = false;
@@ -4530,3 +4675,5 @@ pub fn self_test(paths: &Paths) -> Result<()> {
 }
 
 include!("recent.rs");
+
+include!("context_menu.rs");

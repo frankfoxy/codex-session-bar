@@ -4,9 +4,11 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
+    rc::Rc,
     time::Duration,
 };
 
@@ -411,6 +413,7 @@ struct Cache {
 }
 pub struct Store {
     paths: Paths,
+    databases: RefCell<HashMap<String, Rc<Connection>>>,
     cache: HashMap<String, Cache>,
     prompts: HashMap<String, (i64, String)>,
     tag_sources: crate::tags::Sources,
@@ -419,18 +422,22 @@ impl Store {
     pub fn new(paths: &Paths) -> Self {
         Self {
             paths: paths.clone(),
+            databases: RefCell::new(HashMap::new()),
             cache: HashMap::new(),
             prompts: HashMap::new(),
             tag_sources: crate::tags::Sources::default(),
         }
     }
-    fn db(&self, name: &str) -> Result<Connection> {
+    fn db(&self, name: &str) -> Result<Rc<Connection>> {
+        if let Some(db) = self.databases.borrow().get(name) { return Ok(Rc::clone(db)); }
         let db = Connection::open_with_flags(
             self.paths.home.join(name),
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         db.busy_timeout(Duration::from_millis(500))?;
-        db.execute_batch("PRAGMA query_only=ON; PRAGMA temp_store=MEMORY;")?;
+        db.execute_batch("PRAGMA query_only=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-512;")?;
+        let db = Rc::new(db);
+        self.databases.borrow_mut().insert(name.into(), Rc::clone(&db));
         Ok(db)
     }
     pub fn sessions(&self) -> Result<Vec<Row>> {
@@ -495,6 +502,30 @@ impl Store {
                 ))
             })
             .context("Chat not found")
+    }
+    pub fn directory(&self,id:&str)->Result<String> {
+        Ok(self.db("state_5.sqlite")?.query_row("SELECT cwd FROM threads WHERE id=?",[id],|r|r.get::<_,Option<String>>(0))?.unwrap_or_default())
+    }
+    pub fn markdown(&self,id:&str,title:&str)->Result<String> {
+        // Explicit copy only: bounded, read-only, and run outside the UI thread.
+        // Skip tool/system records and hidden reasoning; preserve visible Markdown.
+        let db=self.db("thread_history_1.sqlite").context("Local chat history unavailable")?;
+        let mut statement=db.prepare("SELECT item_type,CASE WHEN length(CAST(item_json AS BLOB))<=4194304 THEN item_json ELSE NULL END FROM thread_items WHERE thread_id=? AND item_type IN ('userMessage','agentMessage') ORDER BY rollout_ordinal,item_id LIMIT 20001")?;
+        let mut rows=statement.query([id])?;
+        let mut output=format!("# {}\n\n",title.replace(['\r','\n']," "));
+        let (mut count,mut visible)=(0,0);
+        while let Some(row)=rows.next()? {
+            count+=1;
+            anyhow::ensure!(count<=20000,"Chat too large to copy safely");
+            let json=row.get::<_,Option<String>>(1)?.context("Chat message too large to copy safely")?;
+            let Some(text)=crate::body::history_text(&json) else{continue;};
+            visible+=1;
+            let role=if row.get::<_,String>(0)?=="userMessage"{"User"}else{"Assistant"};
+            anyhow::ensure!(output.len()+text.len()+32<=16*1024*1024,"Chat too large to copy safely");
+            output.push_str(&format!("## {role}\n\n{text}\n\n"));
+        }
+        anyhow::ensure!(visible>0,"No local chat messages available");
+        Ok(output)
     }
     pub fn read(&mut self, id: &str) -> Result<Snapshot> {
         let db = self.db("state_5.sqlite")?;
@@ -762,6 +793,22 @@ pub fn load_recent(paths: &Paths) -> Recent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    #[test]
+    fn markdown_copy_uses_visible_messages_in_order_without_tools_or_reasoning() {
+        let (paths,dir)=fixture("markdown-copy");
+        let db=Connection::open(dir.join("thread_history_1.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE thread_items(thread_id TEXT,item_id TEXT,item_type TEXT,rollout_ordinal INTEGER,item_json TEXT);").unwrap();
+        for (id,kind,ordinal,item) in [("u","userMessage",1,json!({"type":"userMessage","content":[{"type":"text","text":"请检查 **接口**"}]})),("hidden","agentMessage",2,json!({"type":"agentMessage","phase":"analysis","text":"hidden reasoning"})),("a","agentMessage",3,json!({"type":"agentMessage","phase":"final","text":"已检查。\n```rust\nlet ok=true;\n```"})),("tool","commandExecution",4,json!({"type":"commandExecution","text":"tool output"}))] {
+            db.execute("INSERT INTO thread_items VALUES('chat',?,?,?,?)",rusqlite::params![id,kind,ordinal,item.to_string()]).unwrap();
+        }
+        let store=Store::new(&paths);let text=store.markdown("chat","接口 [联调]").unwrap();
+        assert!(text.starts_with("# 接口 [联调]\n\n## User\n\n请检查 **接口**"));
+        assert!(text.contains("## Assistant\n\n已检查。\n```rust"));
+        assert!(!text.contains("hidden reasoning")&&!text.contains("tool output"));
+        assert!(store.markdown("missing","Missing").is_err());
+        drop(store);drop(db);std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn named_titles_win_and_attachment_envelopes_do_not_become_names() {
         let prompt = "# Files mentioned by the user:\n输出报告.png\n## Referenced chats with Codex:\ncontext\n## My request:\n[@Reference](thread://ref)\n做一个 3D 模型\n放到工程目录";
@@ -869,6 +916,10 @@ mod tests {
             .unwrap();
         drop(db);
         let store = Store::new(&paths);
+        let cached = store.db("state_5.sqlite").unwrap();
+        assert!(Rc::ptr_eq(&cached, &store.db("state_5.sqlite").unwrap()));
+        assert_eq!(cached.query_row("PRAGMA cache_size", [], |r| r.get::<_, i32>(0)).unwrap(), -512);
+        assert!(cached.execute("DELETE FROM threads", []).is_err());
         assert_eq!(store.resolve("unique").unwrap().as_deref(), Some("one"));
         assert!(store.resolve("duplicate").unwrap().is_none());
         assert!(store.resolve("missing").unwrap().is_none());
