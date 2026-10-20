@@ -155,6 +155,10 @@ enum Hit {
     Dock,
     Follow,
     Guard,
+    GuardLogs,
+    GuardRefresh,
+    GuardFolder,
+    BackPreferences,
     Body,
     Quit,
 }
@@ -175,6 +179,7 @@ enum Popup {
     Details,
     Fixed,
     Preferences,
+    GuardLogs,
 }
 
 struct Painter {
@@ -389,6 +394,16 @@ impl Painter {
             MUTED
         };
         match hit {
+            Hit::GuardLogs => {
+                self.border(rect(x + 4., y + 2., 15., 19.), c, 2.);
+                for dy in [7., 11., 15.] { self.line(x + 8., y + dy, x + 15., y + dy, c, 1.3); }
+            }
+            Hit::GuardFolder => {
+                self.border(rect(x + 2., y + 7., 20., 14.), c, 2.);
+                self.line(x + 2., y + 7., x + 2., y + 3., c, 1.4);
+                self.line(x + 2., y + 3., x + 10., y + 3., c, 1.4);
+                self.line(x + 10., y + 3., x + 14., y + 7., c, 1.4);
+            }
             Hit::Preferences => {
                 for i in 0..24 {
                     let a = i as f32 * std::f32::consts::TAU / 24.;
@@ -418,7 +433,7 @@ impl Painter {
                 self.border(rect(x + 12., y + 9., 7., 7.), TEXT, 3.5);
                 self.line(x + 18., y + 15., x + 22., y + 19., TEXT, 1.5);
             }
-            Hit::Refresh | Hit::ResetPreferences => {
+            Hit::Refresh | Hit::ResetPreferences | Hit::GuardRefresh => {
                 // Two opposing arcs and aligned arrowheads form a clear refresh
                 // glyph; the old single arc resembled a power switch.
                 for start in [-165_f32, 15.] {
@@ -466,7 +481,7 @@ impl Painter {
                 }
                 self.line(x + 12., y + 19., x + 22., y + 19., c, 1.5);
             }
-            Hit::Back => {
+            Hit::Back | Hit::BackPreferences => {
                 self.line(x + 14., y + 3., x + 6., y + 10., c, 1.5);
                 self.line(x + 6., y + 10., x + 14., y + 17., c, 1.5);
             }
@@ -509,6 +524,8 @@ struct App {
     shortcut_id: i32,
     preferences_draft: Option<Settings>,
     preferences_note: String,
+    guard_events: Vec<guard::LogEntry>,
+    guard_log_error: String,
     rows: Vec<Row>,
     hits: Vec<Area>,
     popup_hits: Vec<Area>,
@@ -600,6 +617,10 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::Dock => "Dock in the blank title bar area",
         Hit::Follow => "Follow the current Codex chat",
         Hit::Guard => "Protect Codex Git · every 5 seconds · alerts and automatic cleanup",
+        Hit::GuardLogs => "View protection log · badge counts storm episodes, not processes · new tracking; recovered after 60 stable seconds",
+        Hit::GuardRefresh => "Refresh recent protection events",
+        Hit::GuardFolder => "Open log folder · includes compressed history",
+        Hit::BackPreferences => "Back to settings",
         Hit::Body => "Search message text · off by default",
         Hit::Quit => "Quit Session Bar",
         Hit::Emoji(i) => {
@@ -696,6 +717,8 @@ impl App {
             shortcut_id: RECENT_HOTKEY,
             preferences_draft: None,
             preferences_note: String::new(),
+            guard_events: Vec::new(),
+            guard_log_error: String::new(),
             popup_layout: None,
             rows: Vec::new(),
             hits: Vec::new(),
@@ -803,6 +826,14 @@ impl App {
         std::fs::rename(pending, self.paths.app.join("settings.json"))
             .context("Could not save settings")?;
         Ok(())
+    }
+    fn refresh_guard_events(&mut self) {
+        if self.testing { return; }
+        match guard::recent_events(&self.paths) {
+            Ok(entries) => { self.guard_events = entries; self.guard_log_error.clear(); }
+            Err(error) => { self.guard_log_error = format!("Cannot read protection log: {error}"); }
+        }
+        self.scroll = self.scroll.min(self.guard_events.len().saturating_sub(8));
     }
     unsafe fn apply_preferences(&mut self) -> Result<()> {
         let mut next = self.preferences_draft.clone().context("Settings are not open")?;
@@ -1681,6 +1712,43 @@ impl App {
                     false,
                 );
             }
+            Some(Popup::GuardLogs) => {
+                p.label("Protection log", rect(18., 8., width - 130., 30.), 14., TEXT, false);
+                for (hit, x) in [(Hit::GuardRefresh, width - 92.), (Hit::BackPreferences, width - 48.)] {
+                    area(hit.clone(), rect(x, 8., 32., 30.));
+                    p.action_icon(&hit, x + 5., 12.);
+                }
+                p.label(&format!("Storms {}  ·  {}  ·  Ended {} processes",
+                    live.guard.storm_count.map(|v|v.to_string()).unwrap_or_else(|| "—".into()),
+                    if !live.guard.available { "Unavailable" } else if !live.guard.enabled { "Protection off" } else if live.guard.storm_active { "Active" } else { "Stable" },
+                    live.guard.terminated), rect(18., 44., width - 36., 24.), 12., TEXT, false);
+                let since = chrono::DateTime::parse_from_rfc3339(&live.guard.tracking_since).ok()
+                    .map(|t| t.format("%m-%d %H:%M").to_string());
+                p.label(&since.map(|s|format!("Episode tracking since {s} · earlier alarms are not counted"))
+                    .unwrap_or_else(|| "Episode counter unavailable · update Memory Watch".into()),
+                    rect(18., 72., width - 36., 22.), 11., MUTED, false);
+                for (slot, entry) in self.guard_events.iter().skip(self.scroll).take(8).enumerate() {
+                    let y = 104. + slot as f32 * 42.;
+                    p.fill(rect(14., y, width - 32., 39.), 0x293238, 5.);
+                    p.label(&entry.time, rect(22., y + 2., 112., 33.), 10., MUTED, false);
+                    p.label(&entry.title, rect(142., y + 1., width - 170., 20.), 12.,
+                        if entry.warning { ORANGE } else { TEXT }, false);
+                    p.label(&entry.detail, rect(142., y + 20., width - 170., 17.), 10., MUTED, false);
+                }
+                if self.guard_events.is_empty() {
+                    p.label(if self.guard_log_error.is_empty() { "No recent events · open the folder for archived logs" } else { &self.guard_log_error },
+                        rect(24., 125., width - 48., 45.), 12., MUTED, false);
+                }
+                if self.guard_events.len() > 8 {
+                    let thumb = (333. * 8. / self.guard_events.len() as f32).max(18.);
+                    let offset = (333. - thumb) * self.scroll as f32 / (self.guard_events.len() - 8) as f32;
+                    p.fill(rect(width - 10., 106., 3., 333.), 0x354148, 1.5);
+                    p.fill(rect(width - 10., 106. + offset, 3., thumb), 0x77929f, 1.5);
+                }
+                p.label(&format!("{} recent events · scroll · latest log tail", self.guard_events.len()), rect(18., height - 39., width - 90., 28.), 11., MUTED, false);
+                area(Hit::GuardFolder, rect(width - 54., height - 40., 36., 30.));
+                p.action_icon(&Hit::GuardFolder, width - 48., height - 36.);
+            }
             Some(Popup::Preferences) => {
                 let draft = self.preferences_draft.as_ref().unwrap_or(&self.settings);
                 p.label("Settings", rect(16., 8., width - 120., 28.), 14., TEXT, false);
@@ -1723,14 +1791,24 @@ impl App {
                 );
                 let guard_row = rect(16., 391., width - 32., 31.);
                 p.fill(guard_row, 0x293238, 6.);
-                area(Hit::Guard, guard_row);
+                area(Hit::Guard, rect(16., 391., width - 192., 31.));
+                area(Hit::Guard, rect(width - 73., 391., 57., 31.));
                 p.label(
                     "Codex Git memory protection",
-                    rect(27., 391., width - 100., 31.),
+                    rect(27., 391., width - 210., 31.),
                     12.,
                     TEXT,
                     false,
                 );
+                let badge = rect(width - 162., 395., 40., 23.);
+                p.fill(badge, if live.guard.enabled && live.guard.storm_active { 0x62411d } else { 0x314759 }, 10.);
+                area(Hit::GuardLogs, badge);
+                let badge_text = live.guard.storm_count.map(|v|v.to_string()).unwrap_or_else(|| "—".into());
+                let text_width = p.width(&badge_text, 11.).min(32.);
+                p.label(&badge_text, rect(width - 142. - text_width / 2., 395., text_width + 1., 23.),
+                    11., if live.guard.storm_active { ORANGE } else { NEW_RESULT }, false);
+                area(Hit::GuardLogs, rect(width - 113., 391., 32., 31.));
+                p.action_icon(&Hit::GuardLogs, width - 108., 396.);
                 p.toggle(width - 60., 399., live.guard.enabled);
                 p.label(
                     &format!(
@@ -1794,6 +1872,10 @@ impl App {
                     },
                     wide(&if a.hit == Hit::Title {
                         format!("Recent chats · {}", self.settings.recent_shortcut.label())
+                    } else if a.hit == Hit::GuardLogs {
+                        let guard = self.snapshot().guard;
+                        format!("{} recorded storm episodes · view log · continuous storms count once; recovered after 60 stable seconds",
+                            guard.storm_count.map(|v|v.to_string()).unwrap_or_else(|| "—".into()))
                     } else { tip_text(&a.hit, &self.catalog) }),
                 )
             })
@@ -1926,7 +2008,7 @@ impl App {
         let identity = self.identity(&live);
         if identity != self.last_identity {
             self.last_identity = identity;
-            if self.popup_kind.is_some() && self.popup_kind != Some(Popup::Preferences) {
+            if self.popup_kind.is_some() && !matches!(self.popup_kind, Some(Popup::Preferences | Popup::GuardLogs)) {
                 self.close_popup();
             }
         }
@@ -2087,7 +2169,7 @@ impl App {
             let _ = InvalidateRect(self.bar, None, false);
             if matches!(
                 self.popup_kind,
-                Some(Popup::Recent) | Some(Popup::Details) | Some(Popup::Fixed) | Some(Popup::Preferences)
+                Some(Popup::Recent) | Some(Popup::Details) | Some(Popup::Fixed) | Some(Popup::Preferences) | Some(Popup::GuardLogs)
             ) {
                 let _ = InvalidateRect(self.popup, None, false);
             }
@@ -2465,6 +2547,14 @@ impl App {
         true
     }
     unsafe fn popup(&mut self, kind: Popup) -> Result<()> {
+        let resume_preferences = kind == Popup::Preferences && self.popup_kind == Some(Popup::GuardLogs);
+        if self.popup_kind == Some(Popup::Preferences) && kind == Popup::GuardLogs {
+            if let Some(draft) = self.preferences_draft.as_mut() {
+                draft.recent_shortcut = Shortcut::from_control_word(
+                    SendMessageW(self.edit, HKM_GETHOTKEY, WPARAM(0), LPARAM(0)).0 as u16,
+                    draft.recent_shortcut.enabled);
+            }
+        }
         self.close_icon_panel();
         self.tips.retain(|t| t.owner != self.popup);
         if self.popup_kind == Some(kind) && IsWindowVisible(self.popup).as_bool() {
@@ -2504,17 +2594,25 @@ impl App {
             Popup::Details => [560, DETAILS_HEIGHT],
             Popup::Fixed => [560, 500],
             Popup::Preferences => [560, PREFERENCES_HEIGHT],
+            Popup::GuardLogs => [640, 496],
         };
+        if kind == Popup::GuardLogs {
+            self.scroll = 0;
+            self.refresh_guard_events();
+        }
         if kind == Popup::Preferences {
-            self.preferences_draft = Some(self.settings.clone());
-            self.preferences_note = self.shortcut_error.clone();
+            if !resume_preferences || self.preferences_draft.is_none() {
+                self.preferences_draft = Some(self.settings.clone());
+                self.preferences_note = self.shortcut_error.clone();
+            }
             self.edit = CreateWindowExW(
                 WINDOW_EX_STYLE(0), w!("msctls_hotkey32"), w!(""),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP, 258, 198, 278, 24,
                 self.popup, HMENU(104isize as *mut _), GetModuleHandleW(None)?, None,
             )?;
-            SendMessageW(self.edit, HKM_SETHOTKEY, WPARAM(self.settings.recent_shortcut.control_word() as usize), LPARAM(0));
-            let _ = EnableWindow(self.edit, self.settings.recent_shortcut.enabled);
+            let shortcut = &self.preferences_draft.as_ref().unwrap().recent_shortcut;
+            SendMessageW(self.edit, HKM_SETHOTKEY, WPARAM(shortcut.control_word() as usize), LPARAM(0));
+            let _ = EnableWindow(self.edit, shortcut.enabled);
         }
         if kind == Popup::Icons {
             self.scroll = 0;
@@ -2749,6 +2847,18 @@ impl App {
     }
     unsafe fn hit(&mut self, hit: Hit) -> Option<Action> {
         match hit {
+            Hit::GuardLogs => { let _ = self.popup(Popup::GuardLogs); }
+            Hit::GuardRefresh => { self.refresh_guard_events(); }
+            Hit::BackPreferences => { let _ = self.popup(Popup::Preferences); }
+            Hit::GuardFolder => {
+                if !self.testing {
+                    let path = guard::log_dir(&self.paths);
+                    let path = path.to_string_lossy().trim_start_matches(r"\\?\").to_string();
+                    let result = ShellExecuteW(self.popup, w!("open"), PCWSTR(wide(&path).as_ptr()),
+                        PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+                    if result.0 as isize <= 32 { self.guard_log_error = "Cannot open log folder".into(); }
+                }
+            }
             Hit::Preferences => { let _ = self.popup(Popup::Preferences); }
             Hit::Rows(delta) => {
                 if let Some(draft) = self.preferences_draft.as_mut() {
@@ -3313,6 +3423,13 @@ unsafe extern "system" fn wndproc(
                 } else {
                     app.scroll.saturating_sub(3)
                 };
+                let _ = InvalidateRect(app.popup, None, false);
+                Some(LRESULT(0))
+            }
+            WM_MOUSEWHEEL if !is_bar && app.popup_kind == Some(Popup::GuardLogs) => {
+                let delta = ((wparam.0 >> 16) as i16) as i32;
+                app.scroll = if delta < 0 { (app.scroll + 3).min(app.guard_events.len().saturating_sub(8)) }
+                    else { app.scroll.saturating_sub(3) };
                 let _ = InvalidateRect(app.popup, None, false);
                 Some(LRESULT(0))
             }
@@ -4006,7 +4123,10 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         {
             let mut live = state.lock().unwrap();
             live.guard.available = true;
-            live.guard.note = "0 Git · 0 MiB · blocked 0".into();
+            live.guard.note = "0 Git · 0 MiB · ended 128".into();
+            live.guard.terminated = 128;
+            live.guard.storm_count = Some(2);
+            live.guard.tracking_since = "2026-10-20T19:00:00+08:00".into();
         }
         assert!(app.snapshot().guard.enabled);
         assert!(app.hit(Hit::Guard).is_none());
@@ -4016,7 +4136,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         {
             let mut live = state.lock().unwrap();
             live.guard.available = true;
-            live.guard.note = "0 Git · 0 MiB · blocked 0".into();
+            live.guard.note = "0 Git · 0 MiB · ended 128".into();
         }
         let detail_hits = capture(
             &app,
@@ -4170,6 +4290,23 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             &paths.runtime.join("rust-preferences-verification.png"))?;
         assert!(preferences_hits.iter().any(|a| a.hit == Hit::Guard));
         assert!(preferences_hits.iter().any(|a| a.hit == Hit::ApplyPreferences));
+        assert!(preferences_hits.iter().any(|a| a.hit == Hit::GuardLogs && a.contains(451., 405.)));
+        assert!(!preferences_hits.iter().any(|a| a.hit == Hit::Guard && a.contains(451., 405.)));
+        app.guard_events = vec![
+            guard::LogEntry { time:"10-20 20:55:40".into(), title:"Storm recovered".into(), detail:"Below limits for 60 seconds".into(), warning:false },
+            guard::LogEntry { time:"10-20 20:54:40".into(), title:"Git ended · PID 12340".into(), detail:"terminated".into(), warning:false },
+            guard::LogEntry { time:"10-20 20:54:40".into(), title:"Ending read-only Git · PID 12340".into(), detail:"diff · 35 MiB · Codex PID 12300".into(), warning:false },
+            guard::LogEntry { time:"10-20 20:46:41".into(), title:"Git storm #2 detected".into(), detail:"100 Git · 3400 MiB · protection activated".into(), warning:true },
+        ];
+        app.hit(Hit::Rows(1));
+        let guard_enabled = app.snapshot().guard.enabled;
+        app.hit(Hit::GuardLogs);
+        assert_eq!(app.popup_kind, Some(Popup::GuardLogs));
+        assert_eq!(app.snapshot().guard.enabled, guard_enabled);
+        capture(&app, Some(Popup::GuardLogs), 640, 496, &paths.runtime.join("rust-guard-log-verification.png"))?;
+        app.hit(Hit::BackPreferences);
+        assert_eq!(app.popup_kind, Some(Popup::Preferences));
+        assert_eq!(app.preferences_draft.as_ref().unwrap().recent_rows, 11);
         assert!(app.hits.iter().any(|a| a.hit == Hit::Preferences));
         assert!(!app.hits.iter().any(|a| a.hit == Hit::Hide));
         // Exercise real Windows registration and persistence only in an isolated
@@ -4209,7 +4346,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         app.shortcut_id = RECENT_HOTKEY;
         paths.write("rust-preferences-test.json", &json!({"apply_and_discard":true,"invalid_shortcut_preserves_settings":true,
             "shortcut_enable_disable":true,"native_hotkey_conflict_preserves_previous_registration_and_file":true,
-            "default_recent_rows":10,"configured_scroll_last_row":true,"extensions_only_in_settings":true}));
+            "default_recent_rows":10,"configured_scroll_last_row":true,"extensions_only_in_settings":true,
+            "guard_log_button_does_not_toggle_protection":true,"guard_log_preserves_unsaved_settings":true}));
         paths.write("rust-popover-shortcut-test.json", &json!({"list_window_preserved":true,"list_search_scroll_selection_preserved":true,"native_icon_click_routed":true,"icon_combo_survives_100_refreshes":true,"recent_shortcut_toggle":true,"index_percent_local_only":true,"body_snippet_highlight":true}));
         let _ = app.hit(Hit::Hide);
         assert!(app.hidden);

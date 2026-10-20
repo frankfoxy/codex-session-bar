@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     fs,
+    io::{Read, Seek, SeekFrom},
     os::windows::process::CommandExt,
     path::PathBuf,
     process::Command,
@@ -28,6 +29,9 @@ pub struct View {
     pub max_processes: usize,
     pub max_private_mib: u64,
     pub note: String,
+    pub storm_count: Option<u64>,
+    pub storm_active: bool,
+    pub tracking_since: String,
 }
 impl Default for View {
     fn default() -> Self {
@@ -40,11 +44,57 @@ impl Default for View {
             max_processes: 64,
             max_private_mib: 4096,
             note: "Connecting to Memory Watch…".into(),
+            storm_count: None,
+            storm_active: false,
+            tracking_since: String::new(),
         }
     }
 }
 fn dir(paths: &Paths) -> PathBuf {
     paths.runtime.parent().unwrap().join("memory-watch-rust")
+}
+pub fn log_dir(paths: &Paths) -> PathBuf { dir(paths) }
+#[derive(Clone, Default)]
+pub struct LogEntry {
+    pub time: String,
+    pub title: String,
+    pub detail: String,
+    pub warning: bool,
+}
+pub fn recent_events(paths: &Paths) -> anyhow::Result<Vec<LogEntry>> {
+    let path = dir(paths).join("codex-git-guard-events.jsonl");
+    if !path.exists() { return Ok(Vec::new()); }
+    let mut file = fs::File::open(path)?;
+    let start = file.metadata()?.len().saturating_sub(65536);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity(65536);
+    file.take(65536).read_to_end(&mut bytes)?;
+    Ok(parse_events(&bytes, start > 0))
+}
+fn parse_events(bytes: &[u8], skip_first: bool) -> Vec<LogEntry> {
+    let end = bytes.iter().rposition(|b| *b == b'\n').map(|i| i + 1).unwrap_or(0);
+    let mut entries = Vec::new();
+    for line in bytes[..end].split(|b| *b == b'\n').skip(usize::from(skip_first)) {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else { continue; };
+        let kind = value["type"].as_str().unwrap_or("");
+        let pid = value["pid"].as_u64().unwrap_or(0);
+        let (title, detail, warning) = match kind {
+            "storm_started" => (format!("Git storm #{} detected", value["episode"].as_u64().unwrap_or(0)),
+                format!("{} Git · {:.0} MiB · protection activated", value["count"].as_u64().unwrap_or(0), value["private_bytes"].as_u64().unwrap_or(0) as f64 / 1048576.), true),
+            "storm_recovered" => ("Storm recovered".into(), "Below limits for 60 seconds".into(), false),
+            "limit_exceeded" => ("Limit exceeded".into(), format!("{} Git · {:.0} MiB · {}", value["count"].as_u64().unwrap_or(0), value["private_bytes"].as_u64().unwrap_or(0) as f64 / 1048576., value["reason"].as_str().unwrap_or("")), true),
+            "termination_requested" => (format!("Ending read-only Git · PID {pid}"), format!("{} · {:.0} MiB · Codex PID {}", value["verb"].as_str().unwrap_or("query"), value["private_bytes"].as_u64().unwrap_or(0) as f64 / 1048576., value["codex_pid"].as_u64().unwrap_or(0)), false),
+            "termination_result" => {
+                let result = value["result"].as_str().unwrap_or("unknown");
+                (format!("{} · PID {pid}", if result == "terminated" { "Git ended" } else { "Git skipped / pending" }), result.chars().take(180).collect(), result != "terminated")
+            }
+            _ => continue,
+        };
+        let time = value["time"].as_str().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.format("%m-%d %H:%M:%S").to_string()).unwrap_or_else(|| "—".into());
+        entries.push(LogEntry { time, title, detail, warning });
+    }
+    entries.into_iter().rev().take(200).collect()
 }
 pub fn set(paths: &Paths, enabled: bool) -> anyhow::Result<()> {
     let dir = dir(paths);
@@ -103,7 +153,7 @@ fn snapshot(paths: &Paths) -> View {
     let note = if available {
         if enabled {
             format!(
-                "{} Git · {:.0} MiB · blocked {}",
+                "{} Git · {:.0} MiB · ended {}",
                 status["count"].as_u64().unwrap_or(0),
                 status["private_bytes"].as_u64().unwrap_or(0) as f64 / 1048576.,
                 status["terminated"].as_u64().unwrap_or(0)
@@ -132,6 +182,9 @@ fn snapshot(paths: &Paths) -> View {
         max_processes: cfg["max_processes"].as_u64().unwrap_or(64) as usize,
         max_private_mib: cfg["max_private_mib"].as_u64().unwrap_or(4096),
         note,
+        storm_count: status["storm_count"].as_u64(),
+        storm_active: status["storm_active"].as_bool().unwrap_or(false),
+        tracking_since: status["tracking_since"].as_str().unwrap_or("").to_string(),
     }
 }
 pub fn start(paths: &Paths, state: &State, stop: &Stop) -> thread::JoinHandle<()> {
@@ -175,4 +228,21 @@ pub fn start(paths: &Paths, state: &State, stop: &Stop) -> thread::JoinHandle<()
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn log_tail_discards_partial_records_and_distinguishes_counts() {
+        let data = b"truncated\n{\"type\":\"storm_started\",\"episode\":2,\"count\":100}\n{\"type\":\"termination_result\",\"pid\":123,\"result\":\"terminated\"}\n{\"type\":\"termination_result\",\"pid\":124,\"result\":\"skipped: identity changed\"}\n{\"type\":\"storm_recovered\"}\n{\"type\":";
+        let rows = parse_events(data, true);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].title, "Storm recovered");
+        assert!(rows[1].warning);
+        assert!(!rows[2].warning);
+        assert_eq!(rows[2].title, "Git ended · PID 123");
+        assert_eq!(rows[3].title, "Git storm #2 detected");
+        assert!(!rows[3].title.contains("100"));
+    }
 }

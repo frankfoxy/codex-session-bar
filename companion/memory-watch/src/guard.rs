@@ -25,6 +25,7 @@ use windows::{
 
 pub const CONFIG: &str = "codex-git-guard-settings.json";
 pub const STATUS: &str = "codex-git-guard-status.json";
+const COUNTERS: &str = "codex-git-guard-counters.json";
 const MIB: u64 = 1024 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -84,6 +85,80 @@ pub struct Status {
     pub error: String,
     pub check_ms: f64,
     pub interval_seconds: u64,
+    pub storm_count: u64,
+    pub storm_active: bool,
+    pub tracking_since: String,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Incidents {
+    version: u32,
+    tracked_since: String,
+    storms: u64,
+    active: bool,
+    terminated: usize,
+    #[serde(skip)]
+    calm_since: Option<f64>,
+    #[serde(skip)]
+    last_observation: Option<f64>,
+}
+impl Incidents {
+    fn load(dir: &Path) -> Result<Self> {
+        let file = dir.join(COUNTERS);
+        if file.exists() {
+            ensure!(fs::metadata(&file)?.len() <= 16384, "Guard counters too large");
+            let saved: Self = serde_json::from_slice(&fs::read(file)?)?;
+            ensure!(saved.version == 1, "Unsupported guard counters");
+            return Ok(saved);
+        }
+        // Preserve the known process total on upgrade; historical alarm logs
+        // cannot reconstruct exact episode counts and must not be guessed.
+        let old = dir.join(STATUS);
+        let previous = if fs::metadata(&old).is_ok_and(|m| m.len() <= 16384) {
+            serde_json::from_slice::<serde_json::Value>(&fs::read(old)?).unwrap_or_default()
+        } else { serde_json::Value::Null };
+        let initial = Self {
+            version: 1, tracked_since: chrono::Local::now().to_rfc3339(), storms: 0,
+            active: false, terminated: previous["terminated"].as_u64().unwrap_or(0) as usize,
+            calm_since: None, last_observation: None,
+        };
+        initial.save(dir)?;
+        Ok(initial)
+    }
+    fn save(&self, dir: &Path) -> Result<()> {
+        let pending = dir.join(format!("{COUNTERS}.{}.pending", std::process::id()));
+        let mut file = OpenOptions::new().create(true).truncate(true).write(true).open(&pending)?;
+        serde_json::to_writer(&mut file, self)?;
+        file.sync_data()?;
+        drop(file);
+        fs::rename(pending, dir.join(COUNTERS))?;
+        Ok(())
+    }
+    fn pause(&mut self) {
+        self.calm_since = None;
+        self.last_observation = None;
+    }
+    fn observe(&mut self, over: bool, at: f64) -> Option<&'static str> {
+        if self.last_observation.is_some_and(|last| !(0.0..=15.0).contains(&(at - last))) {
+            self.calm_since = None;
+        }
+        self.last_observation = Some(at);
+        if over {
+            self.calm_since = None;
+            if !self.active {
+                self.active = true;
+                self.storms += 1;
+                return Some("storm_started");
+            }
+        } else if self.active {
+            let start = *self.calm_since.get_or_insert(at);
+            if at - start >= 60.0 {
+                self.active = false;
+                self.calm_since = None;
+                return Some("storm_recovered");
+            }
+        }
+        None
+    }
 }
 fn now() -> f64 {
     std::time::SystemTime::now()
@@ -413,11 +488,14 @@ pub struct Guard {
     streak: u32,
     last_popup: Option<Instant>,
     status: Status,
+    incidents: Incidents,
     #[cfg(test)]
     scope: Option<HashSet<(u32, i64)>>,
 }
 impl Guard {
     pub fn new(dir: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&dir)?;
+        let incidents = Incidents::load(&dir)?;
         Ok(Self {
             dir,
             collector: Collector::new(),
@@ -425,7 +503,9 @@ impl Guard {
             next: Instant::now(),
             streak: 0,
             last_popup: None,
-            status: Status::default(),
+            status: Status { terminated: incidents.terminated, storm_count: incidents.storms,
+                storm_active: incidents.active, tracking_since: incidents.tracked_since.clone(), ..Status::default() },
+            incidents,
             #[cfg(test)]
             scope: None,
         })
@@ -461,6 +541,20 @@ impl Guard {
         file.sync_data()?;
         Ok(())
     }
+    fn record_observation(&mut self, over: bool) -> Result<()> {
+        let mut next = self.incidents.clone();
+        let event = next.observe(over, now());
+        if let Some(kind) = event {
+            next.save(&self.dir)?;
+            self.event(json!({"type":kind,"time":chrono::Local::now().to_rfc3339(),
+                "episode":next.storms,"count":self.status.count,"private_bytes":self.status.private_bytes,
+                "stable_seconds":60}))?;
+        }
+        self.incidents = next;
+        self.status.storm_count = self.incidents.storms;
+        self.status.storm_active = self.incidents.active;
+        Ok(())
+    }
     pub fn poll(&mut self) -> (Option<String>, String) {
         if Instant::now() < self.next {
             return (None, String::new());
@@ -469,6 +563,7 @@ impl Guard {
         let started = Instant::now();
         let mut alert = None;
         if let Err(e) = self.check(&mut alert) {
+            self.incidents.pause();
             self.status.healthy = false;
             self.status.error = format!("{e:#}");
             self.status.last_alert = format!("Codex Git 防护失败：{e:#}。请检查内存监测程序。 ");
@@ -494,9 +589,10 @@ impl Guard {
             "Codex Git 防护已关闭".into()
         } else {
             format!(
-                "Codex Git 防护已开启 · {} 个 · {:.0} MiB · 已拦截 {}",
+                "Codex Git 防护已开启 · {} 个 · {:.0} MiB · 风暴 {} 次 · 已结束 {} 个进程",
                 self.status.count,
                 self.status.private_bytes as f64 / MIB as f64,
+                self.status.storm_count,
                 self.status.terminated
             )
         };
@@ -511,6 +607,7 @@ impl Guard {
         self.status.error.clear();
         if !cfg.enabled {
             self.streak = 0;
+            self.incidents.pause();
             return Ok(());
         }
         let snapshot = self.collector.sample(1)?;
@@ -532,6 +629,7 @@ impl Guard {
             || self.status.private_bytes > cfg.max_private_mib * MIB;
         self.streak = if over { self.streak + 1 } else { 0 };
         if !over {
+            self.record_observation(false)?;
             return Ok(());
         }
         // Re-sample before acting. PID/creation-time, ancestry, image, owner and
@@ -555,8 +653,10 @@ impl Guard {
                 <= cfg.max_private_mib * MIB
         {
             self.streak = 0;
+            self.record_observation(false)?;
             return Ok(());
         }
+        self.record_observation(true)?;
         let reason = if self.status.count > cfg.max_processes {
             "process_limit"
         } else {
@@ -619,6 +719,8 @@ impl Guard {
             self.event(json!({"time":chrono::Local::now().to_rfc3339(),"type":"termination_result","pid":victim.process.pid,"created_ticks":victim.process.created_ticks,"result":outcome}))?;
         }
         self.status.terminated += ended;
+        self.incidents.terminated = self.status.terminated;
+        self.incidents.save(&self.dir)?;
         self.status.last_alert=format!("Codex Git 超限：{} 个 / {:.0} MiB（上限 {} 个 / {} MiB）。已结束 {} 个，等待退出 {} 个，跳过 {} 个。写操作及无法确认归属的进程不会结束。详见 codex-git-guard-events.jsonl。",self.status.count,self.status.private_bytes as f64/MIB as f64,cfg.max_processes,cfg.max_private_mib,ended,pending,failed);
         if popup_due {
             *alert = Some(self.status.last_alert.clone());
@@ -632,6 +734,32 @@ impl Guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn storm_counter_requires_a_stable_minute_and_survives_serialization() {
+        let mut counter = Incidents { version:1, tracked_since:"2026-10-20T00:00:00Z".into(),
+            storms:0, active:false, terminated:9592, calm_since:None, last_observation:None };
+        assert_eq!(counter.observe(true, 100.), Some("storm_started"));
+        for at in [105., 110., 115., 120.] { assert!(counter.observe(true, at).is_none()); }
+        assert_eq!(counter.storms, 1);
+        assert!(counter.observe(false, 125.).is_none());
+        assert!(counter.observe(true, 130.).is_none());
+        for at in (135..195).step_by(5) { assert!(counter.observe(false, at as f64).is_none()); }
+        assert_eq!(counter.observe(false, 195.), Some("storm_recovered"));
+        assert_eq!(counter.observe(true, 200.), Some("storm_started"));
+        assert_eq!(counter.storms, 2);
+        counter.observe(false, 205.);
+        // An unobserved gap is not evidence of a stable minute.
+        assert!(counter.observe(false, 300.).is_none());
+        assert!(counter.active);
+        let mut restored: Incidents = serde_json::from_slice(&serde_json::to_vec(&counter).unwrap()).unwrap();
+        assert_eq!(restored.terminated, 9592);
+        assert_eq!(restored.storms, 2);
+        assert!(restored.observe(true, 400.).is_none());
+        assert_eq!(restored.storms, 2);
+        restored.pause();
+        assert!(restored.observe(false, 500.).is_none());
+        assert!(restored.active);
+    }
     fn args(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
     }
@@ -823,6 +951,11 @@ mod tests {
             "Controlled children must be traceable to the actual Codex ancestor"
         );
         assert_eq!(guard.status.terminated, 4);
+        assert_eq!(guard.status.storm_count, 1);
+        assert!(guard.status.storm_active);
+        let restored = Guard::new(dir.clone()).unwrap();
+        assert_eq!(restored.status.terminated, 4);
+        assert_eq!(restored.status.storm_count, 1);
         assert!(warning.is_some());
         assert!(
             children.0[9].try_wait().unwrap().is_none(),
