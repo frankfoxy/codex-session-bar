@@ -1,5 +1,6 @@
 settings.json
 bin/
+/memory-watch/
 target/
 tmp/
 *.log

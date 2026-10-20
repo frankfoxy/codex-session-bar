@@ -31,6 +31,7 @@ navigates chats, renames them, submits prompts or resumes work.
 ## Repository layout and releases
 
 - `src/`: native Rust application.
+- `companion/memory-watch/`: independent native monitor and Git enforcement backend.
 - `assets/images/`: sanitized README screenshots and docking illustration.
 - `emoji_catalog.json`: runtime emoji catalog.
 - `Build.ps1`: build/test; `-NoInstall` keeps the installed executable untouched.
@@ -39,6 +40,14 @@ navigates chats, renames them, submits prompts or resumes work.
 
 `--version` prints the Cargo package version without opening the UI or creating runtime files.
 Build output and release staging live under workspace `tmp`, not in Git.
+
+## Codex Git guard
+
+The Session Bar `guard.rs` only reads fresh, PID-matched Memory Watch state and writes its enable preference, preserving advanced limits. It can start a bundled companion hidden. The native monitor owns enumeration, user/session and ancestry checks, command classification, logging, termination and warning windows. Shared files live under workspace `tmp/memory-watch-rust`; heartbeat expiry is 15 seconds. A missing backend is shown as unavailable.
+
+Enforcement runs every five seconds even when ordinary 30-second recording is paused. Two snapshots confirm a breach; only verified read-query Git handles are terminated, after a durable intent record. Creation-time validation prevents PID reuse errors. An executable name alone is insufficient; installed Codex path, account and Windows session are verified. Write/unknown commands are never killed. Shutdown/cancellation does not stop unrelated applications.
+
+The default companion tests are read-only or synthetic. Its ignored controlled native test requires a deliberately built sleeping `git.exe` fixture under workspace `tmp`, supplied as `CODEX_GUARD_FIXTURE_EXE`; test-only PID/birth scoping confines termination to children the test owns. It checks disabling, real termination and log records, while leaving its `commit` fixture alive. No production scope override is compiled into release builds.
 
 ## Data and desktop integration
 

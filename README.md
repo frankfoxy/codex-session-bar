@@ -59,6 +59,16 @@
 
 > 图片为界面演示，标题栏使用“xxx 会话名称”和示例速率，不包含个人聊天记录。
 
+## 04 · Codex Git 内存防护（当前源码新增）
+
+![会话详情中的默认开启防护开关](assets/images/preview-protection.png)
+
+打开 **Session details**，可直接开关 **Codex Git memory protection**。默认开启，每 **5 秒**检查一次，预设 **64 个进程 / 合计 4 GiB**，无需填写参数。
+
+防护由独立的 Memory Watch 伴随程序执行。超限时弹出警告、记录原因，并自动结束已验证由 Codex 启动的异常 Git 查询进程；提交、推送等写操作及归属不明的进程会跳过。后端未启动或状态失联时明确提示，不会显示为已生效。
+
+普通内存日志仍每 30 秒采样，暂停记录也会继续防护。[查看防护范围与日志](companion/memory-watch/README.md)。这项功能包含在当前源码构建及后续发布包中，已发布的 `v0.1.0` 下载包不包含此项。
+
 ## 快速开始
 
 运行需要 **Windows 10/11、Node.js、已登录的 Codex Desktop**，以及桌面自带的 App Tools 插件。无需安装 Python、Qt 或额外的 Codex CLI。

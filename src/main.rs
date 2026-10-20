@@ -4,6 +4,7 @@ mod body;
 mod data;
 mod desktop;
 mod host;
+mod guard;
 mod search;
 mod ui;
 
@@ -135,6 +136,7 @@ fn yes() -> bool {
 
 #[derive(Clone, Default, Serialize)]
 pub struct Shared {
+    pub guard: guard::View,
     pub host: isize,
     pub view: Option<String>,
     pub view_label: String,

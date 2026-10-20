@@ -2,7 +2,7 @@ use crate::{
     body,
     data::{self, Catalog, Row},
     desktop::{Action, Workers},
-    host, now,
+    guard, host, now,
     search::{ranked_matches, ChatSearch},
     Paths, Settings, State, Stop,
 };
@@ -145,6 +145,7 @@ enum Hit {
     Refresh,
     Dock,
     Follow,
+    Guard,
     Body,
     Quit,
 }
@@ -555,6 +556,7 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::Refresh => "Refresh account limits and chat list",
         Hit::Dock => "Dock in the blank title bar area",
         Hit::Follow => "Follow the current Codex chat",
+        Hit::Guard => "Protect Codex Git · every 5 seconds · alerts and automatic cleanup",
         Hit::Body => "Search message text · off by default",
         Hit::Quit => "Quit Session Bar",
         Hit::Emoji(i) => {
@@ -1501,21 +1503,44 @@ impl App {
                         .join("   ")
                 };
                 p.label(&quota, rect(16., 167., width - 32., 25.), 12., MUTED, false);
+                let guard_row = rect(16., 202., width - 32., 31.);
+                p.fill(guard_row, 0x293238, 6.);
+                area(Hit::Guard, guard_row);
+                p.label(
+                    "Codex Git memory protection",
+                    rect(27., 202., width - 100., 31.),
+                    12.,
+                    TEXT,
+                    false,
+                );
+                p.toggle(width - 60., 210., live.guard.enabled);
+                p.label(
+                    &format!(
+                        "{} · {} processes / {:.0} GiB · 5s",
+                        live.guard.note,
+                        live.guard.max_processes,
+                        live.guard.max_private_mib as f64 / 1024.
+                    ),
+                    rect(20., 235., width - 40., 29.),
+                    11.,
+                    if live.guard.available { MUTED } else { ORANGE },
+                    false,
+                );
                 for (hit, x) in [
                     (Hit::Refresh, 16.),
                     (Hit::Dock, 58.),
                     (Hit::Quit, width - 52.),
                 ] {
                     if hit == Hit::Refresh {
-                        p.fill(rect(x, 204., 36., 32.), 0x2b3a3c, 5.);
+                        p.fill(rect(x, 275., 36., 32.), 0x2b3a3c, 5.);
                     }
-                    area(hit.clone(), rect(x, 204., 36., 32.));
-                    p.border(rect(x, 204., 36., 32.), 0x47535b, 5.);
-                    p.action_icon(&hit, x + 6., 210.);
+                    area(hit.clone(), rect(x, 275., 36., 32.));
+                    p.border(rect(x, 275., 36., 32.), 0x47535b, 5.);
+                    p.action_icon(&hit, x + 6., 281.);
                 }
                 p.label(
                     &live.action_note,
-                    rect(16., 241., width - 32., 28.),
+                    rect(16., 312., width - 32., 28.),
                     11.,
                     if live.action_note.starts_with("Action failed") {
                         0xf87171
@@ -1526,7 +1551,7 @@ impl App {
                 );
                 p.label(
                     "Ctrl+Alt+J: recent chats · × hides to tray",
-                    rect(16., 274., width - 32., 25.),
+                    rect(16., 345., width - 32., 25.),
                     11.,
                     MUTED,
                     false,
@@ -2285,7 +2310,7 @@ impl App {
                 [560, 436]
             }
             Popup::Icons => [384, 450],
-            Popup::Details => [560, 310],
+            Popup::Details => [560, 380],
             Popup::Fixed => [560, 500],
         };
         if kind == Popup::Icons {
@@ -2528,7 +2553,7 @@ impl App {
         let live = self.snapshot();
         let current = self.current(&live);
         let (_, title, status, _, _) = unsafe { self.bar_text(&live) };
-        self.paths.write(if self.testing{"rust-test-status.json"}else{"live-status.json"},&json!({"pid":std::process::id(),"runtime":"rust","updated_at":now(),"thread":self.identity(&live),"overview":self.identity(&live).is_empty() && data::visible_chat_title(&live.view_label).is_none(),"display_title":title,"display_status":status,"tokens":current.and_then(|s|s.tokens()),"auto_thread":live.auto_thread,"topmost":true,"user_hidden":self.hidden,"host_hidden":self.host_hidden,"host_window":live.host,"host_rect":self.last_host,"host_offset":self.settings.host_offset,"titlebar_slot":live.slot,"quota":live.quota,"quota_error":live.quota_error,"recent_cache":{"rows":live.recent.rows.len(),"busy_count":live.recent.busy_count,"stale":live.recent.stale,"error":live.recent.error},"active_view":{"thread":live.view,"label":live.view_label,"available":live.view.is_some() || data::visible_chat_title(&live.view_label).is_some(),"identity_pending":live.auto_thread && live.view.is_none() && data::visible_chat_title(&live.view_label).is_some(),"source":"uia-current-page"},"action_note":live.action_note,"font":{"chinese":self.painter.chinese,"latin":"Segoe UI","emoji":"Segoe UI Emoji","renderer":"DirectWrite / software Direct2D","antialias":"ClearType","per_monitor_dpi":true}}));
+        self.paths.write(if self.testing{"rust-test-status.json"}else{"live-status.json"},&json!({"pid":std::process::id(),"runtime":"rust","updated_at":now(),"thread":self.identity(&live),"overview":self.identity(&live).is_empty() && data::visible_chat_title(&live.view_label).is_none(),"display_title":title,"display_status":status,"tokens":current.and_then(|s|s.tokens()),"auto_thread":live.auto_thread,"topmost":true,"user_hidden":self.hidden,"host_hidden":self.host_hidden,"host_window":live.host,"host_rect":self.last_host,"host_offset":self.settings.host_offset,"titlebar_slot":live.slot,"quota":live.quota,"quota_error":live.quota_error,"recent_cache":{"rows":live.recent.rows.len(),"busy_count":live.recent.busy_count,"stale":live.recent.stale,"error":live.recent.error},"active_view":{"thread":live.view,"label":live.view_label,"available":live.view.is_some() || data::visible_chat_title(&live.view_label).is_some(),"identity_pending":live.auto_thread && live.view.is_none() && data::visible_chat_title(&live.view_label).is_some(),"source":"uia-current-page"},"action_note":live.action_note,"codex_git_guard":live.guard,"font":{"chinese":self.painter.chinese,"latin":"Segoe UI","emoji":"Segoe UI Emoji","renderer":"DirectWrite / software Direct2D","antialias":"ClearType","per_monitor_dpi":true}}));
     }
     unsafe fn hit(&mut self, hit: Hit) -> Option<Action> {
         match hit {
@@ -2635,6 +2660,27 @@ impl App {
                 live.snapshot = None;
                 drop(live);
                 self.settings();
+                let _ = InvalidateRect(self.popup, None, false);
+            }
+            Hit::Guard => {
+                let enabled = !self.snapshot().guard.enabled;
+                let result = if self.testing {
+                    Ok(())
+                } else {
+                    guard::set(&self.paths, enabled)
+                };
+                let mut live = self.state.lock().unwrap();
+                match result {
+                    Ok(()) => {
+                        live.guard.enabled = enabled;
+                        live.guard.available = false;
+                        live.guard.note = "Applying change…".into();
+                    }
+                    Err(error) => {
+                        live.guard.available = false;
+                        live.guard.note = format!("Cannot change protection: {error}");
+                    }
+                }
                 let _ = InvalidateRect(self.popup, None, false);
             }
             Hit::Body => {
@@ -3188,7 +3234,8 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
         register()?;
         let app = App::new(paths.clone(), settings, state.clone(), stop.clone(), false)?;
         let workers = Workers::start(&paths, &state, &stop, &app.catalog);
-        let observers = host::start(&paths, &state, &stop);
+        let mut observers = host::start(&paths, &state, &stop);
+        observers.push(guard::start(&paths, &state, &stop));
         ACTIONS.with(|a| *a.borrow_mut() = Some(workers.actions.clone()));
         APP.with(|a| *a.borrow_mut() = Some(app));
         let mut msg = MSG::default();
@@ -3723,11 +3770,26 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         )?;
         app.rows = rows.clone();
         app.popup(Popup::Details)?;
+        {
+            let mut live = state.lock().unwrap();
+            live.guard.available = true;
+            live.guard.note = "0 Git · 0 MiB · blocked 0".into();
+        }
+        assert!(app.snapshot().guard.enabled);
+        assert!(app.hit(Hit::Guard).is_none());
+        assert!(!app.snapshot().guard.enabled);
+        assert!(app.hit(Hit::Guard).is_none());
+        assert!(app.snapshot().guard.enabled);
+        {
+            let mut live = state.lock().unwrap();
+            live.guard.available = true;
+            live.guard.note = "0 Git · 0 MiB · blocked 0".into();
+        }
         assert!(capture(
             &app,
             Some(Popup::Details),
             560,
-            310,
+            380,
             &paths.runtime.join("rust-details-verification.png")
         )?
         .iter()
@@ -3796,7 +3858,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             &app,
             Some(Popup::Details),
             560,
-            310,
+            380,
             &paths.runtime.join("rust-details-verification.png"),
         )?;
         *state.lock().unwrap() = before;
