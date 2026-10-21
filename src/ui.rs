@@ -1787,7 +1787,7 @@ impl App {
                 );
                 let guard_row = rect(16., 391., width - 32., 31.);
                 p.fill(guard_row, 0x293238, 6.);
-                area(Hit::Guard, rect(16., 391., width - 192., 31.));
+                area(Hit::Guard, rect(16., 391., width - 226., 31.));
                 area(Hit::Guard, rect(width - 73., 391., 57., 31.));
                 p.ui_label(
                     "Codex Git memory protection",
@@ -2978,7 +2978,7 @@ impl App {
             }
             Hit::GuardSettings => {
                 if let Some(draft)=self.preferences_draft.as_mut(){draft.recent_shortcut=Shortcut::from_control_word(SendMessageW(self.edit,HKM_GETHOTKEY,WPARAM(0),LPARAM(0)).0 as u16,draft.recent_shortcut.enabled);}
-                self.guard_limits=guard::Limits::load(&self.paths);self.preferences_guard=true;self.preferences_advanced=false;self.preferences_note.clear();let _=ShowWindow(self.edit,SW_HIDE);
+                self.guard_limits=guard::Limits::load(&self.paths);self.preferences_guard=true;self.preferences_advanced=false;self.preferences_note.clear();if !self.testing{let _=SetFocus(self.popup);}let _=ShowWindow(self.edit,SW_HIDE);
             }
             Hit::GuardLimit(field,delta) => {self.guard_limits.adjust(field,delta);self.preferences_note="Apply to save changes".into();}
             Hit::RefreshPreferences => {

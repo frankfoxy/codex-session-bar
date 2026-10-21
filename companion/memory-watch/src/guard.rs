@@ -2,6 +2,7 @@
 //! Process names alone never authorize termination; identity is checked again
 //! using the same open handle that is passed to TerminateProcess.
 use crate::collect::{Collector, Process, Snapshot};
+use crate::attribution;
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -94,6 +95,9 @@ pub struct Status {
     pub storm_count: u64,
     pub storm_active: bool,
     pub tracking_since: String,
+    pub observed_new_git_60s: usize,
+    pub episode_terminated: usize,
+    pub peak_count: usize,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Incidents {
@@ -102,6 +106,8 @@ struct Incidents {
     storms: u64,
     active: bool,
     terminated: usize,
+    #[serde(default)]
+    terminated_at_start: usize,
     #[serde(skip)]
     calm_since: Option<f64>,
     #[serde(skip)]
@@ -112,7 +118,9 @@ impl Incidents {
         let file = dir.join(COUNTERS);
         if file.exists() {
             ensure!(fs::metadata(&file)?.len() <= 16384, "Guard counters too large");
-            let saved: Self = serde_json::from_slice(&fs::read(file)?)?;
+            let value:serde_json::Value=serde_json::from_slice(&fs::read(file)?)?;
+            let mut saved: Self = serde_json::from_value(value.clone())?;
+            if value.get("terminated_at_start").is_none(){saved.terminated_at_start=saved.terminated;}
             ensure!(saved.version == 1, "Unsupported guard counters");
             return Ok(saved);
         }
@@ -125,7 +133,7 @@ impl Incidents {
         let initial = Self {
             version: 1, tracked_since: chrono::Local::now().to_rfc3339(), storms: 0,
             active: false, terminated: previous["terminated"].as_u64().unwrap_or(0) as usize,
-            calm_since: None, last_observation: None,
+            terminated_at_start: 0, calm_since: None, last_observation: None,
         };
         initial.save(dir)?;
         Ok(initial)
@@ -153,6 +161,7 @@ impl Incidents {
             if !self.active {
                 self.active = true;
                 self.storms += 1;
+                self.terminated_at_start = self.terminated;
                 return Some("storm_started");
             }
         } else if self.active {
@@ -486,6 +495,46 @@ fn plan<'a>(items: &'a [Candidate], cfg: &Config) -> Vec<&'a Candidate> {
     }
     selected
 }
+#[derive(Clone, Default, Serialize)]
+struct Source {
+    git_pid: u32,
+    codex_pid: u32,
+    git_created_ticks: i64,
+    codex_created_ticks: i64,
+    image: String,
+    command: Vec<String>,
+    context: attribution::Context,
+}
+fn source(candidate: &Candidate) -> Source {
+    let mut result=Source {git_pid:candidate.process.pid,codex_pid:candidate.origin.0,
+        git_created_ticks:candidate.process.created_ticks,codex_created_ticks:candidate.origin.1,
+        image:candidate.path.clone(),..Source::default()};
+    // Context is optional and never used as permission to terminate a process.
+    unsafe {if let Ok(raw)=OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,false,result.git_pid){
+        let handle=Handle(raw);
+        if created(handle.0).ok()==Some(result.git_created_ticks){
+            result.context=attribution::process(handle.0);
+            result.command=command(handle.0).unwrap_or_default().into_iter().take(40)
+                .map(|arg|arg.chars().take(512).collect()).collect();
+        }
+    }}
+    if let Some(home)=attribution::codex_home(){attribution::resolve(&mut result.context,&home);}
+    result
+}
+fn warning(status:&Status,sources:&[Source],skipped:usize)->String {
+    let pids=sources.iter().map(|s|format!("{} → {}",s.codex_pid,s.git_pid)).collect::<Vec<_>>().join("；");
+    let context=sources.first().map(|s|&s.context);
+    let session=match context {
+        Some(c) if !c.session_id.is_empty()=>format!("{} ({}) [进程会话 ID]",c.session_title.chars().take(48).collect::<String>(),c.session_id),
+        _=>"暂无法确认；Codex 后台可能由多个会话共用".into(),
+    };
+    let cwd=context.filter(|c|!c.cwd.is_empty()).map(|c|c.cwd.chars().take(160).collect::<String>()).unwrap_or_else(||"未能读取".into());
+    let clue=context.and_then(|c|c.candidates.first()).map(|s|format!("\r\n目录匹配线索（非确认归属）：{s}")).unwrap_or_default();
+    format!("Codex Git 保护：{}\r\n\r\n本次累计已确认结束 {} 个 Git；另有 {} 个已下达结束命令，等待确认。\r\n近 60 秒至少观察到 {} 个新 Git；当前 {} 个，本次峰值 {} 个。\r\n上限：{} 个 / 合计 {} MiB；当前合计 {:.0} MiB。\r\n来源 PID（Codex → Git 示例）：{}\r\n进程：git.exe；完整路径和命令已记录到日志。\r\n会话：{}\r\n工作目录：{}{}\r\n\r\n本次跳过 {} 次（自行退出或安全校验未通过）；写操作保留。\r\n提示窗口不阻塞防护；当前每 {} 秒继续检查。\r\n日志：codex-git-guard-events.jsonl",
+        if status.storm_active{"正在处理 / 观察恢复"}else{"已恢复"},status.episode_terminated,status.pending_terminations,
+        status.observed_new_git_60s,status.count,status.peak_count,status.max_processes,status.max_private_mib,
+        status.private_bytes as f64/MIB as f64,if pids.is_empty(){"未记录"}else{&pids},session,cwd,clue,skipped,status.interval_seconds)
+}
 pub struct Guard {
     dir: PathBuf,
     collector: Collector,
@@ -497,6 +546,9 @@ pub struct Guard {
     incidents: Incidents,
     normal_interval: u64,
     pending: HashMap<(u32,i64),Handle>,
+    traffic: attribution::Traffic,
+    sources: Vec<Source>,
+    skipped: usize,
     #[cfg(test)]
     scope: Option<HashSet<(u32, i64)>>,
 }
@@ -508,6 +560,7 @@ impl Guard {
             dir,
             normal_interval: 5,
             pending: HashMap::new(),
+            traffic: attribution::Traffic::default(), sources: Vec::new(), skipped: 0,
             collector: Collector::new(),
             inspector: Inspector::new()?,
             next: Instant::now(),
@@ -589,6 +642,11 @@ impl Guard {
         self.status.interval_seconds = effective_interval(self.status.enabled,self.status.healthy,self.status.storm_active,self.normal_interval);
         self.next=started+Duration::from_secs(self.status.interval_seconds);
         self.status.pending_terminations=self.pending.len();
+        self.status.episode_terminated=self.status.terminated.saturating_sub(self.incidents.terminated_at_start);
+        if self.status.healthy && !self.sources.is_empty() {
+            self.status.last_alert=warning(&self.status,&self.sources,self.skipped);
+            if alert.is_some(){alert=Some(self.status.last_alert.clone());}
+        }
         if let Ok(file)=OpenOptions::new().write(true).open(self.dir.join("codex-git-guard-events.jsonl")){let _=file.sync_data();}
         self.status.check_ms = started.elapsed().as_secs_f64() * 1000.;
         self.status.version = 1;
@@ -646,6 +704,8 @@ impl Guard {
         self.status.private_bytes = items.iter().map(|c| c.process.private).sum();
         self.status.eligible = items.iter().filter(|c| c.verb.is_some()).count();
         self.status.unknown_git = unknown;
+        self.status.observed_new_git_60s=self.traffic.observe(items.iter().map(|c|(c.process.pid,c.process.created_ticks)),now());
+        if self.incidents.active {self.status.peak_count=self.status.peak_count.max(items.len());}
         let over = items.len() > cfg.max_processes
             || self.status.private_bytes > cfg.max_private_mib * MIB;
         self.streak = if over { self.streak + 1 } else { 0 };
@@ -677,6 +737,8 @@ impl Guard {
             self.record_observation(false)?;
             return Ok(());
         }
+        let new_episode=!self.incidents.active;
+        if new_episode {self.status.peak_count=self.status.count;self.skipped=0;self.sources.clear();}
         self.record_observation(true)?;
         let reason = if self.status.count > cfg.max_processes {
             "process_limit"
@@ -688,6 +750,14 @@ impl Guard {
             .is_none_or(|at| at.elapsed() > Duration::from_secs(60));
         if popup_due {
             self.event(json!({"time":chrono::Local::now().to_rfc3339(),"type":"limit_exceeded","reason":reason,"count":self.status.count,"private_bytes":self.status.private_bytes,"limits":cfg,"eligible":victims.len()}))?;
+        }
+        if self.sources.is_empty() || popup_due {
+            let mut examples:Vec<_>=fresh_items.iter().collect();
+            examples.sort_by_key(|c|(c.origin.0,c.process.pid));
+            self.sources=examples.into_iter().take(4).map(source).collect();
+            self.event(json!({"time":chrono::Local::now().to_rfc3339(),"type":"storm_context",
+                "episode":self.incidents.storms,"observation_window_seconds":60,"observed_new_git":self.status.observed_new_git_60s,
+                "sources":self.sources}))?;
         }
         let mut ended = 0;
         let mut pending = 0;
@@ -747,9 +817,9 @@ impl Guard {
         self.status.terminated += ended;
         self.incidents.terminated = self.status.terminated;
         self.incidents.save(&self.dir)?;
-        self.status.last_alert=format!("Codex Git 超限：{} 个 / {:.0} MiB（上限 {} 个 / {} MiB）。已结束 {} 个，等待退出 {} 个，跳过 {} 个。写操作及无法确认归属的进程不会结束。详见 codex-git-guard-events.jsonl。",self.status.count,self.status.private_bytes as f64/MIB as f64,cfg.max_processes,cfg.max_private_mib,ended,pending,failed);
+        self.skipped+=failed;
         if popup_due {
-            *alert = Some(self.status.last_alert.clone());
+            *alert = Some(String::new());
             self.last_popup = Some(Instant::now());
         }
         Ok(())
@@ -767,7 +837,7 @@ impl Runner {
         use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
         let stop=Arc::new(AtomicBool::new(false));let done=stop.clone();
         let thread=std::thread::spawn(move||{
-            let mut guard=None;let mut note=String::new();let mut pending_alert=None;
+            let mut guard=None;let mut note=String::new();let mut pending_alert=None;let mut last_warning=String::new();
             while !done.load(Ordering::Relaxed) {
                 if guard.is_none(){match Guard::new(dir.clone()){Ok(value)=>guard=Some(value),Err(error)=>{
                     pending_alert=Some(format!("Codex Git 防护无法启动：{error:#}"));
@@ -775,6 +845,7 @@ impl Runner {
                 let wait=if let Some(g)=guard.as_mut(){
                     let (alert,status)=g.poll();if alert.is_some(){pending_alert=alert;}
                     if !status.is_empty()&&status!=note&&events.try_send(crate::Event::GuardStatus(status.clone())).is_ok(){note=status;}
+                    if !g.status.last_alert.is_empty()&&g.status.last_alert!=last_warning&&events.try_send(crate::Event::GuardUpdate(g.status.last_alert.clone())).is_ok(){last_warning=g.status.last_alert.clone();}
                     g.wait()
                 }else{Duration::from_secs(5)};
                 if let Some(alert)=pending_alert.take(){
@@ -796,6 +867,16 @@ impl Drop for Runner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn warning_distinguishes_confirmed_exits_window_and_session_evidence(){
+        let status=Status{episode_terminated:12,pending_terminations:4,observed_new_git_60s:82,count:20,peak_count:64,max_processes:16,max_private_mib:1024,interval_seconds:1,storm_active:true,..Status::default()};
+        let mut source=Source{git_pid:123,codex_pid:456,..Source::default()};
+        source.context.cwd=r"D:\project".into();source.context.candidates.push("相关会话 (candidate)".into());
+        let text=warning(&status,&[source.clone()],3);
+        for fragment in ["已确认结束 12 个","另有 4 个","近 60 秒至少观察到 82","当前 20 个","峰值 64","456 → 123","暂无法确认","非确认归属","每 1 秒"]{assert!(text.contains(fragment),"{fragment}");}
+        source.context.session_id="01a14d83-72e0-7e41-a98c-8d7dbf8d0174".into();source.context.session_title="真实会话".into();
+        assert!(warning(&status,&[source],0).contains("真实会话 (01a14d83"));
+    }
     #[test]
     fn defaults_and_fast_checks_recover_only_after_stable_observations(){
         let cfg:Config=serde_json::from_str("{}").unwrap();assert_eq!((cfg.max_processes,cfg.max_private_mib,cfg.interval_seconds),(16,1024,5));
@@ -822,7 +903,7 @@ mod tests {
     #[test]
     fn storm_counter_requires_a_stable_minute_and_survives_serialization() {
         let mut counter = Incidents { version:1, tracked_since:"2026-10-20T00:00:00Z".into(),
-            storms:0, active:false, terminated:9592, calm_since:None, last_observation:None };
+            storms:0, active:false, terminated:9592, terminated_at_start:9592, calm_since:None, last_observation:None };
         assert_eq!(counter.observe(true, 100.), Some("storm_started"));
         for at in [105., 110., 115., 120.] { assert!(counter.observe(true, at).is_none()); }
         assert_eq!(counter.storms, 1);
@@ -999,6 +1080,8 @@ mod tests {
                     .env("TEMP", &dir)
                     .env("TMP", &dir)
                     .env("TMPDIR", &dir)
+                    .env("CODEX_THREAD_ID", "00000000-0000-4000-8000-000000000001")
+                    .current_dir(&dir)
                     .creation_flags(0x08000000)
                     .spawn()
                     .unwrap(),
@@ -1046,6 +1129,11 @@ mod tests {
         assert_eq!(restored.status.terminated, 4);
         assert_eq!(restored.status.storm_count, 1);
         assert!(warning.is_some());
+        assert!(guard.status.last_alert.contains("已确认结束 4 个"));
+        assert_eq!(guard.status.observed_new_git_60s,10);
+        assert_eq!(guard.sources[0].context.session_id,"00000000-0000-4000-8000-000000000001");
+        assert_eq!(guard.sources[0].context.evidence,"process_environment");
+        assert!(!guard.sources[0].command.is_empty());
         assert!(
             children.0[9].try_wait().unwrap().is_none(),
             "Commit fixture must remain alive"
@@ -1058,6 +1146,8 @@ mod tests {
         let snapshot=guard.collector.sample(1).unwrap();guard.scope=Some(snapshot.processes.iter().filter(|p|owned.contains(&p.pid)).map(|p|(p.pid,p.created_ticks)).collect());
         guard.next=Instant::now();let _=guard.poll();std::thread::sleep(Duration::from_millis(80));guard.next=Instant::now();let _=guard.poll();
         assert_eq!(guard.status.terminated,8);assert_eq!(guard.status.storm_count,1);
+        assert_eq!(guard.status.episode_terminated,8);
+        assert_eq!(guard.status.observed_new_git_60s,14);
         assert!(children.0[9].try_wait().unwrap().is_none());
         let evidence = dir.join("codex-git-guard-events.jsonl");
         assert!(fs::metadata(&evidence).unwrap().len() < 65536);

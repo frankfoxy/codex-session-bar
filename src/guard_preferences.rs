@@ -31,7 +31,12 @@ unsafe fn verify_guard_preferences(app:&mut App,paths:&Paths)->Result<()> {
     let mut config=serde_json::json!({"enabled":false,"max_processes":64,"max_private_mib":4096});
     let folder=fixture.join("memory-watch-rust");std::fs::create_dir_all(&folder)?;
     std::fs::write(folder.join("codex-git-guard-settings.json"),serde_json::to_vec(&config)?)?;
-    app.popup(Popup::Preferences)?;app.hit(Hit::GuardSettings);
+    app.popup(Popup::Preferences)?;
+    let controls=capture(app,Some(Popup::Preferences),560,464,&paths.runtime.join("rust-guard-button-hit-verification.png"))?;
+    let actual=controls.iter().find(|a|a.contains(373.,407.)).map(|a|a.hit.clone());
+    assert_eq!(actual,Some(Hit::GuardSettings),"Settings button must not toggle protection");
+    assert_eq!(controls.iter().find(|a|a.contains(418.,407.)).map(|a|a.hit.clone()),Some(Hit::GuardLogs));
+    app.hit(actual.unwrap());assert_eq!(app.popup_kind,Some(Popup::Preferences));
     assert_eq!(app.guard_limits.max_processes,64);assert!(app.preferences_guard);
     app.guard_limits=guard::Limits::default();app.hit(Hit::GuardLimit(0,1));assert_eq!(app.guard_limits.max_processes,17);
     app.hit(Hit::GuardLimit(0,-1));app.hit(Hit::ApplyPreferences);

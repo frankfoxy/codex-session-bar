@@ -105,6 +105,17 @@ fn parse_events(bytes: &[u8], skip_first: bool) -> Vec<LogEntry> {
             "limit_exceeded" => ("Limit exceeded".into(), format!("{} Git · {:.0} MiB · {}", value["count"].as_u64().unwrap_or(0), value["private_bytes"].as_u64().unwrap_or(0) as f64 / 1048576., value["reason"].as_str().unwrap_or("")), true),
             "termination_requested" => (format!("Ending read-only Git · PID {pid}"), format!("{} · {:.0} MiB · Codex PID {}", value["verb"].as_str().unwrap_or("query"), value["private_bytes"].as_u64().unwrap_or(0) as f64 / 1048576., value["codex_pid"].as_u64().unwrap_or(0)), false),
             "termination_confirmed" => (format!("Git ended · PID {pid}"),"Asynchronous exit confirmed".into(),false),
+            "storm_context" => {
+                let source=&value["sources"][0];let context=&source["context"];
+                let session=context["session_title"].as_str().filter(|s|!s.is_empty()).or_else(||context["session_id"].as_str().filter(|s|!s.is_empty()));
+                let title=if crate::locale::chinese(){"Git 来源线索"}else{"Git source evidence"};
+                let detail=format!("Codex PID {} → Git PID {} · {} · {} · {}",
+                    source["codex_pid"].as_u64().unwrap_or(0),source["git_pid"].as_u64().unwrap_or(0),
+                    if crate::locale::chinese(){format!("近 60 秒 ≥ {} 个新 Git",value["observed_new_git"].as_u64().unwrap_or(0))}else{format!("≥ {} new Git / 60s",value["observed_new_git"].as_u64().unwrap_or(0))},
+                    session.unwrap_or(if crate::locale::chinese(){"会话未确认"}else{"Chat unconfirmed"}),
+                    context["cwd"].as_str().unwrap_or("").chars().take(160).collect::<String>());
+                (title.into(),detail,false)
+            }
             "termination_result" => {
                 let result = value["result"].as_str().unwrap_or("unknown");
                 (format!("{} · PID {pid}", if result == "terminated" { "Git ended" } else { "Git skipped / pending" }), result.chars().take(180).collect(), result != "terminated")

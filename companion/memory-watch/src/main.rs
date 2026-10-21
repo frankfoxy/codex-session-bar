@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod collect;
 mod guard;
+mod attribution;
 mod recorder;
 use anyhow::{Context, Result};
 use collect::Snapshot;
@@ -37,6 +38,25 @@ const GUARD_WARNING_TEST: u32 = WM_APP + 8;
 const INTERVALS: [u64; 5] = [15, 30, 60, 120, 300];
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
+}
+unsafe fn update_notice(window:HWND,message:&str)->bool {
+    let mut pid=0;GetWindowThreadProcessId(window,Some(&mut pid));
+    if pid!=std::process::id(){return false;}
+    let Ok(label)=GetDlgItem(window,65535)else{return false;};
+    let text=wide(message);let mut result=0;
+    SendMessageTimeoutW(label,WM_SETTEXT,WPARAM(0),LPARAM(text.as_ptr() as isize),SMTO_ABORTIFHUNG|SMTO_BLOCK,100,Some(&mut result)).0!=0
+}
+#[cfg(test)]mod notice_tests {
+    use super::*;
+    #[test]fn existing_notice_text_updates_without_creating_a_dialog(){unsafe{
+        let window=CreateWindowExW(WINDOW_EX_STYLE::default(),w!("STATIC"),w!("Hidden notice test"),WS_POPUP,0,0,400,300,None,None,None,None).unwrap();
+        let label=CreateWindowExW(WINDOW_EX_STYLE::default(),w!("STATIC"),w!("old"),WS_CHILD,0,0,380,280,window,HMENU(65535usize as *mut _),None,None).unwrap();
+        assert!(!IsWindowVisible(window).as_bool());
+        assert!(update_notice(window,"已确认结束 8 个；待确认 2 个"));
+        let mut text=[0u16;128];let length=GetWindowTextW(label,&mut text);
+        assert_eq!(String::from_utf16_lossy(&text[..length as usize]),"已确认结束 8 个；待确认 2 个");
+        assert!(!IsWindowVisible(window).as_bool());let _=DestroyWindow(window);
+    }}
 }
 fn mib(v: u64) -> String {
     format!("{:.1}", v as f64 / 1048576.)
@@ -135,6 +155,7 @@ enum Event {
     Error(String),
     GuardStatus(String),
     GuardAlert(String),
+    GuardUpdate(String),
 }
 fn worker(paths: Paths, interval: u64, rx: mpsc::Receiver<Command>, tx: mpsc::SyncSender<Event>) {
     let recorder = Recorder::new(paths.logs.clone());
@@ -576,6 +597,7 @@ impl App {
                     self.guard_warning(&message);
                     let _ = SetWindowTextW(self.status, PCWSTR(wide(&message).as_ptr()));
                 }
+                Event::GuardUpdate(message) => {self.update_guard_warning(&message);}
             }
         }
         if dirty {
@@ -586,6 +608,7 @@ impl App {
     unsafe fn guard_warning(&self, message: &str) {
         static OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if OPEN.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            self.update_guard_warning(message);
             return;
         }
         let message = message.to_owned();
@@ -610,6 +633,14 @@ impl App {
             }
             OPEN.store(false, std::sync::atomic::Ordering::Release);
         });
+    }
+    unsafe fn update_guard_warning(&self,message:&str) {
+        // Update the existing notice without creating another modal window.
+        // Even a hung notice cannot delay the independent enforcement worker.
+        let _=fs::write(self.paths.logs.join("guard-warning-latest.json"),json!({"updated_at":chrono::Local::now().to_rfc3339(),"test":false,"message":message}).to_string());
+        if let Ok(window)=FindWindowW(w!("#32770"),w!("Codex Git 内存防护告警")) {
+            update_notice(window,message);
+        }
     }
     unsafe fn refresh(&mut self) {
         let Some(s) = &self.sample else {
