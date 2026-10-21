@@ -45,9 +45,24 @@ foreach ($file in @('emoji_catalog.json', 'Launch.cmd', 'Enable-Autostart.ps1', 
 Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'assets/images') -File | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $package ('assets/images/' + $_.Name))
 }
-$archive = Join-Path $releaseRoot ($baseName + '.zip')
-Compress-Archive -LiteralPath $package -DestinationPath $archive -CompressionLevel Optimal
-$hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-$checksum = Join-Path $releaseRoot 'SHA256SUMS.txt'
+$stagedArchive = Join-Path $releaseRoot ($baseName + '.zip')
+Compress-Archive -LiteralPath $package -DestinationPath $stagedArchive -CompressionLevel Optimal
+$hash = (Get-FileHash -LiteralPath $stagedArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+# Final deliverables survive tmp cleanup; only build/staging content lives in tmp.
+$destination = Join-Path $PSScriptRoot ('releases/v' + $version)
+[IO.Directory]::CreateDirectory($destination) | Out-Null
+$archive = Join-Path $destination ($baseName + '.zip')
+if (Test-Path -LiteralPath $archive) {
+    if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $hash) {
+        throw 'A different archive already exists for this version; it was not overwritten.'
+    }
+} else { Copy-Item -LiteralPath $stagedArchive -Destination $archive }
+if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $hash) { throw 'Final archive verification failed' }
+$checksum = Join-Path $destination 'SHA256SUMS.txt'
 [IO.File]::WriteAllText($checksum, $hash + '  ' + [IO.Path]::GetFileName($archive) + "`n", [Text.Encoding]::ASCII)
-[pscustomobject]@{Version=$version; Archive=$archive; SHA256=$hash; Checksums=$checksum}
+$portable = Join-Path $destination $baseName
+if (-not (Test-Path -LiteralPath $portable)) { Expand-Archive -LiteralPath $archive -DestinationPath $destination }
+$resolvedStaging = (Resolve-Path -LiteralPath $releaseRoot).Path
+if (-not $resolvedStaging.StartsWith($tmpRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw 'Refusing cleanup outside workspace/tmp' }
+Remove-Item -LiteralPath $resolvedStaging -Recurse -Force
+[pscustomobject]@{Version=$version; Directory=$destination; Portable=$portable; Archive=$archive; SHA256=$hash; Checksums=$checksum}

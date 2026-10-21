@@ -1,6 +1,7 @@
 settings.json
 tags.json
 bin/
+/releases/
 /memory-watch/
 target/
 tmp/

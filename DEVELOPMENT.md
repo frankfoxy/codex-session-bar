@@ -35,7 +35,7 @@ navigates chats, renames them, submits prompts or resumes work.
 - `assets/images/`: sanitized README screenshots and docking illustration.
 - `emoji_catalog.json`: runtime emoji catalog.
 - `Build.ps1`: build/test; `-NoInstall` keeps the installed executable untouched.
-- `Package.ps1`: build/test and stage an allowlisted Windows x64 ZIP plus SHA-256.
+- `Package.ps1`: build/test and save an allowlisted Windows x64 ZIP, SHA-256 and extracted portable folder under `releases/v<version>/`; temporary staging remains under workspace `tmp` and is removed after success.
 - `RELEASING.md`: version, tag, publishing and upgrade steps.
 
 `--version` prints the Cargo package version without opening the UI or creating runtime files.
