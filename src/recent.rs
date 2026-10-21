@@ -998,10 +998,10 @@ impl App {
                 TEXT,
                 true,
             );
-            let model = if busy { row.execution.short() } else { String::new() };
+            let model = row.execution.short();
             let columns = self.recent_columns();
             let model_width = if model.is_empty() { 0. } else { (p.width(&model, 10.) + 10.).min(if self.settings.compact_recent { 170. } else { columns.meta_width - 52. }) };
-            let metric_width = if busy { 225. + model_width } else { 165. };
+            let metric_width = (if busy { 225. } else { 165. }) + model_width;
             let metric_x = width - 52. - metric_width;
             let line_h = if self.settings.compact_recent {
                 34.
@@ -1053,7 +1053,7 @@ impl App {
                 let summary = if busy {
                     format!("{} t/s", row.rate().map(|v| format!("{v:.1}")).unwrap_or("—".into()))
                 } else {
-                    format!("{} TOK", data::compact(row.tokens))
+                    if model.is_empty() { format!("{} TOK", data::compact(row.tokens)) } else { String::new() }
                 };
                 let elapsed = if busy {
                     row.started_at
@@ -1062,7 +1062,7 @@ impl App {
                 } else {
                     row.total_seconds.map(data::duration).unwrap_or("—".into())
                 };
-                let rate_width = if busy { p.width(&summary, 10.) + 2. } else { columns.meta_width };
+                let rate_width = if summary.is_empty() { 0. } else { p.width(&summary, 10.) + 2. };
                 p.right_label(
                     &summary,
                     rect(columns.meta_right - rate_width, y + 1., rate_width, 20.),
@@ -1073,7 +1073,7 @@ impl App {
                     p.model_label(&model, rect(columns.meta_right - rate_width - model_width, y + 1., model_width - 8., 20.), 10.);
                 }
                 p.right_label(
-                    &if busy { format!("{} TOK · {elapsed}", data::compact(row.tokens)) } else { elapsed },
+                    &if busy || !model.is_empty() { format!("{} TOK · {elapsed}", data::compact(row.tokens)) } else { elapsed },
                     rect(columns.meta_left, y + 23., columns.meta_width, 20.),
                     10.,
                     MUTED,

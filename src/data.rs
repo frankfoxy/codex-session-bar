@@ -217,9 +217,13 @@ pub struct Quota {
     pub remaining: f64,
     pub reset: Option<f64>,
     pub minutes: Option<f64>,
-    // An explicit next banked-reset grant, never an ordinary quota reset or credit expiry.
+    // Earliest expiry among available earned-reset credits; not quota renewal.
     #[serde(default)]
     pub banked_reset: Option<f64>,
+    #[serde(default)]
+    pub banked_available: Option<u64>,
+    #[serde(default)]
+    pub banked_expiring: Option<u64>,
 }
 
 pub fn quotas(value: &Value) -> Vec<Quota> {
@@ -248,12 +252,23 @@ pub fn quotas(value: &Value) -> Vec<Quota> {
                         remaining: (100.0 - used).clamp(0.0, 100.0),
                         reset: window["resetsAt"].as_f64(),
                         minutes,
-                        banked_reset: value.pointer("/rateLimitResetCredits/nextGrantAt")
-                            .and_then(Value::as_f64).filter(|v| v.is_finite() && *v > 0.),
+                        banked_reset: None,
+                        banked_available: None,
+                        banked_expiring: None,
                     });
                 }
             }
         }
+    }
+    if let Some(quota) = result.first_mut() {
+        let resets = &value["rateLimitResetCredits"];
+        let expiries: Vec<f64> = resets["credits"].as_array().into_iter().flatten()
+            .filter(|credit| credit["status"] == "available" && credit["resetType"] == "codexRateLimits")
+            .filter_map(|credit| credit["expiresAt"].as_f64())
+            .filter(|at| at.is_finite() && *at > now()).collect();
+        quota.banked_reset = expiries.iter().copied().min_by(f64::total_cmp);
+        quota.banked_available = resets["availableCount"].as_u64();
+        quota.banked_expiring = quota.banked_reset.map(|at| expiries.iter().filter(|&&expiry| expiry == at).count() as u64);
     }
     result
 }
@@ -451,7 +466,9 @@ impl Store {
     }
     pub fn sessions(&self) -> Result<Vec<Row>> {
         let db = self.db("state_5.sqlite")?;
-        let mut query=db.prepare("SELECT id,title,updated_at,tokens_used,name FROM threads WHERE archived=0 AND agent_path IS NULL ORDER BY updated_at DESC,id")?;
+        let mut query=db.prepare("SELECT id,title,updated_at,tokens_used,name,model,reasoning_effort FROM threads WHERE archived=0 AND agent_path IS NULL ORDER BY updated_at DESC,id")
+            .or_else(|_|db.prepare("SELECT id,title,updated_at,tokens_used,name FROM threads WHERE archived=0 AND agent_path IS NULL ORDER BY updated_at DESC,id"))?;
+        let has_execution = query.column_count() >= 7;
         let rows = query
             .query_map([], |r| {
                 Ok(Row {
@@ -465,6 +482,9 @@ impl Store {
                         .is_none_or(|v| v.trim().is_empty()),
                     updated_at: r.get(2)?,
                     tokens: r.get(3)?,
+                    execution: if has_execution {
+                        crate::telemetry::Execution { model:r.get::<_,Option<String>>(5)?.unwrap_or_default(), effort:r.get::<_,Option<String>>(6)?.unwrap_or_default(), service_tier:None }
+                    } else { Default::default() },
                     state: unknown(),
                     ..Row::default()
                 })
@@ -932,6 +952,17 @@ mod tests {
     }
 
     #[test]
+    fn completed_chats_keep_model_and_effort_without_reading_rollouts() {
+        let (paths, dir) = fixture("completed-execution");
+        let db = Connection::open(dir.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT,title TEXT,name TEXT,updated_at REAL,tokens_used INTEGER,archived INTEGER,agent_path TEXT,model TEXT,reasoning_effort TEXT);
+            INSERT INTO threads VALUES('done','Completed chat',NULL,10,1200,0,NULL,'gpt-6.1-sol','xhigh');").unwrap();
+        let rows = Store::new(&paths).sessions().unwrap();
+        assert_eq!(rows[0].execution.short(), "6.1 Sol · XH");
+        assert!(rows[0].execution.service_tier.is_none());
+    }
+
+    #[test]
     fn turn_metadata_is_incremental_and_new_turn_does_not_inherit_fast() {
         let (paths, dir) = fixture("execution");
         let file = dir.join("execution.jsonl");
@@ -951,13 +982,24 @@ mod tests {
     }
 
     #[test]
-    fn banked_countdown_requires_explicit_next_grant_not_quota_or_expiry() {
-        let mut v = serde_json::json!({"rateLimits":{"primary":{"usedPercent":30,"windowDurationMins":10080,"resetsAt":1800000000}},"rateLimitResetCredits":{"credits":[{"expiresAt":1799990000,"grantedAt":1799000000}]}});
+    fn banked_countdown_uses_nearest_available_credit_expiry() {
+        let at = now() + 86400.;
+        let mut v = serde_json::json!({"rateLimits":{"primary":{"usedPercent":30,"windowDurationMins":10080,"resetsAt":1800000000},"secondary":{"usedPercent":10,"windowDurationMins":300,"resetsAt":1800000010}},"rateLimitResetCredits":{"availableCount":5,"credits":[]}});
         assert!(quotas(&v)[0].banked_reset.is_none());
-        v["rateLimitResetCredits"]["nextGrantAt"] = serde_json::json!(1800000100);
-        let q = quotas(&v).remove(0);
-        assert_eq!(q.banked_reset, Some(1800000100.));
+        v["rateLimitResetCredits"]["credits"] = serde_json::json!([
+            {"expiresAt":at+1000.,"status":"available","resetType":"codexRateLimits"},
+            {"expiresAt":at,"status":"available","resetType":"codexRateLimits"},
+            {"expiresAt":at,"status":"available","resetType":"codexRateLimits"},
+            {"expiresAt":at-100.,"status":"redeemed","resetType":"codexRateLimits"},
+            {"expiresAt":now()-100.,"status":"available","resetType":"codexRateLimits"},
+            {"expiresAt":null,"status":"available","resetType":"codexRateLimits"}]);
+        let quotas = quotas(&v);
+        let q = &quotas[0];
+        assert_eq!(q.banked_reset, Some(at));
+        assert_eq!(q.banked_available, Some(5));
+        assert_eq!(q.banked_expiring, Some(2));
         assert_eq!(q.reset, Some(1800000000.));
+        assert!(quotas[1].banked_reset.is_none());
     }
 
     #[test]

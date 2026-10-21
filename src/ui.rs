@@ -1180,7 +1180,9 @@ impl App {
             if kind.is_none() { 8. } else { 10. },
         );
         let mut area = |hit: Hit, r: D2D_RECT_F| {
-            if self.hover.as_ref() == Some(&hit) {
+            // Informational regions are registered after their foreground is
+            // painted. They must never paint an opaque hover background.
+            if !matches!(hit, Hit::Info(_)) && self.hover.as_ref() == Some(&hit) {
                 p.fill(r, 0x35434a, 5.);
             }
             hits.push(Area { hit, r });
@@ -1240,7 +1242,7 @@ impl App {
                     p.label(text, rect(x, 2., w, 30.), 11., MUTED, false);
                     x += w + 8.;
                 }
-                if let Some(s) = current.filter(|s| s.turn.status == "inProgress") {
+                if let Some(s) = current {
                     let model = s.execution.short();
                     if !model.is_empty() {
                         let w = p.width(&model, 11.) + 2.;
@@ -1331,8 +1333,10 @@ impl App {
                     if let Some(reset) = quota.and_then(|q| q.banked_reset).filter(|r| *r > now()) {
                         let text = format!("↶ {}", crate::telemetry::countdown(reset, now()));
                         let w = p.width(&text, 11.) + 2.;
-                        p.label(&text, rect(x, 2., w, 30.), 11., MUTED, false);
-                        area(Hit::Info(crate::telemetry::reset_tooltip(if zh { "Banked reset · 下次补充重置次数" } else { "Banked reset · next grant" }, Some(reset), now())), rect(x, 2., w, 30.));
+                        let color = if reset-now() <= 86400. { ORANGE } else if reset-now() <= 3.*86400. { MODEL } else { MUTED };
+                        p.label(&text, rect(x, 2., w, 30.), 11., color, false);
+                        let counts = quota.map(|q| format!("{} {} · {} {}", q.banked_expiring.map(|n|n.to_string()).unwrap_or_else(||"—".into()), if zh { "张即将到期" } else { "expiring" }, q.banked_available.map(|n|n.to_string()).unwrap_or_else(||"—".into()), if zh { "张可用" } else { "available" })).unwrap_or_default();
+                        area(Hit::Info(format!("{}\n{counts}", crate::telemetry::reset_tooltip(if zh { "Banked Reset 到期时间" } else { "Banked reset expiry" }, Some(reset), now()))), rect(x, 2., w, 30.));
                         x += w + 8.;
                     }
                 }
@@ -1494,7 +1498,7 @@ impl App {
                         TEXT,
                         true,
                     );
-                    let with_metrics = row.tokens.is_some() || row.total_seconds.is_some();
+                    let with_metrics = row.tokens.is_some() || row.total_seconds.is_some() || !row.execution.model.is_empty();
                     p.label(
                         self.catalog.strip(&row.label),
                         rect(
@@ -1508,7 +1512,7 @@ impl App {
                         false,
                     );
                     if with_metrics {
-                        let model = if busy { row.execution.short() } else { String::new() };
+                        let model = row.execution.short();
                         let model_width = if model.is_empty() { 0. } else { p.width(&model, 10.) + 10. };
                         if !model.is_empty() { p.model_label(&model, rect(68., y + 22., model_width - 8., 16.), 10.); }
                         p.label(
@@ -1928,7 +1932,7 @@ impl App {
                         let mut tip = tip_text(&a.hit, &self.catalog);
                         if let Some(row) = row {
                             tip.push_str(&format!("\n{}", crate::locale::text(&row.state)));
-                            if row.state == "Busy" { tip.push_str(&format!("\n{}", row.execution.tooltip())); }
+                            if !row.execution.model.is_empty() { tip.push_str(&format!("\n{}", row.execution.tooltip())); }
                         }
                         tip
                     } else if a.hit == Hit::GuardLogs {
@@ -2071,7 +2075,7 @@ impl App {
                 }
             }
         }
-        if let Some(s) = self.current(&live).filter(|s| s.turn.status == "inProgress") {
+        if let Some(s) = self.current(&live) {
             let model = s.execution.short();
             if !model.is_empty() { width += p.width(&model, 11.) + 10.; }
         }
@@ -4156,6 +4160,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             minutes: Some(10080.),
             reset: Some(now() + 350000.),
             banked_reset: Some(now() + 8300.),
+            banked_available: Some(3),
+            banked_expiring: Some(1),
         };
         state.lock().unwrap().quota = vec![quota];
         state.lock().unwrap().quota_at = now();
@@ -4347,6 +4353,20 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert!(bar_hits.iter().any(|area| matches!(&area.hit, Hit::Info(text) if text.contains("gpt-6.1-sol") && text.contains("Fast: On"))));
         assert!(bar_hits.iter().any(|area| matches!(&area.hit, Hit::Info(text) if text.contains("Quota reset:") && text.contains("Time remaining:"))));
         assert!(bar_hits.iter().any(|area| matches!(&area.hit, Hit::Info(text) if text.contains("Banked reset"))));
+        for (name, marker) in [("model", "gpt-6.1-sol"), ("quota", "Quota reset:")] {
+            let info = bar_hits.iter().find(|area| matches!(&area.hit, Hit::Info(text) if text.contains(marker))).unwrap();
+            app.hover = Some(info.hit.clone());
+            let path = paths.runtime.join(format!("rust-bar-hover-{name}-verification.png"));
+            capture(&app, None, w, 34, &path)?;
+            let before = image::open(paths.runtime.join("rust-bar-verification.png"))?.to_rgba8();
+            let after = image::open(&path)?.to_rgba8();
+            for y in info.r.top.ceil() as u32..info.r.bottom.floor() as u32 {
+                for x in info.r.left.ceil() as u32..info.r.right.floor() as u32 {
+                    assert_eq!(before.get_pixel(x,y), after.get_pixel(x,y), "Hover must preserve {name} foreground");
+                }
+            }
+        }
+        app.hover = None;
         app.sync_tips(app.bar, &bar_hits, 1.);
         let tip_window = app.tips.iter().find(|t| t.owner == app.bar).unwrap().window;
         let mut updated_hits = bar_hits.clone();
