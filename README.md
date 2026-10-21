@@ -4,7 +4,7 @@
 
 **默认停靠在 Codex 标题栏的空白区中央**，自动避开左侧菜单和右侧窗口按钮。当前会话、Token、生成速度和剩余额度，一行看全；窗口移动、最小化和恢复时，悬浮条一起跟随。
 
-**v0.1.0 · Rust 原生 Windows 版** · 运行不需要 Python 或 Qt · 中文使用微软雅黑，支持多屏 DPI 缩放。
+**v0.2.0 · Rust 原生 Windows 版** · 运行不需要 Python 或 Qt · 中文使用微软雅黑，支持多屏 DPI 缩放。
 
 ![Codex 标题栏中的悬浮条效果：在空白区居中，避开菜单和窗口按钮](assets/images/preview-docking.png)
 
@@ -101,7 +101,7 @@ Tag 列最多显示两行，放不下时在最后一个可见标签后显示 **�
 
 防护由独立的 Memory Watch 伴随程序执行。超限时弹出警告、记录原因，并自动结束已验证由 Codex 启动的异常 Git 查询进程；提交、推送等写操作及归属不明的进程会跳过。后端未启动或状态失联时明确提示，不会显示为已生效。
 
-普通内存日志仍每 30 秒采样，暂停记录也会继续防护。[查看防护范围与日志](companion/memory-watch/README.md)。这项功能包含在当前源码构建及后续发布包中，已发布的 `v0.1.0` 下载包不包含此项。
+普通内存日志仍每 30 秒采样，暂停记录也会继续防护。[查看防护范围与日志](companion/memory-watch/README.md)。这项功能已包含在 `v0.2.0` 发布包中。
 
 当前的状态、耗时和 Token 用于观察运行情况，不代表任务完成百分比。Codex 的计划步骤状态仅在代理提供结构化计划时可用，不能据此可靠预测整个任务的剩余时间。
 
@@ -113,7 +113,7 @@ Tag 列最多显示两行，放不下时在最后一个可见标签后显示 **�
 
 ### 下载即用（推荐）
 
-到 [v0.1.0 发布页](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.1.0) 下载 **codex-session-bar-0.1.0-windows-x64.zip**，解压到固定目录，打开 Codex 后双击 **Launch.cmd**。无需编译；可用同页的 `SHA256SUMS.txt` 校验下载文件。GitHub 的 **Source code** 附件是源码包。
+到 [v0.2.0 发布页](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.2.0) 下载 **codex-session-bar-0.2.0-windows-x64.zip**，解压到固定目录，打开 Codex 后双击 **Launch.cmd**。无需编译；可用同页的 `SHA256SUMS.txt` 校验下载文件。GitHub 的 **Source code** 附件是源码包。
 
 ### 从源码构建
 

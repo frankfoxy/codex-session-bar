@@ -87,7 +87,7 @@ impl App {
         let clip = self
             .sidebar_animation
             .map(|a| ((1. - a.value_at(time)) * TAG_SIDEBAR * scale).round() as i32)
-            .unwrap_or(0);
+            .unwrap_or(if self.sidebar_open {0} else {(TAG_SIDEBAR * scale).round() as i32});
         let region = CreateRoundRectRgn(
             clip,
             0,
@@ -101,15 +101,11 @@ impl App {
         }
     }
     unsafe fn set_sidebar_open(&mut self, open: bool) {
-        // The conversation area is laid out only at the endpoints. Animation
-        // frames change the window's left clipping edge, never its contents.
-        // Keep the popup and conversation controls visible throughout. In
-        // particular WM_SETREDRAW(FALSE) on a top-level window removes its
-        // WS_VISIBLE style and makes DWM briefly discard the conversation.
-        self.popup_layout_batch = true;
+        // Reserve the sidebar in the native window from the first layout.
+        // Resizing at either endpoint recreated the DC render surface and
+        // sometimes exposed stale/blank conversation pixels to DWM.
         self.close_tag_editor();
         self.sidebar_open = open;
-        self.popup_size = [self.recent_width(), self.recent_panel_height()];
         for i in 0..3 {
             self.tag_scroll[i] = self.tag_scroll[i].min(self.tag_scroll_max(i));
         }
@@ -118,10 +114,12 @@ impl App {
                 .len()
                 .saturating_sub(self.list_page_rows()),
         );
-        self.place_popup();
         let _ = self.ensure_tag_search();
-        self.popup_layout_batch = false;
-        let _=RedrawWindow(self.popup,None,HRGN::default(),RDW_INVALIDATE);
+        self.apply_recent_region(Instant::now());
+        self.invalidate_sidebar_animation();
+        let button=RECT {left:((TAG_SIDEBAR+10.)*self.dpi).floor() as i32,top:0,
+            right:((TAG_SIDEBAR+44.)*self.dpi).ceil() as i32,bottom:(43.*self.dpi).ceil() as i32};
+        let _=InvalidateRect(self.popup,Some(&button),false);
     }
     unsafe fn invalidate_sidebar_animation(&self) {
         let sidebar=RECT { left:0, top:0, right:((TAG_SIDEBAR+2.)*self.dpi).ceil() as i32,
@@ -220,11 +218,7 @@ impl App {
         }
     }
     fn recent_toolbar_left(&self) -> f32 {
-        if self.sidebar_open {
-            TAG_SIDEBAR
-        } else {
-            0.
-        }
+        TAG_SIDEBAR
     }
     fn recent_left(&self) -> f32 {
         self.recent_toolbar_left() + 12.
@@ -242,12 +236,7 @@ impl App {
         } else {
             1040
         };
-        let requested = base
-            + if self.sidebar_open {
-                TAG_SIDEBAR as i32
-            } else {
-                0
-            };
+        let requested = base + TAG_SIDEBAR as i32;
         if self.testing {
             return requested;
         }
@@ -1224,7 +1213,7 @@ impl App {
                     " · retry pending"
                 }
             )},
-            rect(16., height - 29., (tx - 28.).max(30.), 24.),
+            rect(toolbar + 16., height - 29., (tx - toolbar - 28.).max(30.), 24.),
             10.,
             MUTED,
             false,
@@ -1687,7 +1676,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     let before_toolbar = capture(
         app,
         Some(Popup::Recent),
-        1040,
+        1276,
         app.popup_size[1] as u32,
         &paths
             .runtime
@@ -1820,7 +1809,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     assert!(app.tag_editor.is_none());
     let _ = app.hit(Hit::TagSidebar);
     assert!(!app.sidebar_open);
-    assert_eq!(app.popup_size[0], 1040);
+    assert_eq!(app.popup_size[0], 1276);
     assert_eq!(host::bounds(app.popup.0 as isize).unwrap(), before_panel);
     assert_eq!(host::bounds(app.edit.0 as isize).unwrap(), before_search);
     let _ = SetWindowPos(
@@ -1836,7 +1825,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     app.popup_hits = capture(
         app,
         Some(Popup::Recent),
-        1040,
+        1276,
         h,
         &paths.runtime.join("rust-tags-collapsed-verification.png"),
     )?;
@@ -1848,7 +1837,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     );
     let _ = app.hit(Hit::Compact);
     assert!(app.settings.compact_recent);
-    assert_eq!(app.popup_size, [640, RECENT_FRAME + 10 * 43]);
+    assert_eq!(app.popup_size, [876, RECENT_FRAME + 10 * 43]);
     assert_eq!(
         (
             app.search.clone(),
@@ -1861,7 +1850,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
     let compact_hits = capture(
         app,
         Some(Popup::Recent),
-        640,
+        876,
         app.popup_size[1] as u32,
         &paths.runtime.join("rust-recent-compact-verification.png"),
     )?;
@@ -1869,12 +1858,12 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
         .iter()
         .any(|a| matches!(a.hit, Hit::TagEdit(_))));
     assert_eq!(
-        app.fixed_hit_at(80., RECENT_TOP as f32 + 43. + 10.),
+        app.fixed_hit_at(TAG_SIDEBAR + 80., RECENT_TOP as f32 + 43. + 10.),
         Some(Hit::Recent(app.rows[app.chat_filters[1]].id.clone()))
     );
     let _ = app.hit(Hit::Compact);
     assert!(!app.settings.compact_recent);
-    assert_eq!(app.popup_size, [1040, RECENT_FRAME + 10 * RECENT_ROW]);
+    assert_eq!(app.popup_size, [1276, RECENT_FRAME + 10 * RECENT_ROW]);
     app.search = "mingcheng 2".into();
     app.filter_fixed();
     let title_hits = app.chat_filters.clone();
@@ -2066,7 +2055,7 @@ unsafe fn verify_filter_controls(app: &mut App, paths: &Paths) -> Result<()> {
     let _ = SetWindowTextW(app.edit, w!("xxx"));
     app.tag_filters.insert("project:demo".into());
     let selected = app.tag_filters.clone();
-    assert_eq!(app.fixed_hit_at(285., 25.), Some(Hit::ClearChatSearch));
+    assert_eq!(app.fixed_hit_at(TAG_SIDEBAR + 285., 25.), Some(Hit::ClearChatSearch));
     let _ = app.hit(Hit::ClearChatSearch);
     assert!(app.search.is_empty());
     assert_eq!(GetWindowTextLengthW(app.edit), 0);
@@ -2092,8 +2081,8 @@ unsafe fn verify_filter_controls(app: &mut App, paths: &Paths) -> Result<()> {
     // Pointer position controls the whole row, including tag chips, independently of the keyboard cursor.
     app.chat_cursor = 0;
     app.scroll = 0;
-    assert!(app.set_list_pointer(Some((80., RECENT_TOP as f32 + RECENT_ROW as f32 + 15.))));
-    assert!(!app.set_list_pointer(Some((82., RECENT_TOP as f32 + RECENT_ROW as f32 + 17.))));
+    assert!(app.set_list_pointer(Some((TAG_SIDEBAR + 80., RECENT_TOP as f32 + RECENT_ROW as f32 + 15.))));
+    assert!(!app.set_list_pointer(Some((TAG_SIDEBAR + 82., RECENT_TOP as f32 + RECENT_ROW as f32 + 17.))));
     let hover_id = app.rows[app.chat_filters[1]].id.clone();
     assert!(app.row_hovered(&hover_id));
     assert!(!app.row_hovered(&app.rows[app.chat_filters[0]].id));
@@ -2104,7 +2093,7 @@ unsafe fn verify_filter_controls(app: &mut App, paths: &Paths) -> Result<()> {
     capture(
         app,
         Some(Popup::Recent),
-        1040,
+        1276,
         app.popup_size[1] as u32,
         &paths.runtime.join("rust-list-hover-verification.png"),
     )?;
@@ -2117,7 +2106,7 @@ unsafe fn verify_filter_controls(app: &mut App, paths: &Paths) -> Result<()> {
     capture(
         app,
         Some(Popup::Recent),
-        1040,
+        1276,
         app.popup_size[1] as u32,
         &paths.runtime.join("rust-search-clear-verification.png"),
     )?;
@@ -2202,7 +2191,7 @@ unsafe fn verify_two_columns(app: &mut App, paths: &Paths) -> Result<()> {
     app.popup_hits = capture(
         app,
         Some(Popup::Recent),
-        1040,
+        1276,
         h,
         &paths.runtime.join("rust-two-column-verification.png"),
     )?;
@@ -2222,7 +2211,7 @@ unsafe fn verify_two_columns(app: &mut App, paths: &Paths) -> Result<()> {
     );
     assert_eq!(RECENT_TOP, 48); // The list starts directly below the toolbar, without column headings.
     let normal_size = app.popup_size;
-    for (width, sidebar) in [(1040, false), (1276, true), (900, true), (820, false)] {
+    for (width, sidebar) in [(1276, false), (1276, true), (900, true), (820, false)] {
         app.popup_size[0] = width;
         app.sidebar_open = sidebar;
         for configured in [140, 200, 280] {
@@ -2266,7 +2255,7 @@ unsafe fn verify_two_columns(app: &mut App, paths: &Paths) -> Result<()> {
     capture(
         app,
         Some(Popup::Recent),
-        1040,
+        1276,
         h,
         &paths
             .runtime
@@ -2351,7 +2340,7 @@ unsafe fn verify_tag_overflow(app: &mut App, paths: &Paths) -> Result<()> {
     capture(
         app,
         Some(Popup::Recent),
-        1040,
+        1276,
         app.popup_size[1] as u32,
         &paths.runtime.join("rust-tag-column-verification.png"),
     )?;
@@ -2362,7 +2351,7 @@ unsafe fn verify_tag_overflow(app: &mut App, paths: &Paths) -> Result<()> {
     app.popup_hits = capture(
         app,
         Some(Popup::Recent),
-        1040,
+        1276,
         app.popup_size[1] as u32,
         &paths.runtime.join("rust-tag-overflow-verification.png"),
     )?;
@@ -2392,7 +2381,7 @@ unsafe fn verify_tag_overflow(app: &mut App, paths: &Paths) -> Result<()> {
     app.popup_hits = capture(
         app,
         Some(Popup::Recent),
-        1040,
+        1276,
         app.popup_size[1] as u32,
         &paths
             .runtime
@@ -2423,7 +2412,7 @@ unsafe fn verify_tag_overflow(app: &mut App, paths: &Paths) -> Result<()> {
     assert_eq!(app.tag_editor.as_ref(), Some(&id));
     assert_eq!(app.popup, parent.0);
     let _ = app.hit(Hit::TagClose);
-    for (width, sidebar) in [(1040, false), (1276, true), (900, true), (820, false)] {
+    for (width, sidebar) in [(1276, false), (1276, true), (900, true), (820, false)] {
         app.popup_size[0] = width;
         app.sidebar_open = sidebar;
         let layout = app.tag_layout(&app.rows[row_index]);
@@ -2434,7 +2423,7 @@ unsafe fn verify_tag_overflow(app: &mut App, paths: &Paths) -> Result<()> {
             && r.bottom <= 43.));
     }
     app.sidebar_open = false;
-    app.popup_size[0] = 1040;
+    app.popup_size[0] = 1276;
     paths.write("rust-tag-overflow-test.json",&json!({"two_rows":true,"more_than_three_tags":true,"ellipsis_after_last_chip":true,"all_assigned_tags_shown":true,"overflow_scroll_to_last_tag":true,"filter_hit_targets":true,"escape_preserves_list_search_cursor_scroll":true,"editor_keeps_list_open":true,"narrow_and_sidebar_layouts":true}));
     Ok(())
 }
@@ -2512,7 +2501,7 @@ unsafe fn verify_sidebar_animation(app: &mut App, paths: &Paths) -> Result<()> {
                 assert_eq!(app.fixed_hit_at(local, 25.), Some(hit));
                 assert_eq!(
                     bounds[0] + (local * app.dpi).round() as i32,
-                    collapsed[0] + (x * app.dpi).round() as i32
+                    collapsed[0] + ((TAG_SIDEBAR + x) * app.dpi).round() as i32
                 );
             }
         }
@@ -2533,6 +2522,15 @@ unsafe fn verify_sidebar_animation(app: &mut App, paths: &Paths) -> Result<()> {
     app.advance_sidebar_animation(
         reversed.began + std::time::Duration::from_millis(SIDEBAR_DURATION_MS),
     );
+    for _ in 0..100 {
+        app.toggle_sidebar(true);
+        let animation=app.sidebar_animation.unwrap();
+        for elapsed in [0,16,48,96,120] {
+            app.advance_sidebar_animation(animation.began+std::time::Duration::from_millis(elapsed));
+            assert_eq!(host::bounds(app.popup.0 as isize).unwrap(),collapsed,"Even animation endpoints must not resize or move the native surface");
+            assert_eq!(host::bounds(app.edit.0 as isize).unwrap(),search);
+        }
+    }
     assert_eq!(
         (
             app.search.clone(),
@@ -2554,7 +2552,7 @@ unsafe fn verify_sidebar_animation(app: &mut App, paths: &Paths) -> Result<()> {
         0,
         SWP_NOSIZE | SWP_NOACTIVATE,
     );
-    paths.write("rust-sidebar-animation-test.json", &json!({"duration_ms":SIDEBAR_DURATION_MS,"frames_only_update_clip":true,"conversation_toolbar_and_search_stay_fixed":true,"rapid_reverse_preserves_progress":true,"close_stops_timer":true,"list_context_preserved":true}));
+    paths.write("rust-sidebar-animation-test.json", &json!({"duration_ms":SIDEBAR_DURATION_MS,"frames_only_update_clip":true,"native_window_fixed_at_both_endpoints":true,"stress_toggles":100,"conversation_toolbar_and_search_stay_fixed":true,"rapid_reverse_preserves_progress":true,"close_stops_timer":true,"list_context_preserved":true}));
     Ok(())
 }
 

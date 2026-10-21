@@ -1011,7 +1011,7 @@ impl App {
     unsafe fn recent_panel_height(&self) -> i32 {
         let requested = self.settings.recent_rows.clamp(4, 20) as i32;
         let row=self.recent_row_height();
-        let minimum=if self.sidebar_open{(TAG_CLOUD_TOP+44.+3.*(28.+32.)) as i32}else{RECENT_FRAME+row};
+        let minimum=(TAG_CLOUD_TOP+44.+3.*(28.+32.)) as i32;
         if self.testing { return (RECENT_FRAME + requested * row).max(minimum); }
         let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
         let monitor = MonitorFromWindow(self.bar, MONITOR_DEFAULTTONEAREST);
@@ -1143,8 +1143,9 @@ impl App {
         let mut hits = Vec::new();
         p.target
             .Clear(Some(&color(if kind.is_none() { BG } else { PANEL })));
+        let frame_left=if kind==Some(Popup::Recent)&&!self.sidebar_open{TAG_SIDEBAR}else{0.};
         p.border(
-            rect(0.5, 0.5, width - 1., height - 1.),
+            rect(frame_left+0.5, 0.5, width - frame_left - 1., height - 1.),
             0x47535b,
             if kind.is_none() { 8. } else { 10. },
         );
@@ -2826,7 +2827,7 @@ impl App {
         let _ = GetMonitorInfoW(monitor, &mut info);
         let bounds = info.rcWork;
         let mut x = if self.popup_kind == Some(Popup::Recent) {
-            recent_panel_x(bar[0], w, self.sidebar_open, scale, bounds.left, bounds.right)
+            recent_panel_x(bar[0], w, true, scale, bounds.left, bounds.right)
         } else {
             bar[0].max(bounds.left).min((bounds.right - w).max(bounds.left))
         };
@@ -4160,14 +4161,14 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         );
         assert!(!app.search_body);
         assert!(app.body_service.is_none());
-        assert_eq!(app.fixed_hit_at(340., 25.), Some(Hit::Body));
+        assert_eq!(app.fixed_hit_at(TAG_SIDEBAR + 340., 25.), Some(Hit::Body));
         let _ = app.hit(Hit::Body);
         assert!(app.search_body);
         assert!(app.body_service.is_none());
         let _ = app.hit(Hit::Body);
         assert!(!app.search_body);
         assert_eq!(app.rows.len(), 40);
-        assert_eq!(app.popup_size, [1040, RECENT_FRAME + 8 * RECENT_ROW]);
+        assert_eq!(app.popup_size, [1276, RECENT_FRAME + 8 * RECENT_ROW]);
         app.search = "huihuamingcheng 25".into();
         app.filter_fixed();
         assert_eq!(app.chat_filters, [24]);
@@ -4176,7 +4177,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         app.move_fixed_cursor(24);
         assert_eq!(app.scroll, 17);
         assert_eq!(
-            app.fixed_hit_at(80., (RECENT_TOP + 7 * RECENT_ROW + 10) as f32),
+            app.fixed_hit_at(TAG_SIDEBAR + 80., (RECENT_TOP + 7 * RECENT_ROW + 10) as f32),
             Some(Hit::Recent(rows[24].id.clone()))
         );
         let original = app.rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
@@ -4252,16 +4253,16 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            1040,
+            1276,
             (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-recent-verification.png"),
         )?;
         assert_eq!(
-            app.fixed_hit_at(30., 81.),
+            app.fixed_hit_at(TAG_SIDEBAR + 30., 81.),
             Some(Hit::ChatIcon(rows[0].id.clone()))
         );
         assert_eq!(
-            app.fixed_hit_at(80., 81.),
+            app.fixed_hit_at(TAG_SIDEBAR + 80., 81.),
             Some(Hit::Recent(rows[0].id.clone()))
         );
         let identity_before_icon = app.identity(&app.snapshot());
@@ -4371,7 +4372,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            1040,
+            1276,
             (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-background-index-verification.png"),
         )?;
@@ -4382,7 +4383,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            1040,
+            1276,
             (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-recent-search-verification.png"),
         )?;
@@ -4417,7 +4418,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         capture(
             &app,
             Some(Popup::Recent),
-            1040,
+            1276,
             (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-recent-body-verification.png"),
         )?;
@@ -4583,9 +4584,9 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert_eq!(app.settings.recent_rows, 10);
         assert_eq!(app.settings.recent_shortcut.label(), "Ctrl+Alt+K");
         app.popup(Popup::Recent)?;
-        assert_eq!(app.popup_size, [1040, RECENT_FRAME + 10 * RECENT_ROW]);
+        assert_eq!(app.popup_size, [1276, RECENT_FRAME + 10 * RECENT_ROW]);
         assert_eq!(app.list_page_rows(), 10);
-        assert_eq!(app.fixed_hit_at(80., (RECENT_TOP + 9 * RECENT_ROW + 10) as f32), Some(Hit::Recent(rows[9].id.clone())));
+        assert_eq!(app.fixed_hit_at(TAG_SIDEBAR + 80., (RECENT_TOP + 9 * RECENT_ROW + 10) as f32), Some(Hit::Recent(rows[9].id.clone())));
         assert!(app.begin_chat_scroll(app.popup_size[0] as f32-10., 450.));
         app.drag_chat_scroll(10000.);
         assert_eq!(app.scroll, 30);
@@ -4593,7 +4594,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         let _ = ReleaseCapture();
         app.scroll = 0;
         app.chat_cursor = 0;
-        capture(&app, Some(Popup::Recent), 1040, (RECENT_FRAME + 10 * RECENT_ROW) as u32, &paths.runtime.join("rust-recent-configured-verification.png"))?;
+        capture(&app, Some(Popup::Recent), 1276, (RECENT_FRAME + 10 * RECENT_ROW) as u32, &paths.runtime.join("rust-recent-configured-verification.png"))?;
         app.popup(Popup::Preferences)?;
         app.hit(Hit::ShortcutEnabled);
         app.hit(Hit::ApplyPreferences);

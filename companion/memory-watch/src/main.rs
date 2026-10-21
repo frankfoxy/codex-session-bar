@@ -1168,6 +1168,9 @@ unsafe fn capture_window(hwnd: HWND, path: &Path) -> Result<()> {
     Ok(())
 }
 fn run() -> Result<()> {
+    if std::env::args().any(|arg|arg=="--version"||arg=="-V") {
+        println!("Memory Watch {}",env!("CARGO_PKG_VERSION"));return Ok(());
+    }
     let paths = Paths::discover()?;
     let args: Vec<_> = std::env::args().collect();
     if args.iter().any(|s| {
