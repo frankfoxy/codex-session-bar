@@ -1335,8 +1335,7 @@ impl App {
                         let w = p.width(&text, 11.) + 2.;
                         let color = if reset-now() <= 86400. { ORANGE } else if reset-now() <= 3.*86400. { MODEL } else { MUTED };
                         p.label(&text, rect(x, 2., w, 30.), 11., color, false);
-                        let counts = quota.map(|q| format!("{} {} · {} {}", q.banked_expiring.map(|n|n.to_string()).unwrap_or_else(||"—".into()), if zh { "张即将到期" } else { "expiring" }, q.banked_available.map(|n|n.to_string()).unwrap_or_else(||"—".into()), if zh { "张可用" } else { "available" })).unwrap_or_default();
-                        area(Hit::Info(format!("{}\n{counts}", crate::telemetry::reset_tooltip(if zh { "Banked Reset 到期时间" } else { "Banked reset expiry" }, Some(reset), now()))), rect(x, 2., w, 30.));
+                        area(Hit::Info(quota.map(|q| q.banked_tooltip(now())).unwrap_or_default()), rect(x, 2., w, 30.));
                         x += w + 8.;
                     }
                 }
@@ -4162,6 +4161,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             banked_reset: Some(now() + 8300.),
             banked_available: Some(3),
             banked_expiring: Some(1),
+            banked_expiries: vec![Some(now()+8300.), Some(now()+90000.), Some(now()+170000.)],
         };
         state.lock().unwrap().quota = vec![quota];
         state.lock().unwrap().quota_at = now();

@@ -224,6 +224,25 @@ pub struct Quota {
     pub banked_available: Option<u64>,
     #[serde(default)]
     pub banked_expiring: Option<u64>,
+    #[serde(default)]
+    pub banked_expiries: Vec<Option<f64>>,
+}
+impl Quota {
+    pub fn banked_tooltip(&self, at: f64) -> String {
+        let zh = crate::locale::chinese();
+        let mut text = format!("{}\n{}: {}", if zh { "Banked Reset 到期时间" } else { "Banked reset expiry" },
+            if zh { "可用张数" } else { "Available resets" }, self.banked_available.map(|n|n.to_string()).unwrap_or_else(||"—".into()));
+        for (index, expiry) in self.banked_expiries.iter().enumerate() {
+            let detail = expiry.map(|expiry| format!("{} · {} {}", crate::telemetry::local_reset(expiry),
+                if zh { "剩余" } else { "remaining" }, crate::telemetry::countdown(expiry, at)))
+                .unwrap_or_else(|| if zh { "未提供到期时间".into() } else { "Expiry not provided".into() });
+            text.push_str(&format!("\n{}. {detail}", index+1));
+        }
+        if let Some(missing) = self.banked_available.and_then(|count| count.checked_sub(self.banked_expiries.len() as u64)).filter(|&n| n > 0) {
+            text.push_str(&if zh { format!("\n另有 {missing} 张未提供到期明细") } else { format!("\nExpiry details unavailable for {missing} more resets") });
+        }
+        text
+    }
 }
 
 pub fn quotas(value: &Value) -> Vec<Quota> {
@@ -255,6 +274,7 @@ pub fn quotas(value: &Value) -> Vec<Quota> {
                         banked_reset: None,
                         banked_available: None,
                         banked_expiring: None,
+                        banked_expiries: Vec::new(),
                     });
                 }
             }
@@ -262,13 +282,15 @@ pub fn quotas(value: &Value) -> Vec<Quota> {
     }
     if let Some(quota) = result.first_mut() {
         let resets = &value["rateLimitResetCredits"];
-        let expiries: Vec<f64> = resets["credits"].as_array().into_iter().flatten()
+        let mut expiries: Vec<Option<f64>> = resets["credits"].as_array().into_iter().flatten()
             .filter(|credit| credit["status"] == "available" && credit["resetType"] == "codexRateLimits")
-            .filter_map(|credit| credit["expiresAt"].as_f64())
-            .filter(|at| at.is_finite() && *at > now()).collect();
-        quota.banked_reset = expiries.iter().copied().min_by(f64::total_cmp);
+            .map(|credit| credit["expiresAt"].as_f64().filter(|at| at.is_finite()))
+            .filter(|expiry| expiry.is_none_or(|at| at > now())).collect();
+        expiries.sort_by(|a,b| match (a,b) { (Some(a),Some(b))=>a.total_cmp(b), (None,Some(_))=>std::cmp::Ordering::Greater, (Some(_),None)=>std::cmp::Ordering::Less, _=>std::cmp::Ordering::Equal });
+        quota.banked_reset = expiries.iter().flatten().copied().min_by(f64::total_cmp);
         quota.banked_available = resets["availableCount"].as_u64();
-        quota.banked_expiring = quota.banked_reset.map(|at| expiries.iter().filter(|&&expiry| expiry == at).count() as u64);
+        quota.banked_expiring = quota.banked_reset.map(|at| expiries.iter().filter(|&&expiry| expiry == Some(at)).count() as u64);
+        quota.banked_expiries = expiries;
     }
     result
 }
@@ -998,6 +1020,11 @@ mod tests {
         assert_eq!(q.banked_reset, Some(at));
         assert_eq!(q.banked_available, Some(5));
         assert_eq!(q.banked_expiring, Some(2));
+        assert_eq!(q.banked_expiries, vec![Some(at), Some(at), Some(at+1000.), None]);
+        let tip = q.banked_tooltip(now());
+        assert_eq!(tip.matches(&crate::telemetry::local_reset(at)).count(), 2);
+        assert!(tip.contains(&crate::telemetry::local_reset(at+1000.)));
+        assert!(tip.contains("4. "));
         assert_eq!(q.reset, Some(1800000000.));
         assert!(quotas[1].banked_reset.is_none());
     }
