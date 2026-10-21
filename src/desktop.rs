@@ -113,7 +113,7 @@ impl Rpc {
         self.input = child.stdin.take();
         self.child = Some(child);
         self.replies = Some(receiver);
-        self.call_raw("initialize",json!({"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"codex-session-bar-rust","version":"0.2.0"}}))?;
+        self.call_raw("initialize",json!({"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"codex-session-bar-rust","version":env!("CARGO_PKG_VERSION")}}))?;
         self.write(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}))?;
         Ok(())
     }

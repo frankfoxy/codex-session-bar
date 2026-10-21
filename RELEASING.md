@@ -1,12 +1,12 @@
 # 发布版本
 
-Git 标签标记源码版本；GitHub Release 提供该版本的说明和可下载程序。当前版本为 **0.2.0**，对应标签 **v0.2.0**。
+Git 标签标记源码版本；GitHub Release 提供该版本的说明和可下载程序。当前源码为 **0.2.1 开发版本，暂不发布**；最新稳定版为 **0.2.0**，对应标签 **v0.2.0**。以下命令保留为已发布版本的示例，不表示需要重新发布。
 
 ## 1. 准备与打包
 
 在仓库根目录执行。需要 Rust MSVC 工具链和 Visual Studio C++ Build Tools。
 
-1. 修改 `Cargo.toml` 中的包版本，并同步 `Cargo.lock` 中 `codex-session-bar` 的版本；填写 `CHANGELOG.md`。
+1. 发布新版本时，同步主程序与 `companion/memory-watch` 的 `Cargo.toml`、`Cargo.lock` 中的包版本；填写 `CHANGELOG.md`。
 2. 运行下列命令。脚本先测试、构建，再生成 Windows x64 ZIP 和 `SHA256SUMS.txt`，输出位于工作区 `tmp`。构建不会覆盖正在运行的安装。
 
 ```powershell
@@ -18,7 +18,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Package.ps1
 
 ## 2. 标签与 GitHub Release
 
-以当前版本为例：
+以下以已发布的 0.2.0 为例：
 
 ```powershell
 git tag -a v0.2.0 -m "Codex Session Bar v0.2.0"
