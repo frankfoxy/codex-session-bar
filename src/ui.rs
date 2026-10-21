@@ -191,6 +191,8 @@ enum Hit {
     TitleWidth(i32),
     ShortcutEnabled,
     ApplyPreferences,
+    GuardSettings,
+    GuardLimit(usize,i32),
     RefreshPreferences,
     RefreshBack,
     RefreshInterval(usize, i32),
@@ -638,6 +640,8 @@ struct App {
     preferences_draft: Option<Settings>,
     preferences_note: String,
     preferences_advanced: bool,
+    preferences_guard: bool,
+    guard_limits: guard::Limits,
     guard_events: Vec<guard::LogEntry>,
     guard_log_error: String,
     rows: Vec<Row>,
@@ -749,6 +753,8 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::Preferences => "Settings · list size, shortcut and extensions",
         Hit::Rows(n) => if *n < 0 { "Show fewer rows" } else { "Show more rows" },
         Hit::ShortcutEnabled => "Enable shortcut · only while Codex or Session Bar has focus",
+        Hit::GuardSettings => "Protection limits and check interval",
+        Hit::GuardLimit(_,_) => "Adjust protection limit · apply to save",
         Hit::RefreshPreferences => "Refresh settings · source events, rate limits, fallback and diagnostics",
         Hit::RefreshBack => "Back to settings · keep unsaved changes",
         Hit::RefreshInterval(_,delta) => if *delta>0 {"Increase refresh interval · apply to save"} else {"Decrease refresh interval · apply to save"},
@@ -765,7 +771,7 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::Refresh => "Refresh account limits and chat list",
         Hit::Dock => "Dock in the blank title bar area",
         Hit::Follow => "Follow the current Codex chat",
-        Hit::Guard => "Protect Codex Git · every 5 seconds · alerts and automatic cleanup",
+        Hit::Guard => "Protect Codex Git · configurable checks · 1s after trigger",
         Hit::GuardLogs => "View protection log · badge counts storm episodes, not processes · new tracking; recovered after 60 stable seconds",
         Hit::GuardRefresh => "Refresh recent protection events",
         Hit::GuardFolder => "Open log folder · includes compressed history",
@@ -895,6 +901,8 @@ impl App {
             preferences_draft: None,
             preferences_note: String::new(),
             preferences_advanced: false,
+            preferences_guard: false,
+            guard_limits: guard::Limits::default(),
             guard_events: Vec::new(),
             guard_log_error: String::new(),
             popup_layout: None,
@@ -1709,6 +1717,7 @@ impl App {
             }
             Some(Popup::Preferences) => {
                 let draft = self.preferences_draft.as_ref().unwrap_or(&self.settings);
+                if self.preferences_guard {return self.draw_guard_preferences(width,height);}
                 if self.preferences_advanced {
                     area(Hit::RefreshBack,rect(14.,8.,32.,30.));p.action_icon(&Hit::BackPreferences,18.,13.);
                     p.ui_label("Refresh settings",rect(54.,8.,width-70.,28.),14.,TEXT,false);
@@ -1782,11 +1791,12 @@ impl App {
                 area(Hit::Guard, rect(width - 73., 391., 57., 31.));
                 p.ui_label(
                     "Codex Git memory protection",
-                    rect(27., 391., width - 210., 31.),
+                    rect(27., 391., width - 250., 31.),
                     12.,
                     TEXT,
                     false,
                 );
+                area(Hit::GuardSettings,rect(width-201.,393.,28.,28.));p.action_icon(&Hit::Preferences,width-198.,396.);
                 let badge = rect(width - 162., 395., 40., 23.);
                 p.fill(badge, if live.guard.enabled && live.guard.storm_active { 0x62411d } else { 0x314759 }, 10.);
                 area(Hit::GuardLogs, badge);
@@ -1799,10 +1809,11 @@ impl App {
                 p.toggle(width - 60., 399., live.guard.enabled);
                 p.ui_label(
                     &format!(
-                        "{} · {} processes / {:.0} GiB · 5s",
+                        "{} · {} processes / {:.2} GiB · {}s",
                         live.guard.note,
                         live.guard.max_processes,
-                        live.guard.max_private_mib as f64 / 1024.
+                        live.guard.max_private_mib as f64 / 1024.,
+                        live.guard.interval_seconds
                     ),
                     rect(20., 426., width - 40., 25.),
                     11.,
@@ -2631,7 +2642,7 @@ impl App {
             self.refresh_guard_events();
         }
         if kind == Popup::Preferences {
-            self.preferences_advanced=false;
+            self.preferences_advanced=false;self.preferences_guard=false;
             if !resume_preferences || self.preferences_draft.is_none() {
                 self.preferences_draft = Some(self.settings.clone());
                 self.preferences_note = self.shortcut_error.clone();
@@ -2887,7 +2898,7 @@ impl App {
         let live = self.snapshot();
         let current = self.current(&live);
         let (_, title, status, _, _) = unsafe { self.bar_text(&live) };
-        self.paths.write(if self.testing{"rust-test-status.json"}else{"live-status.json"},&json!({"pid":std::process::id(),"runtime":"rust","ui_language":{"culture":crate::locale::status().0,"source":if crate::locale::status().1{"codex-uia"}else{"windows-default"}},"refresh":{"file_events":live.refresh_events.watching.load(Ordering::Relaxed),"settings":live.refresh_options},"updated_at":now(),"thread":self.identity(&live),"overview":self.identity(&live).is_empty() && data::visible_chat_title(&live.view_label).is_none(),"display_title":title,"display_status":status,"tokens":current.and_then(|s|s.tokens()),"auto_thread":live.auto_thread,"topmost":true,"user_hidden":self.hidden,"host_hidden":self.host_hidden,"host_window":live.host,"host_rect":self.last_host,"host_offset":self.settings.host_offset,"titlebar_slot":live.slot,"quota":live.quota,"quota_error":live.quota_error,"recent_cache":{"rows":live.recent.rows.len(),"busy_count":live.recent.busy_count,"stale":live.recent.stale,"error":live.recent.error},"active_view":{"thread":live.view,"label":live.view_label,"available":live.view.is_some() || data::visible_chat_title(&live.view_label).is_some(),"identity_pending":live.auto_thread && live.view.is_none() && data::visible_chat_title(&live.view_label).is_some(),"source":"uia-current-page"},"action_note":live.action_note,"codex_git_guard":live.guard,"font":{"chinese":self.painter.chinese,"latin":"Segoe UI","emoji":"Segoe UI Emoji","renderer":"DirectWrite / software Direct2D","antialias":"ClearType","per_monitor_dpi":true}}));
+        self.paths.write(if self.testing{"rust-test-status.json"}else{"live-status.json"},&json!({"pid":std::process::id(),"runtime":"rust","ui_language":{"culture":crate::locale::status().0,"source":if crate::locale::status().1{"codex-uia"}else{"windows-default"}},"refresh":{"file_events":live.refresh_events.watching.load(Ordering::Relaxed),"settings":live.refresh_options},"updated_at":now(),"thread":self.identity(&live),"overview":self.identity(&live).is_empty() && data::visible_chat_title(&live.view_label).is_none(),"display_title":title,"display_status":status,"tokens":current.and_then(|s|s.tokens()),"auto_thread":live.auto_thread,"topmost":true,"user_hidden":self.hidden,"host_hidden":self.host_hidden,"host_window":live.host,"host_rect":self.last_host,"host_offset":self.settings.host_offset,"titlebar_slot":live.slot,"quota":live.quota,"quota_error":live.quota_error,"view_error":live.view_error,"recent_cache":{"rows":live.recent.rows.len(),"busy_count":live.recent.busy_count,"stale":live.recent.stale,"error":live.recent.error},"active_view":{"thread":live.view,"label":live.view_label,"available":live.view.is_some() || data::visible_chat_title(&live.view_label).is_some(),"identity_pending":live.auto_thread && live.view.is_none() && data::visible_chat_title(&live.view_label).is_some(),"source":"uia-current-page"},"action_note":live.action_note,"codex_git_guard":live.guard,"font":{"chinese":self.painter.chinese,"latin":"Segoe UI","emoji":"Segoe UI Emoji","renderer":"DirectWrite / software Direct2D","antialias":"ClearType","per_monitor_dpi":true}}));
     }
     unsafe fn hit(&mut self, hit: Hit) -> Option<Action> {
         match hit {
@@ -2965,14 +2976,20 @@ impl App {
                     self.preferences_note = "Defaults restored · apply to save".into();
                 }
             }
+            Hit::GuardSettings => {
+                if let Some(draft)=self.preferences_draft.as_mut(){draft.recent_shortcut=Shortcut::from_control_word(SendMessageW(self.edit,HKM_GETHOTKEY,WPARAM(0),LPARAM(0)).0 as u16,draft.recent_shortcut.enabled);}
+                self.guard_limits=guard::Limits::load(&self.paths);self.preferences_guard=true;self.preferences_advanced=false;self.preferences_note.clear();let _=ShowWindow(self.edit,SW_HIDE);
+            }
+            Hit::GuardLimit(field,delta) => {self.guard_limits.adjust(field,delta);self.preferences_note="Apply to save changes".into();}
             Hit::RefreshPreferences => {
                 if let Some(draft)=self.preferences_draft.as_mut(){draft.recent_shortcut=Shortcut::from_control_word(SendMessageW(self.edit,HKM_GETHOTKEY,WPARAM(0),LPARAM(0)).0 as u16,draft.recent_shortcut.enabled);}
                 self.preferences_advanced=true;let _=ShowWindow(self.edit,SW_HIDE);
             }
-            Hit::RefreshBack => {self.preferences_advanced=false;let _=ShowWindow(self.edit,SW_SHOW);}
+            Hit::RefreshBack => {self.preferences_guard=false;self.preferences_advanced=false;let _=ShowWindow(self.edit,SW_SHOW);}
             Hit::RefreshInterval(field,delta) => {if let Some(draft)=self.preferences_draft.as_mut(){draft.refresh.adjust(field,delta);self.preferences_note="Apply to save changes".into();}}
             Hit::ApplyPreferences => {
-                if let Err(error) = self.apply_preferences() { self.preferences_note = format!("{error:#}"); }
+                let result=if self.preferences_guard {self.guard_limits.save(&self.paths)}else{self.apply_preferences()};
+                self.preferences_note=match result{Ok(())=>"Saved · changes are active".into(),Err(error)=>format!("{error:#}")};
             }
             Hit::Title | Hit::NewResults(_) => {
                 let _ = self.popup(Popup::Recent);
@@ -4656,6 +4673,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         verify_sidebar_animation(&mut app,paths)?;
         verify_refresh_preferences(&mut app,paths)?;
         verify_chat_menu_and_language(&mut app,paths)?;
+        verify_guard_preferences(&mut app,paths)?;
         let _ = app.hit(Hit::Hide);
         assert!(app.hidden);
         app.hidden = false;
@@ -4677,3 +4695,5 @@ pub fn self_test(paths: &Paths) -> Result<()> {
 include!("recent.rs");
 
 include!("context_menu.rs");
+
+include!("guard_preferences.rs");

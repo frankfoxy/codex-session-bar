@@ -139,29 +139,9 @@ enum Event {
 fn worker(paths: Paths, interval: u64, rx: mpsc::Receiver<Command>, tx: mpsc::SyncSender<Event>) {
     let recorder = Recorder::new(paths.logs.clone());
     let mut collector = collect::Collector::new();
-    let mut guard = guard::Guard::new(paths.logs.clone());
-    let mut guard_note = String::new();
+    let _protection=guard::Runner::start(paths.logs.clone(),tx.clone());
     let (mut seconds, mut paused, mut next, mut force) = (interval, false, Instant::now(), false);
     loop {
-        match guard.as_mut() {
-            Ok(guard) => {
-                let (alert, note) = guard.poll();
-                if let Some(message) = alert {
-                    let _ = tx.try_send(Event::GuardAlert(message));
-                }
-                if !note.is_empty() && note != guard_note {
-                    if tx.try_send(Event::GuardStatus(note.clone())).is_ok() {
-                        guard_note = note;
-                    }
-                }
-            }
-            Err(error) => {
-                let note = format!("Codex Git 防护无法启动：{error:#}");
-                if guard_note != note && tx.try_send(Event::GuardAlert(note.clone())).is_ok() {
-                    guard_note = note;
-                }
-            }
-        }
         if force || (!paused && Instant::now() >= next) {
             force = false;
             match collector.sample(seconds).and_then(|s| {
@@ -184,7 +164,7 @@ fn worker(paths: Paths, interval: u64, rx: mpsc::Receiver<Command>, tx: mpsc::Sy
         } else {
             next.saturating_duration_since(Instant::now())
         }
-        .min(guard.as_ref().map_or(Duration::from_secs(5), |g| g.wait()));
+        .min(Duration::from_secs(1));
         match rx.recv_timeout(wait) {
             Ok(Command::Quit) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(Command::Pause(v)) => {

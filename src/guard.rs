@@ -28,6 +28,7 @@ pub struct View {
     pub terminated: usize,
     pub max_processes: usize,
     pub max_private_mib: u64,
+    pub interval_seconds: u64,
     pub note: String,
     pub storm_count: Option<u64>,
     pub storm_active: bool,
@@ -41,8 +42,9 @@ impl Default for View {
             count: 0,
             private_bytes: 0,
             terminated: 0,
-            max_processes: 64,
-            max_private_mib: 4096,
+            max_processes: 16,
+            max_private_mib: 1024,
+            interval_seconds: 5,
             note: "Connecting to Memory Watch…".into(),
             storm_count: None,
             storm_active: false,
@@ -54,6 +56,24 @@ fn dir(paths: &Paths) -> PathBuf {
     paths.runtime.parent().unwrap().join("memory-watch-rust")
 }
 pub fn log_dir(paths: &Paths) -> PathBuf { dir(paths) }
+#[derive(Clone,Debug,Serialize,Deserialize)]
+#[serde(default)]
+pub struct Limits {pub max_processes:u64,pub max_private_mib:u64,pub interval_seconds:u64}
+impl Default for Limits {fn default()->Self {Self{max_processes:16,max_private_mib:1024,interval_seconds:5}}}
+impl Limits {
+    pub fn load(paths:&Paths)->Self {serde_json::from_value(read_json(&dir(paths).join(CONFIG),4096)).unwrap_or_default()}
+    pub fn adjust(&mut self,field:usize,delta:i32){
+        let (value,low,high)=match field {0=>(&mut self.max_processes,8,4096),1=>(&mut self.max_private_mib,256,65536),_=>(&mut self.interval_seconds,1,60)};
+        *value=(*value as i64+delta as i64).clamp(low,high) as u64;
+    }
+    pub fn save(&self,paths:&Paths)->anyhow::Result<()> {
+        anyhow::ensure!((8..=4096).contains(&self.max_processes)&&(256..=65536).contains(&self.max_private_mib)&&(1..=60).contains(&self.interval_seconds),"Invalid Git guard limits");
+        let folder=dir(paths);fs::create_dir_all(&folder)?;
+        let mut value=read_json(&folder.join(CONFIG),4096);if !value.is_object(){value=json!({"enabled":true});}
+        value["max_processes"]=json!(self.max_processes);value["max_private_mib"]=json!(self.max_private_mib);value["interval_seconds"]=json!(self.interval_seconds);
+        let pending=folder.join(format!("guard-limits.{}.pending",std::process::id()));fs::write(&pending,serde_json::to_vec(&value)?)?;fs::rename(pending,folder.join(CONFIG))?;Ok(())
+    }
+}
 #[derive(Clone, Default)]
 pub struct LogEntry {
     pub time: String,
@@ -84,6 +104,7 @@ fn parse_events(bytes: &[u8], skip_first: bool) -> Vec<LogEntry> {
             "storm_recovered" => ("Storm recovered".into(), "Below limits for 60 seconds".into(), false),
             "limit_exceeded" => ("Limit exceeded".into(), format!("{} Git · {:.0} MiB · {}", value["count"].as_u64().unwrap_or(0), value["private_bytes"].as_u64().unwrap_or(0) as f64 / 1048576., value["reason"].as_str().unwrap_or("")), true),
             "termination_requested" => (format!("Ending read-only Git · PID {pid}"), format!("{} · {:.0} MiB · Codex PID {}", value["verb"].as_str().unwrap_or("query"), value["private_bytes"].as_u64().unwrap_or(0) as f64 / 1048576., value["codex_pid"].as_u64().unwrap_or(0)), false),
+            "termination_confirmed" => (format!("Git ended · PID {pid}"),"Asynchronous exit confirmed".into(),false),
             "termination_result" => {
                 let result = value["result"].as_str().unwrap_or("unknown");
                 (format!("{} · PID {pid}", if result == "terminated" { "Git ended" } else { "Git skipped / pending" }), result.chars().take(180).collect(), result != "terminated")
@@ -101,7 +122,7 @@ pub fn set(paths: &Paths, enabled: bool) -> anyhow::Result<()> {
     fs::create_dir_all(&dir)?;
     let mut value = read_json(&dir.join(CONFIG), 4096);
     if !value.is_object() {
-        value = json!({"max_processes":64,"max_private_mib":4096});
+        value = json!({"max_processes":16,"max_private_mib":1024,"interval_seconds":5});
     }
     value["enabled"] = json!(enabled);
     let pending = dir.join(format!("guard-control.{}.pending", std::process::id()));
@@ -142,12 +163,13 @@ fn snapshot(paths: &Paths) -> View {
             })
             .is_some()
     };
+    let freshness=status["interval_seconds"].as_u64().unwrap_or(5).clamp(1,60)*2+5;
     let fresh = status["version"] == 1
         && native
         && status["pid"].as_u64() == Some(pid as u64)
         && status["updated_at"]
             .as_f64()
-            .is_some_and(|at| (0.0..=15.0).contains(&(now() - at)));
+            .is_some_and(|at| (0.0..=freshness as f64).contains(&(now() - at)));
     let healthy = fresh && status["healthy"].as_bool() == Some(true);
     let available = healthy && status["enabled"].as_bool() == Some(enabled);
     let note = if available {
@@ -179,8 +201,9 @@ fn snapshot(paths: &Paths) -> View {
         count: status["count"].as_u64().unwrap_or(0) as usize,
         private_bytes: status["private_bytes"].as_u64().unwrap_or(0),
         terminated: status["terminated"].as_u64().unwrap_or(0) as usize,
-        max_processes: cfg["max_processes"].as_u64().unwrap_or(64) as usize,
-        max_private_mib: cfg["max_private_mib"].as_u64().unwrap_or(4096),
+        max_processes: cfg["max_processes"].as_u64().unwrap_or(16) as usize,
+        max_private_mib: cfg["max_private_mib"].as_u64().unwrap_or(1024),
+        interval_seconds: status["interval_seconds"].as_u64().unwrap_or(5),
         note,
         storm_count: status["storm_count"].as_u64(),
         storm_active: status["storm_active"].as_bool().unwrap_or(false),

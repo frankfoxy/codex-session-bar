@@ -27,19 +27,24 @@ pub const CONFIG: &str = "codex-git-guard-settings.json";
 pub const STATUS: &str = "codex-git-guard-status.json";
 const COUNTERS: &str = "codex-git-guard-counters.json";
 const MIB: u64 = 1024 * 1024;
+fn effective_interval(enabled:bool,healthy:bool,active:bool,normal:u64)->u64 {
+    if enabled&&(active||!healthy){1}else{normal}
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub enabled: bool,
     pub max_processes: usize,
     pub max_private_mib: u64,
+    pub interval_seconds: u64,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_processes: 64,
-            max_private_mib: 4096,
+            max_processes: 16,
+            max_private_mib: 1024,
+            interval_seconds: 5,
         }
     }
 }
@@ -56,7 +61,7 @@ pub fn read_config(dir: &Path) -> Result<Config> {
     );
     let cfg: Config = serde_json::from_slice(&fs::read(file)?)?;
     ensure!(
-        (8..=4096).contains(&cfg.max_processes) && (256..=65536).contains(&cfg.max_private_mib),
+        (8..=4096).contains(&cfg.max_processes) && (256..=65536).contains(&cfg.max_private_mib) && (1..=60).contains(&cfg.interval_seconds),
         "Invalid Git guard limits"
     );
     Ok(cfg)
@@ -85,6 +90,7 @@ pub struct Status {
     pub error: String,
     pub check_ms: f64,
     pub interval_seconds: u64,
+    pub pending_terminations: usize,
     pub storm_count: u64,
     pub storm_active: bool,
     pub tracking_since: String,
@@ -474,7 +480,7 @@ fn plan<'a>(items: &'a [Candidate], cfg: &Config) -> Vec<&'a Candidate> {
         selected.push(c);
         count = count.saturating_sub(1);
         bytes = bytes.saturating_sub(c.process.private);
-        if selected.len() == 512 {
+        if selected.len() == 2048 {
             break;
         }
     }
@@ -489,6 +495,8 @@ pub struct Guard {
     last_popup: Option<Instant>,
     status: Status,
     incidents: Incidents,
+    normal_interval: u64,
+    pending: HashMap<(u32,i64),Handle>,
     #[cfg(test)]
     scope: Option<HashSet<(u32, i64)>>,
 }
@@ -498,6 +506,8 @@ impl Guard {
         let incidents = Incidents::load(&dir)?;
         Ok(Self {
             dir,
+            normal_interval: 5,
+            pending: HashMap::new(),
             collector: Collector::new(),
             inspector: Inspector::new()?,
             next: Instant::now(),
@@ -538,7 +548,7 @@ impl Guard {
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         serde_json::to_writer(&mut file, &value)?;
         file.write_all(b"\n")?;
-        file.sync_data()?;
+        file.flush()?;
         Ok(())
     }
     fn record_observation(&mut self, over: bool) -> Result<()> {
@@ -576,7 +586,10 @@ impl Guard {
             }
         }
         self.status.updated_at = now();
-        self.status.interval_seconds = 5;
+        self.status.interval_seconds = effective_interval(self.status.enabled,self.status.healthy,self.status.storm_active,self.normal_interval);
+        self.next=started+Duration::from_secs(self.status.interval_seconds);
+        self.status.pending_terminations=self.pending.len();
+        if let Ok(file)=OpenOptions::new().write(true).open(self.dir.join("codex-git-guard-events.jsonl")){let _=file.sync_data();}
         self.status.check_ms = started.elapsed().as_secs_f64() * 1000.;
         self.status.version = 1;
         self.status.pid = std::process::id();
@@ -599,7 +612,15 @@ impl Guard {
         (alert, summary)
     }
     fn check(&mut self, alert: &mut Option<String>) -> Result<()> {
+        let mut confirmed=Vec::new();
+        self.pending.retain(|identity,handle|unsafe{if WaitForSingleObject(handle.0,0)==WAIT_OBJECT_0 {confirmed.push(*identity);false}else{true}});
+        for (pid,created_ticks) in confirmed {
+            self.status.terminated+=1;
+            self.event(json!({"time":chrono::Local::now().to_rfc3339(),"type":"termination_confirmed","pid":pid,"created_ticks":created_ticks}))?;
+        }
+        if self.incidents.terminated!=self.status.terminated {self.incidents.terminated=self.status.terminated;self.incidents.save(&self.dir)?;}
         let cfg = read_config(&self.dir)?;
+        self.normal_interval=cfg.interval_seconds;
         self.status.enabled = cfg.enabled;
         self.status.max_processes = cfg.max_processes;
         self.status.max_private_mib = cfg.max_private_mib;
@@ -672,10 +693,12 @@ impl Guard {
         let mut pending = 0;
         let mut failed = 0;
         let all: HashMap<_, _> = fresh.processes.iter().map(|p| (p.pid, p)).collect();
+        let deadline=Instant::now()+Duration::from_millis(750);
         for victim in victims {
-            if !read_config(&self.dir)?.enabled {
-                break;
-            }
+            if Instant::now()>=deadline {break;}
+            if self.pending.contains_key(&(victim.process.pid,victim.process.created_ticks)){continue;}
+            // Check cancellation/config between small batches, not once per PID.
+            if (ended+pending+failed)%32==0 && !read_config(&self.dir)?.enabled {break;}
             let result = unsafe {
                 (|| -> Result<bool> {
                     let h = Handle(OpenProcess(
@@ -699,7 +722,10 @@ impl Guard {
                     );
                     self.event(json!({"time":chrono::Local::now().to_rfc3339(),"type":"termination_requested","reason":reason,"pid":victim.process.pid,"created_ticks":victim.process.created_ticks,"codex_pid":victim.origin.0,"codex_created_ticks":victim.origin.1,"image":victim.path,"verb":victim.verb,"private_bytes":victim.process.private}))?;
                     TerminateProcess(h.0, 0xe0000001)?;
-                    Ok(WaitForSingleObject(h.0, 20) == WAIT_OBJECT_0)
+                    if WaitForSingleObject(h.0,0)==WAIT_OBJECT_0 {Ok(true)}else{
+                        if self.pending.len()<4096 {self.pending.insert((victim.process.pid,victim.process.created_ticks),h);}
+                        Ok(false)
+                    }
                 })()
             };
             let outcome = match result {
@@ -726,14 +752,73 @@ impl Guard {
             *alert = Some(self.status.last_alert.clone());
             self.last_popup = Some(Instant::now());
         }
-        self.next = Instant::now() + Duration::from_secs(5);
         Ok(())
     }
+}
+
+// Enforcement has its own worker: sampling, compression, UI queues and modal
+// notifications must never hold up the next process check.
+pub struct Runner {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Runner {
+    pub fn start(dir:PathBuf,events:std::sync::mpsc::SyncSender<crate::Event>)->Self {
+        use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
+        let stop=Arc::new(AtomicBool::new(false));let done=stop.clone();
+        let thread=std::thread::spawn(move||{
+            let mut guard=None;let mut note=String::new();let mut pending_alert=None;
+            while !done.load(Ordering::Relaxed) {
+                if guard.is_none(){match Guard::new(dir.clone()){Ok(value)=>guard=Some(value),Err(error)=>{
+                    pending_alert=Some(format!("Codex Git 防护无法启动：{error:#}"));
+                }}}
+                let wait=if let Some(g)=guard.as_mut(){
+                    let (alert,status)=g.poll();if alert.is_some(){pending_alert=alert;}
+                    if !status.is_empty()&&status!=note&&events.try_send(crate::Event::GuardStatus(status.clone())).is_ok(){note=status;}
+                    g.wait()
+                }else{Duration::from_secs(5)};
+                if let Some(alert)=pending_alert.take(){
+                    if let Err(std::sync::mpsc::TrySendError::Full(crate::Event::GuardAlert(message)))=events.try_send(crate::Event::GuardAlert(alert)){pending_alert=Some(message);}
+                }
+                let deadline=Instant::now()+wait.max(Duration::from_millis(5));
+                while !done.load(Ordering::Relaxed)&&Instant::now()<deadline {
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(100)));
+                }
+            }
+        });
+        Self{stop,thread:Some(thread)}
+    }
+}
+impl Drop for Runner {
+    fn drop(&mut self){self.stop.store(true,std::sync::atomic::Ordering::Relaxed);if let Some(thread)=self.thread.take(){let _=thread.join();}}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn defaults_and_fast_checks_recover_only_after_stable_observations(){
+        let cfg:Config=serde_json::from_str("{}").unwrap();assert_eq!((cfg.max_processes,cfg.max_private_mib,cfg.interval_seconds),(16,1024,5));
+        assert_eq!(effective_interval(true,true,false,15),15);
+        assert_eq!(effective_interval(true,true,true,15),1);
+        assert_eq!(effective_interval(true,false,false,15),1);
+        assert_eq!(effective_interval(false,true,true,15),15);
+    }
+    #[test]
+    fn full_ui_queue_does_not_stop_guard_worker(){
+        let workspace=crate::workspace_root(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let temp=workspace.join("tmp").canonicalize().unwrap();let dir=temp.join(format!("guard-queue-test-{}",std::process::id()));fs::create_dir_all(&dir).unwrap();
+        atomic(&dir,CONFIG,&Config{enabled:false,interval_seconds:1,..Config::default()}).unwrap();
+        let (tx,_rx)=std::sync::mpsc::sync_channel(1);tx.try_send(crate::Event::Error("blocked UI".into())).unwrap();
+        let runner=Runner::start(dir.clone(),tx);
+        std::thread::sleep(Duration::from_millis(150));
+        let first:serde_json::Value=serde_json::from_slice(&fs::read(dir.join(STATUS)).unwrap()).unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        let last:serde_json::Value=serde_json::from_slice(&fs::read(dir.join(STATUS)).unwrap()).unwrap();
+        assert!(last["updated_at"].as_f64().unwrap()-first["updated_at"].as_f64().unwrap()>=0.8);
+        assert_eq!(last["healthy"],true);assert_eq!(last["enabled"],false);
+        drop(runner);fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn storm_counter_requires_a_stable_minute_and_survives_serialization() {
         let mut counter = Incidents { version:1, tracked_since:"2026-10-20T00:00:00Z".into(),
@@ -804,6 +889,7 @@ mod tests {
         let cfg = Config {
             max_processes: 8,
             max_private_mib: 256,
+            interval_seconds: 5,
             ..Default::default()
         };
         let items: Vec<_> = (0..12)
@@ -919,7 +1005,7 @@ mod tests {
             );
         }
         let mut guard = Guard::new(dir.clone()).unwrap();
-        let owned: HashSet<u32> = children.0.iter().map(|c| c.id()).collect();
+        let mut owned: HashSet<u32> = children.0.iter().map(|c| c.id()).collect();
         let snapshot = guard.collector.sample(5).unwrap();
         guard.scope = Some(
             snapshot
@@ -933,6 +1019,7 @@ mod tests {
             enabled: false,
             max_processes: 8,
             max_private_mib: 256,
+            interval_seconds: 5,
         };
         atomic(&dir, CONFIG, &config).unwrap();
         guard.poll();
@@ -950,6 +1037,8 @@ mod tests {
             guard.status.count, 10,
             "Controlled children must be traceable to the actual Codex ancestor"
         );
+        std::thread::sleep(Duration::from_millis(80));
+        guard.next=Instant::now();let _=guard.poll();
         assert_eq!(guard.status.terminated, 4);
         assert_eq!(guard.status.storm_count, 1);
         assert!(guard.status.storm_active);
@@ -961,6 +1050,15 @@ mod tests {
             children.0[9].try_wait().unwrap().is_none(),
             "Commit fixture must remain alive"
         );
+        // More queries appear while the first warning remains unacknowledged.
+        for _ in 0..4 {
+            let child=Command::new(&fixture).arg("diff").stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x08000000).spawn().unwrap();
+            owned.insert(child.id());children.0.push(child);
+        }
+        let snapshot=guard.collector.sample(1).unwrap();guard.scope=Some(snapshot.processes.iter().filter(|p|owned.contains(&p.pid)).map(|p|(p.pid,p.created_ticks)).collect());
+        guard.next=Instant::now();let _=guard.poll();std::thread::sleep(Duration::from_millis(80));guard.next=Instant::now();let _=guard.poll();
+        assert_eq!(guard.status.terminated,8);assert_eq!(guard.status.storm_count,1);
+        assert!(children.0[9].try_wait().unwrap().is_none());
         let evidence = dir.join("codex-git-guard-events.jsonl");
         assert!(fs::metadata(&evidence).unwrap().len() < 65536);
         let events = fs::read_to_string(&evidence).unwrap();
@@ -969,10 +1067,10 @@ mod tests {
             .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
             .filter(|v| v["type"] == "termination_result")
             .collect();
-        assert_eq!(actions.len(), 4);
+        assert_eq!(actions.len(), 8);
         assert!(actions
             .iter()
             .all(|v| owned.contains(&(v["pid"].as_u64().unwrap() as u32))));
-        assert!(guard.wait() > Duration::from_secs(4));
+        assert!(guard.wait() <= Duration::from_secs(1));
     }
 }

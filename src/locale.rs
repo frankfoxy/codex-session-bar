@@ -19,6 +19,12 @@ pub fn translate(text:&str,zh:bool)->Cow<'_,str>{
     let translated=match text {
         "Settings"=>"设置","Refresh settings"=>"刷新设置","Recent chats"=>"最近会话","Session details"=>"会话详情",
         "Protection log"=>"防护日志","Session icon"=>"会话图标","Choose a fixed chat"=>"选择固定监看的会话",
+        "Protection limits"=>"防护阈值","Process limit"=>"进程数量上限","Total private memory"=>"合计私有内存上限","Normal check interval"=>"正常检查间隔",
+        "Protect Codex Git · configurable checks · 1s after trigger"=>"Codex Git 防护 · 检查间隔可配置 · 触发后每秒检查",
+        "Protection limits and check interval"=>"配置防护阈值和检查间隔","Adjust protection limit · apply to save"=>"调整防护阈值 · 应用后保存",
+        "After a trigger: 1s checks until 60s stable."=>"触发后每秒检查，持续稳定 60 秒后恢复正常间隔。",
+        "Alerts and recording cannot pause enforcement."=>"告警弹框和内存采样不会阻塞防护。",
+        "Only verified Codex read-only Git queries are ended."=>"只结束确认由 Codex 启动的只读 Git 查询进程。",
         "Copy the conversation text as Markdown"=>"将会话正文复制为 Markdown","Copied"=>"已复制","Copied Markdown"=>"已复制 Markdown","Preparing Markdown…"=>"正在生成 Markdown…",
         "Protection is off"=>"防护已关闭","Memory Watch guard is unavailable or outdated"=>"内存监测防护不可用或版本过旧",
         "Applying change…"=>"正在应用修改…","Protection unavailable · start Memory Watch"=>"防护不可用 · 请启动内存监测程序",

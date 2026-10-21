@@ -264,6 +264,12 @@ fn run() -> Result<()> {
         ..Shared::default()
     }));
     let stop = Arc::new(AtomicBool::new(false));
+    let panic_path=paths.runtime.join("rust-worker-error.json");
+    let previous=std::panic::take_hook();
+    std::panic::set_hook(Box::new(move|info|{
+        let text=info.payload().downcast_ref::<&str>().copied().or_else(||info.payload().downcast_ref::<String>().map(String::as_str)).unwrap_or("Worker panicked");
+        let _=fs::write(&panic_path,serde_json::json!({"time":now(),"message":text.chars().take(512).collect::<String>(),"location":info.location().map(|l|format!("{}:{}",l.file(),l.line()))}).to_string());previous(info);
+    }));
     ui::run(paths, settings, state, stop.clone())?;
     stop.store(true, Ordering::Relaxed);
     Ok(())

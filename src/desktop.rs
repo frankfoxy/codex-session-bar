@@ -54,7 +54,8 @@ impl Rpc {
             .map(|e| e.path().join("server.mjs"))
             .filter(|p| p.is_file())
             .collect();
-        adapters.sort_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
+        // Bundled files can retain old packaging timestamps after an update.
+        adapters.sort_by_key(|p| (p.parent().and_then(Path::file_name).map(|n|n.to_string_lossy().split('.').filter_map(|v|v.parse::<u64>().ok()).collect::<Vec<_>>()).unwrap_or_default(),fs::metadata(p).and_then(|m| m.modified()).ok()));
         let adapter = adapters
             .pop()
             .context("Codex Desktop App Tools adapter unavailable")?;
@@ -156,7 +157,7 @@ impl Rpc {
                 .map_or(true, |p| p.try_wait().ok().flatten().is_some())
                 || !Path::new(&self.pipe).exists()
             {
-                self.start()?;
+                if let Err(error)=self.start(){self.close();return Err(error);}
             }
             match self.call_raw(
                 "tools/call",
@@ -191,6 +192,7 @@ fn find_node() -> Option<PathBuf> {
     env::var_os("CODEX_MCP_NODE_PATH")
         .map(PathBuf::from)
         .filter(|p| p.is_file())
+        .or_else(||env::var_os("LOCALAPPDATA").and_then(|local|bundled_nodes(&PathBuf::from(local).join("OpenAI/Codex/runtimes/cua_node")).into_iter().next()))
         .or_else(|| {
             env::var_os("PATH").and_then(|paths| {
                 env::split_paths(&paths)
@@ -198,6 +200,10 @@ fn find_node() -> Option<PathBuf> {
                     .find(|p| p.is_file())
             })
         })
+}
+fn bundled_nodes(root:&Path)->Vec<PathBuf>{
+    let mut nodes:Vec<_>=fs::read_dir(root).into_iter().flatten().filter_map(|entry|entry.ok()).take(32).map(|entry|entry.path().join("bin/node.exe")).filter(|p|p.is_file()).collect();
+    nodes.sort_by_key(|p|std::cmp::Reverse(fs::metadata(p).and_then(|m|m.modified()).ok()));nodes
 }
 fn payload(value: &Value) -> Result<Value> {
     if value["isError"].as_bool() == Some(true) {
@@ -480,4 +486,15 @@ pub fn default_context(paths: &Paths) -> String {
                 .map(|r| r.id)
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]mod tests {
+    use super::*;
+    #[test]fn bundled_runtime_discovery_ignores_missing_and_unrelated_entries(){
+        let paths=Paths::discover().unwrap();let dir=paths.runtime.join(format!("runtime-discovery-test-{}",std::process::id()));
+        fs::create_dir_all(dir.join("new-runtime/bin")).unwrap();fs::create_dir_all(dir.join("missing/bin")).unwrap();
+        fs::write(dir.join("new-runtime/bin/node.exe"),b"fixture").unwrap();
+        assert_eq!(bundled_nodes(&dir),vec![dir.join("new-runtime/bin/node.exe")]);
+        assert!(bundled_nodes(&dir.join("absent")).is_empty());fs::remove_dir_all(dir).unwrap();
+    }
 }
