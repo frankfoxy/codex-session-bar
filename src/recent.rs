@@ -39,6 +39,7 @@ struct RowTagLayout {
     chips: Vec<(tags::Tag, D2D_RECT_F)>,
     hidden: usize,
     action: D2D_RECT_F,
+    add: D2D_RECT_F,
 }
 struct TagCloudItem {
     index: usize,
@@ -494,8 +495,8 @@ impl App {
         let left = self.recent_left();
         let content = (width - left - 18.).max(300.);
         let tags_width = (content * 0.20).clamp(120., 210.);
-        let tags_left = width - 93. - tags_width;
-        let meta_width = (content * 0.145).clamp(100., 155.);
+        let tags_left = width - 54. - tags_width;
+        let meta_width = (content * 0.16).clamp(130., 165.);
         let meta_right = tags_left - 6.;
         let meta_left = meta_right - meta_width;
         let title_left = left + 50.;
@@ -527,13 +528,15 @@ impl App {
     unsafe fn tag_layout(&self, row: &Row) -> RowTagLayout {
         let tags = self.custom_tags.for_row(row);
         let c = self.recent_columns();
+        let tag_left = c.tags_left + 26.;
+        let tag_width = c.tags_width - 26.;
         let (mut x, mut line) = (0., 0usize);
         let mut chips = Vec::new();
         for tag in &tags {
             let mut limit = if line == 0 {
-                c.tags_width
+                tag_width
             } else {
-                c.tags_width - 28.
+                tag_width - 28.
             };
             let mut w = self.chip_width(tag, limit);
             if x + w > limit && x > 0. {
@@ -542,7 +545,7 @@ impl App {
                 }
                 line = 1;
                 x = 0.;
-                limit = c.tags_width - 28.;
+                limit = tag_width - 28.;
                 w = self.chip_width(tag, limit);
             }
             if line >= 2 {
@@ -550,20 +553,21 @@ impl App {
             }
             chips.push((
                 tag.clone(),
-                rect(c.tags_left + x, 1. + line as f32 * 22., w, 20.),
+                rect(tag_left + x, 1. + line as f32 * 22., w, 20.),
             ));
             x += w + 4.;
         }
         let hidden = tags.len() - chips.len();
-        if x + 24. > c.tags_width {
+        if x + 24. > tag_width {
             line += 1;
             x = 0.;
         }
-        let action = rect(c.tags_left + x, 1. + line.min(1) as f32 * 22., 24., 20.);
+        let action = rect(tag_left + x, 1. + line.min(1) as f32 * 22., 24., 20.);
         RowTagLayout {
             chips,
             hidden,
             action,
+            add: rect(c.tags_left, 12., 22., 20.),
         }
     }
     fn tag_overflow_rect(&self) -> D2D_RECT_F {
@@ -994,14 +998,16 @@ impl App {
                 TEXT,
                 true,
             );
-            let metric_width = if busy { 225. } else { 165. };
-            let metric_x = width - 91. - metric_width;
+            let model = if busy { row.execution.short() } else { String::new() };
+            let columns = self.recent_columns();
+            let model_width = if model.is_empty() { 0. } else { (p.width(&model, 10.) + 10.).min(if self.settings.compact_recent { 170. } else { columns.meta_width - 52. }) };
+            let metric_width = if busy { 225. + model_width } else { 165. };
+            let metric_x = width - 52. - metric_width;
             let line_h = if self.settings.compact_recent {
                 34.
             } else {
                 24.
             };
-            let columns = self.recent_columns();
             if self.settings.compact_recent {
                 p.label(
                     self.catalog.strip(&row.label),
@@ -1033,20 +1039,19 @@ impl App {
                 )
             };
             if self.settings.compact_recent {
+                if !model.is_empty() {
+                    p.model_label(&model, rect(metric_x, y + 2., model_width - 8., line_h), 10.);
+                }
                 p.label(
                     &metrics,
-                    rect(metric_x, y + 2., metric_width, line_h),
+                    rect(metric_x + model_width, y + 2., metric_width - model_width, line_h),
                     10.,
                     MUTED,
                     false,
                 );
             } else {
                 let summary = if busy {
-                    format!(
-                        "{} t/s · {} TOK",
-                        row.rate().map(|v| format!("{v:.1}")).unwrap_or("—".into()),
-                        data::compact(row.tokens)
-                    )
+                    format!("{} t/s", row.rate().map(|v| format!("{v:.1}")).unwrap_or("—".into()))
                 } else {
                     format!("{} TOK", data::compact(row.tokens))
                 };
@@ -1057,40 +1062,24 @@ impl App {
                 } else {
                     row.total_seconds.map(data::duration).unwrap_or("—".into())
                 };
+                let rate_width = if busy { p.width(&summary, 10.) + 2. } else { columns.meta_width };
                 p.right_label(
                     &summary,
-                    rect(columns.meta_left, y + 1., columns.meta_width, 20.),
+                    rect(columns.meta_right - rate_width, y + 1., rate_width, 20.),
                     10.,
                     MUTED,
                 );
+                if !model.is_empty() {
+                    p.model_label(&model, rect(columns.meta_right - rate_width - model_width, y + 1., model_width - 8., 20.), 10.);
+                }
                 p.right_label(
-                    &elapsed,
+                    &if busy { format!("{} TOK · {elapsed}", data::compact(row.tokens)) } else { elapsed },
                     rect(columns.meta_left, y + 23., columns.meta_width, 20.),
                     10.,
                     MUTED,
                 );
             }
-            p.ui_label(
-                &row.status_text(),
-                rect(
-                    width - 85.,
-                    y + 2.,
-                    70.,
-                    if self.settings.compact_recent {
-                        line_h
-                    } else {
-                        40.
-                    },
-                ),
-                11.,
-                match row.state.as_str() {
-                    "Busy" | "Waiting" => ORANGE,
-                    "Done" => GREEN,
-                    "Failed" => 0xf87171,
-                    _ => MUTED,
-                },
-                false,
-            );
+            p.status_icon(row, width - 35., y + if self.settings.compact_recent { 19. } else { 22. });
             if row.newly_completed() {
                 p.circle(left + 5., icon_y + 15., 3., NEW_RESULT);
             }
@@ -1134,7 +1123,10 @@ impl App {
                 area(Hit::TagOverflow(row.id.clone()), button);
                 p.fill(button, 0x34424a, 4.);
                 p.ui_label("…", button, 16., TEXT, false);
-            } else {
+            }
+            let r = tag_layout.add;
+            let button = rect(r.left, y + r.top, r.right - r.left, 20.);
+            {
                 area(Hit::TagEdit(row.id.clone()), button);
                 p.border(
                     rect(button.left + 6., button.top + 5., 12., 10.),
@@ -2221,6 +2213,8 @@ unsafe fn verify_two_columns(app: &mut App, paths: &Paths) -> Result<()> {
             assert!(c.preview_left + c.preview_width <= c.meta_left - 7.);
             assert!(c.meta_right + 5. <= c.tags_left);
             let layout = app.tag_layout(&app.rows[first]);
+            assert_eq!(layout.add.left, c.tags_left);
+            assert!(layout.chips.iter().all(|(_, r)| r.left >= layout.add.right + 4.));
             assert!(layout.chips.iter().all(|(_, r)| r.left >= c.tags_left
                 && r.right <= c.tags_left + c.tags_width
                 && r.bottom <= 43.));
@@ -2329,6 +2323,11 @@ unsafe fn verify_tag_overflow(app: &mut App, paths: &Paths) -> Result<()> {
         app.fixed_hit_at(layout.action.left + 12., y + layout.action.top + 10.),
         Some(Hit::TagOverflow(id.clone()))
     );
+    assert_eq!(app.fixed_hit_at(layout.add.left + 11., y + layout.add.top + 10.), Some(Hit::TagEdit(id.clone())));
+    for row in &app.rows {
+        let other = app.tag_layout(row);
+        assert_eq!(other.add, layout.add, "Add-tag buttons must align independently of tag count");
+    }
     let parent = (
         app.popup,
         app.edit,

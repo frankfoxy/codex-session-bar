@@ -10,6 +10,7 @@ mod tags;
 mod ui;
 mod refresh;
 mod locale;
+mod telemetry;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

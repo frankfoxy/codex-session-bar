@@ -46,6 +46,7 @@ const PANEL: u32 = 0x242a2e;
 const TEXT: u32 = 0xe8eef2;
 const MUTED: u32 = 0xa8b8c4;
 const ORANGE: u32 = 0xf5a34b;
+const MODEL: u32 = 0xffdc91;
 const GREEN: u32 = 0x65d69b;
 const NEW_RESULT: u32 = 0x70b7ff;
 const DETAILS_HEIGHT: i32 = 310;
@@ -181,6 +182,7 @@ unsafe fn create_tray_icon() -> Result<HICON> {
 }
 #[derive(Clone, Debug, PartialEq)]
 enum Hit {
+    Info(String),
     Icon,
     Title,
     NewResults(usize),
@@ -430,6 +432,14 @@ impl Painter {
             if let Ok(brush)=self.brush(rgb){self.target.DrawTextLayout(D2D_POINT_2F{x:r.left,y:r.top},&layout,&brush,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT|D2D1_DRAW_TEXT_OPTIONS_CLIP);}
         }
     }
+    unsafe fn model_label(&self, text: &str, r: D2D_RECT_F, size: f32) {
+        if let Ok(layout) = self.layout(text, size, false, (r.right-r.left).max(1.), (r.bottom-r.top).max(1.), false, 0) {
+            if let Ok(brush) = self.brush(MODEL) {
+                // Monochrome glyphs keep the Fast bolt in the same pale yellow.
+                self.target.DrawTextLayout(D2D_POINT_2F { x:r.left, y:r.top }, &layout, &brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            }
+        }
+    }
     unsafe fn fill(&self, r: D2D_RECT_F, rgb: u32, radius: f32) {
         if let Ok(b) = self.brush(rgb) {
             self.target.FillRoundedRectangle(
@@ -477,6 +487,23 @@ impl Painter {
                 },
                 &b,
             );
+        }
+    }
+    unsafe fn status_icon(&self, row: &Row, x: f32, y: f32) {
+        if row.state == "Busy" {
+            // Only list status cells animate. The title bar keeps its static dot.
+            let phase = (now() * 6.) as usize % 8;
+            for i in 0..8 {
+                let angle = i as f32 * std::f32::consts::TAU / 8. - std::f32::consts::FRAC_PI_2;
+                self.circle(x + angle.cos() * 5., y + angle.sin() * 5., 1.1,
+                    if (i + 8 - phase) % 8 < 3 { ORANGE } else { 0x70553a });
+            }
+        } else if row.state == "Done" {
+            self.line(x - 4., y, x - 1., y + 3., GREEN, 1.3);
+            self.line(x - 1., y + 3., x + 5., y - 4., GREEN, 1.3);
+        } else {
+            self.label(&row.status_text(), rect(x - 7., y - 12., 18., 24.), 13.,
+                if row.state == "Failed" { 0xf87171 } else if row.state == "Waiting" { ORANGE } else { MUTED }, false);
         }
     }
     unsafe fn search_icon(&self, x: f32, y: f32, rgb: u32) {
@@ -701,6 +728,7 @@ struct App {
     popup_layout_batch: bool,
     dpi: f32,
     last_draw: Instant,
+    last_status_draw: Instant,
     last_diag: Instant,
     last_identity: String,
     ui_language: u16,
@@ -738,6 +766,7 @@ impl Drop for Tips {
 }
 fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
     match hit {
+        Hit::Info(text) => return text.clone(),
         Hit::Icon | Hit::ChatIcon(_) => "Change chat icon",
         Hit::ChatCopy(0) => "Copy a link to this chat",
         Hit::ChatCopy(1) => "Copy the conversation text as Markdown",
@@ -960,6 +989,7 @@ impl App {
             popup_size: [640, 460],
             dpi: 1.,
             last_draw: Instant::now() - std::time::Duration::from_secs(3),
+            last_status_draw: Instant::now(),
             last_diag: Instant::now() - std::time::Duration::from_secs(3),
             last_identity: String::new(),
             ui_language:crate::locale::status().0,
@@ -1114,7 +1144,7 @@ impl App {
             .busy_count
             .map(|n| {
                 format!(
-                    "{} Busy ({n}){}",
+                    "{} {n}{}",
                     if n > 0 { "●" } else { "○" },
                     if stale { "*" } else { "" }
                 )
@@ -1175,6 +1205,7 @@ impl App {
                 }
                 x += 6.;
                 let sw = p.width(&busy, 12.) + 2.;
+                area(Hit::Info(format!("{}: {}{}", crate::locale::text("Busy"), live.recent.busy_count.map(|n|n.to_string()).unwrap_or_else(||"—".into()), if live.recent.stale { if crate::locale::chinese(){" · 数据可能已过期"}else{" · Stale data"} } else {""})), rect(x, 2., sw, 30.));
                 p.label(
                     &busy,
                     rect(x, 2., sw, 30.),
@@ -1209,12 +1240,22 @@ impl App {
                     p.label(text, rect(x, 2., w, 30.), 11., MUTED, false);
                     x += w + 8.;
                 }
+                if let Some(s) = current.filter(|s| s.turn.status == "inProgress") {
+                    let model = s.execution.short();
+                    if !model.is_empty() {
+                        let w = p.width(&model, 11.) + 2.;
+                        p.model_label(&model, rect(x, 2., w, 30.), 11.);
+                        area(Hit::Info(s.execution.tooltip()), rect(x, 2., w, 30.));
+                        x += w + 8.;
+                    }
+                }
                 let shown: Vec<Option<&data::Quota>> = if live.quota.is_empty() {
                     vec![None]
                 } else {
                     live.quota.iter().take(2).map(Some).collect()
                 };
                 for quota in shown {
+                    let quota_left = x;
                     let label = quota.map(|q| q.label.as_str()).unwrap_or("Limit");
                     let w = p.width(label, 11.) + 3.;
                     p.label(label, rect(x, 2., w, 30.), 11., MUTED, false);
@@ -1279,6 +1320,21 @@ impl App {
                     let w = p.width(&percent, 11.) + 2.;
                     p.label(&percent, rect(x, 2., w, 30.), 11., TEXT, false);
                     x += w + 7.;
+                    let zh = crate::locale::chinese();
+                    let tooltip = quota.map(|q| format!("{} · {}\n{} {:.0}% · {} {:.0}%\n{}{}", q.bucket, q.label,
+                        if zh { "剩余" } else { "Remaining" }, q.remaining,
+                        if zh { "已用" } else { "Used" }, 100. - q.remaining,
+                        crate::telemetry::reset_tooltip(if zh { "额度重置" } else { "Quota reset" }, q.reset, now()),
+                        if !live.quota_error.is_empty() || now()-live.quota_at>180. { if zh { "\n数据可能已过期 · 正在等待更新" } else { "\nStale data · waiting for update" } } else { "" }))
+                        .unwrap_or_else(|| if zh { "额度数据暂不可用".into() } else { "Quota data unavailable".into() });
+                    area(Hit::Info(tooltip), rect(quota_left, 2., x - quota_left, 30.));
+                    if let Some(reset) = quota.and_then(|q| q.banked_reset).filter(|r| *r > now()) {
+                        let text = format!("↶ {}", crate::telemetry::countdown(reset, now()));
+                        let w = p.width(&text, 11.) + 2.;
+                        p.label(&text, rect(x, 2., w, 30.), 11., MUTED, false);
+                        area(Hit::Info(crate::telemetry::reset_tooltip(if zh { "Banked reset · 下次补充重置次数" } else { "Banked reset · next grant" }, Some(reset), now())), rect(x, 2., w, 30.));
+                        x += w + 8.;
+                    }
                 }
                 area(Hit::Details, rect(x, 3., 25., 28.));
                 p.line(x + 8., 15., x + 12., 19., MUTED, 1.4);
@@ -1452,6 +1508,9 @@ impl App {
                         false,
                     );
                     if with_metrics {
+                        let model = if busy { row.execution.short() } else { String::new() };
+                        let model_width = if model.is_empty() { 0. } else { p.width(&model, 10.) + 10. };
+                        if !model.is_empty() { p.model_label(&model, rect(68., y + 22., model_width - 8., 16.), 10.); }
                         p.label(
                             &if busy {
                                 format!(
@@ -1466,24 +1525,13 @@ impl App {
                                     row.total_seconds.map(data::duration).unwrap_or("—".into())
                                 )
                             },
-                            rect(68., y + 22., width - 208., 16.),
+                            rect(68. + model_width, y + 22., width - 208. - model_width, 16.),
                             10.,
                             MUTED,
                             false,
                         );
                     }
-                    p.ui_label(
-                        &row.status_text(),
-                        rect(width - 126., y + 3., 85., 34.),
-                        11.,
-                        match row.state.as_str() {
-                            "Busy" | "Waiting" => ORANGE,
-                            "Done" => GREEN,
-                            "Failed" => 0xf87171,
-                            _ => MUTED,
-                        },
-                        false,
-                    );
+                    p.status_icon(row, width - 80., y + 20.);
                     if selected {
                         p.ui_label("✓", rect(width - 39., y + 3., 20., 34.), 14., GREEN, false);
                     }
@@ -1842,11 +1890,14 @@ impl App {
         if self.painter.target.BindDC(dc, &bounds).is_ok() {
             self.painter.target.SetDpi(96. * scale, 96. * scale);
             self.painter.target.BeginDraw();
+            self.painter.target.PushAxisAlignedClip(&rect(paint.rcPaint.left as f32/scale, paint.rcPaint.top as f32/scale,
+                (paint.rcPaint.right-paint.rcPaint.left) as f32/scale, (paint.rcPaint.bottom-paint.rcPaint.top) as f32/scale), D2D1_ANTIALIAS_MODE_ALIASED);
             let hits = self.render(
                 kind,
                 (bounds.right - bounds.left) as f32 / scale,
                 (bounds.bottom - bounds.top) as f32 / scale,
             );
+            self.painter.target.PopAxisAlignedClip();
             let _ = self.painter.target.EndDraw(None, None);
             self.sync_tips(hwnd, &hits, scale);
             if hwnd == self.bar {
@@ -1872,6 +1923,14 @@ impl App {
                     },
                     wide_ui(&if a.hit == Hit::Title {
                         format!("Recent chats · {}", self.settings.recent_shortcut.label())
+                    } else if let Hit::Recent(id) | Hit::Fixed(id) = &a.hit {
+                        let row = self.rows.iter().find(|r| &r.id == id);
+                        let mut tip = tip_text(&a.hit, &self.catalog);
+                        if let Some(row) = row {
+                            tip.push_str(&format!("\n{}", crate::locale::text(&row.state)));
+                            if row.state == "Busy" { tip.push_str(&format!("\n{}", row.execution.tooltip())); }
+                        }
+                        tip
                     } else if a.hit == Hit::GuardLogs {
                         let guard = self.snapshot().guard;
                         format!("{} recorded storm episodes · view log · continuous storms count once; recovered after 60 stable seconds",
@@ -1887,6 +1946,21 @@ impl App {
             .iter()
             .any(|t| t.owner == owner && t.entries == entries)
         {
+            return;
+        }
+        // Telemetry changes must not restart the native tooltip hover delay.
+        if let Some(tips) = self.tips.iter_mut().find(|t| t.owner == owner && t.entries.len() == entries.len()) {
+            let mut entries = entries;
+            for (i, (bounds, text)) in entries.iter_mut().enumerate() {
+                let info = TTTOOLINFOW {
+                    cbSize: std::mem::offset_of!(TTTOOLINFOW, lpReserved) as u32,
+                    uFlags: TTF_SUBCLASS, hwnd: owner, uId: i + 1, rect: *bounds,
+                    lpszText: PWSTR(text.as_mut_ptr()), ..Default::default()
+                };
+                if *bounds != tips.entries[i].0 { let _ = SendMessageW(tips.window, TTM_NEWTOOLRECTW, WPARAM(0), LPARAM(&info as *const _ as isize)); }
+                let _ = SendMessageW(tips.window, TTM_UPDATETIPTEXTW, WPARAM(0), LPARAM(&info as *const _ as isize));
+            }
+            tips.entries = entries;
             return;
         }
         self.tips.retain(|t| t.owner != owner);
@@ -1992,7 +2066,14 @@ impl App {
                     }
                 );
                 width += p.width(&q.label, 11.) + 5. + 42. + p.width(&percent, 11.) + 9.;
+                if let Some(reset) = q.banked_reset.filter(|r| *r > now()) {
+                    width += p.width(&format!("↶ {}", crate::telemetry::countdown(reset, now())), 11.) + 10.;
+                }
             }
+        }
+        if let Some(s) = self.current(&live).filter(|s| s.turn.status == "inProgress") {
+            let model = s.execution.short();
+            if !model.is_empty() { width += p.width(&model, 11.) + 10.; }
         }
         width.ceil() as i32
     }
@@ -2199,6 +2280,18 @@ impl App {
                 let _ = InvalidateRect(self.popup, None, false);
             }
             self.last_draw = Instant::now();
+        }
+        if !self.popup.is_invalid() && self.sidebar_animation.is_none()
+            && matches!(self.popup_kind, Some(Popup::Recent | Popup::Fixed))
+            && self.last_status_draw.elapsed().as_millis() >= 160
+            && self.chat_filters.iter().skip(self.scroll).take(self.list_page_rows()).any(|&i| self.rows[i].state == "Busy") {
+            let fixed = self.popup_kind == Some(Popup::Fixed);
+            let x = self.popup_size[0] - if fixed { 92 } else { 46 };
+            let scale = GetDpiForWindow(self.popup).max(96) as f32 / 96.;
+            let bounds = RECT { left: (x as f32 * scale) as i32, top: (if fixed {100.} else {RECENT_TOP as f32} * scale) as i32,
+                right: ((x+22) as f32 * scale) as i32, bottom: ((self.popup_size[1]-32) as f32*scale) as i32 };
+            let _ = InvalidateRect(self.popup, Some(&bounds), false);
+            self.last_status_draw = Instant::now();
         }
         if self.last_diag.elapsed().as_secs() >= self.settings.refresh.diagnostic_secs {
             self.diagnostic();
@@ -2903,6 +2996,7 @@ impl App {
     }
     unsafe fn hit(&mut self, hit: Hit) -> Option<Action> {
         match hit {
+            Hit::Info(_) => {}
             Hit::ChatCopy(slot) => {
                 if slot==1 {
                     if !self.testing {self.start_chat_copy();}
@@ -3295,8 +3389,9 @@ impl App {
             if (left+12. ..left+42.).contains(&x)&&(icon_top..icon_top+30.).contains(&local_y){return Some(Hit::ChatIcon(row.id.clone()));}
             if !self.settings.compact_recent{
                 let layout=unsafe{self.tag_layout(row)};
+                if Self::contains_rect(layout.add,x,local_y){return Some(Hit::TagEdit(row.id.clone()));}
                 for(tag,r)in layout.chips{if Self::contains_rect(r,x,local_y){return Some(Hit::TagFilter(tag.key));}}
-                if Self::contains_rect(layout.action,x,local_y){return Some(if layout.hidden>0{Hit::TagOverflow(row.id.clone())}else{Hit::TagEdit(row.id.clone())});}
+                if layout.hidden>0 && Self::contains_rect(layout.action,x,local_y){return Some(Hit::TagOverflow(row.id.clone()));}
             }
             return Some(Hit::Recent(row.id.clone()));
         }
@@ -4060,6 +4155,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             remaining: 54.,
             minutes: Some(10080.),
             reset: Some(now() + 350000.),
+            banked_reset: Some(now() + 8300.),
         };
         state.lock().unwrap().quota = vec![quota];
         state.lock().unwrap().quota_at = now();
@@ -4074,6 +4170,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
                 prompt: "请检查图像采集链路，并补充连续帧仿真。".into(),
                 tags: vec![tags::Tag{key:"project:demo".into(),label:"Demo project".into(),kind:tags::Kind::Project,color:0},tags::Tag{key:"group:IP".into(),label:"IP".into(),kind:tags::Kind::Group,color:0}],
                 state: if i < 3 { "Busy".into() } else { "Done".into() },
+                execution: crate::telemetry::Execution { model: "gpt-6.1-sol".into(), effort: "high".into(), service_tier: (i == 0).then(|| "priority".into()) },
                 is_unread: Some(i == 3 || i == 5),
                 tokens: Some(27190000),
                 tps: Some(42.3),
@@ -4217,6 +4314,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             label: "🧪 xxx 会话名称 · 中文清晰显示".into(),
             tokens_used: Some(27190000),
             model: "gpt-6.1-sol".into(),
+            execution: crate::telemetry::Execution { model: "gpt-6.1-sol".into(), effort: "high".into(), service_tier: Some("priority".into()) },
             cwd: "C:\\Projects\\demo".into(),
             turn: data::Turn {
                 status: "inProgress".into(),
@@ -4245,6 +4343,21 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             &paths.runtime.join("rust-bar-verification.png"),
         )?;
         assert!(bar_hits.iter().any(|area| area.hit == Hit::NewResults(2)));
+        assert_eq!(app.bar_text(&app.snapshot()).2, "● 3");
+        assert!(bar_hits.iter().any(|area| matches!(&area.hit, Hit::Info(text) if text.contains("gpt-6.1-sol") && text.contains("Fast: On"))));
+        assert!(bar_hits.iter().any(|area| matches!(&area.hit, Hit::Info(text) if text.contains("Quota reset:") && text.contains("Time remaining:"))));
+        assert!(bar_hits.iter().any(|area| matches!(&area.hit, Hit::Info(text) if text.contains("Banked reset"))));
+        app.sync_tips(app.bar, &bar_hits, 1.);
+        let tip_window = app.tips.iter().find(|t| t.owner == app.bar).unwrap().window;
+        let mut updated_hits = bar_hits.clone();
+        for area in &mut updated_hits { if let Hit::Info(text) = &mut area.hit { text.push_str("\nupdated"); } }
+        app.sync_tips(app.bar, &updated_hits, 1.);
+        assert_eq!(app.tips.iter().find(|t| t.owner == app.bar).unwrap().window, tip_window, "Telemetry must not recreate tooltips");
+        state.lock().unwrap().quota[0].banked_reset = None;
+        assert!(app.measure_bar() < w as i32);
+        let no_banked_hits = capture(&app, None, app.measure_bar() as u32, 34, &paths.runtime.join("rust-bar-no-banked-verification.png"))?;
+        assert!(!no_banked_hits.iter().any(|area| matches!(&area.hit, Hit::Info(text) if text.contains("Banked reset"))));
+        state.lock().unwrap().quota[0].banked_reset = Some(now() + 8300.);
         capture_docking(&app, paths)?;
         app.popup_kind = Some(Popup::Recent);
         app.rows = rows.clone();

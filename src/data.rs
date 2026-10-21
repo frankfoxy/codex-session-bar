@@ -31,6 +31,8 @@ pub struct Snapshot {
     pub id: String,
     pub label: String,
     pub model: String,
+    #[serde(default)]
+    pub execution: crate::telemetry::Execution,
     pub cwd: String,
     pub tokens_used: Option<u64>,
     pub turn: Turn,
@@ -58,6 +60,8 @@ pub struct Row {
     pub label: String,
     #[serde(default)]
     pub prompt: String,
+    #[serde(default)]
+    pub execution: crate::telemetry::Execution,
     #[serde(default)]
     pub tags: Vec<crate::tags::Tag>,
     #[serde(skip)]
@@ -138,18 +142,14 @@ impl Row {
         })
     }
     pub fn status_text(&self) -> String {
-        format!(
-            "{} {}",
-            match self.state.as_str() {
+        match self.state.as_str() {
                 "Busy" => "●",
                 "Done" => "✓",
                 "Waiting" => "◷",
                 "Stopped" => "Ⅱ",
                 "Failed" => "!",
                 _ => "○",
-            },
-            self.state
-        )
+            }.into()
     }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -217,6 +217,9 @@ pub struct Quota {
     pub remaining: f64,
     pub reset: Option<f64>,
     pub minutes: Option<f64>,
+    // An explicit next banked-reset grant, never an ordinary quota reset or credit expiry.
+    #[serde(default)]
+    pub banked_reset: Option<f64>,
 }
 
 pub fn quotas(value: &Value) -> Vec<Quota> {
@@ -245,6 +248,8 @@ pub fn quotas(value: &Value) -> Vec<Quota> {
                         remaining: (100.0 - used).clamp(0.0, 100.0),
                         reset: window["resetsAt"].as_f64(),
                         minutes,
+                        banked_reset: value.pointer("/rateLimitResetCredits/nextGrantAt")
+                            .and_then(Value::as_f64).filter(|v| v.is_finite() && *v > 0.),
                     });
                 }
             }
@@ -404,6 +409,8 @@ struct TokenData {
     usage: Value,
     at: Option<String>,
     rate: Option<Rate>,
+    execution: crate::telemetry::Execution,
+    context_at: Option<f64>,
 }
 struct Cache {
     size: u64,
@@ -415,6 +422,7 @@ pub struct Store {
     paths: Paths,
     databases: RefCell<HashMap<String, Rc<Connection>>>,
     cache: HashMap<String, Cache>,
+    turn_contexts: HashMap<String, (String, u64, Option<crate::telemetry::Execution>)>,
     prompts: HashMap<String, (i64, String)>,
     tag_sources: crate::tags::Sources,
 }
@@ -424,6 +432,7 @@ impl Store {
             paths: paths.clone(),
             databases: RefCell::new(HashMap::new()),
             cache: HashMap::new(),
+            turn_contexts: HashMap::new(),
             prompts: HashMap::new(),
             tag_sources: crate::tags::Sources::default(),
         }
@@ -550,12 +559,53 @@ impl Store {
             },
         )?;
         snap.turn=self.db("thread_history_1.sqlite")?.query_row("SELECT status,started_at,completed_at FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1",[id],|r|Ok(Turn{status:r.get(0)?,started_at:r.get(1)?,completed_at:r.get(2)?})).optional()?.unwrap_or_default();
+        snap.execution.model = snap.model.clone();
+        snap.execution.effort = db.query_row("SELECT reasoning_effort FROM threads WHERE id=?", [id], |r| r.get::<_,Option<String>>(0)).ok().flatten().unwrap_or_default();
+        // The history projection points directly at the current turn. Read at
+        // most 128 KiB once per turn instead of searching a large rollout.
+        if let Ok((turn, offset)) = self.db("thread_history_1.sqlite")?.query_row(
+            "SELECT turn_id,rollout_byte_offset FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1",
+            [id], |r| Ok((r.get::<_,String>(0)?, r.get::<_,Option<u64>>(1)?))) {
+            if let Some(context) = offset.and_then(|offset| self.turn_context(&path, &turn, offset)) {
+                if !context.model.is_empty() { snap.execution.model = context.model; }
+                if !context.effort.is_empty() { snap.execution.effort = context.effort; }
+                snap.execution.service_tier = context.service_tier;
+            }
+        }
         if let Ok(tokens) = self.tokens(&path) {
+            if tokens.context_at.is_some_and(|at| snap.turn.started_at.is_some_and(|start| at >= start - 2.)) {
+                if !tokens.execution.model.is_empty() { snap.execution.model = tokens.execution.model.clone(); }
+                if !tokens.execution.effort.is_empty() { snap.execution.effort = tokens.execution.effort.clone(); }
+                snap.execution.service_tier = tokens.execution.service_tier.clone();
+            }
             snap.usage = tokens.usage;
             snap.token_at = tokens.at;
             snap.output_rate = tokens.rate;
         }
         Ok(snap)
+    }
+    fn turn_context(&mut self, path: &str, turn: &str, offset: u64) -> Option<crate::telemetry::Execution> {
+        let size = fs::metadata(path).ok()?.len();
+        if let Some((old_turn, old_size, context)) = self.turn_contexts.get(path) {
+            if old_turn == turn && ((context.is_some() && size >= *old_size) || *old_size == size) { return context.clone(); }
+        }
+        let mut file = File::open(path).ok()?;
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        let mut bytes = Vec::with_capacity(131072);
+        file.take(131072).read_to_end(&mut bytes).ok()?;
+        let mut context = None;
+        for line in bytes.split(|b| *b == b'\n') {
+            let Ok(event) = serde_json::from_slice::<Value>(line) else { continue; };
+            if event["type"] == "turn_context" {
+                if event["payload"]["turn_id"].as_str() == Some(turn) {
+                    context = Some(crate::telemetry::Execution::from_context(&event["payload"]));
+                }
+                break;
+            }
+        }
+        if self.turn_contexts.len() >= 128 { self.turn_contexts.clear(); }
+        self.turn_contexts.insert(path.into(), (turn.into(), size, context.clone()));
+        context
     }
     fn tokens(&mut self, path: &str) -> Result<TokenData> {
         let meta = fs::metadata(path)?;
@@ -590,6 +640,15 @@ impl Store {
                 continue;
             };
             let payload = &event["payload"];
+            if event["type"] == "turn_context" {
+                data.execution = crate::telemetry::Execution::from_context(payload);
+                data.context_at = event["timestamp"].as_str().and_then(timestamp);
+                continue;
+            }
+            if event["type"] == "event_msg" && payload["type"] == "task_started" {
+                data.execution = Default::default();
+                data.context_at = None;
+            }
             if event["type"] != "event_msg"
                 || payload["type"] != "token_count"
                 || !payload["info"].is_object()
@@ -731,6 +790,7 @@ impl Store {
                     row.started_at = snapshot.turn.started_at;
                     row.tps = snapshot.rate();
                     row.rate_at = snapshot.output_rate.as_ref().map(|r| r.end);
+                    row.execution = snapshot.execution;
                 }
             }
         }
@@ -869,6 +929,48 @@ mod tests {
         let isolated=Paths{app:dir.clone(),runtime:dir.clone(),..paths};
         custom.save(&isolated).unwrap();let restored=crate::tags::Custom::load(&isolated);
         assert_eq!(restored.for_row(a).len(),3);assert_eq!(restored.definitions[0].color,2);
+    }
+
+    #[test]
+    fn turn_metadata_is_incremental_and_new_turn_does_not_inherit_fast() {
+        let (paths, dir) = fixture("execution");
+        let file = dir.join("execution.jsonl");
+        let context = |effort: &str, tier: Option<&str>| serde_json::json!({"type":"turn_context","timestamp":"2026-10-22T00:00:00Z","payload":{"model":"gpt-6.1-sol","effort":effort,"service_tier":tier}}).to_string();
+        std::fs::write(&file, format!("{}\n", context("high", Some("priority")))).unwrap();
+        let mut store = Store::new(&paths);
+        let path = file.to_str().unwrap();
+        assert!(store.tokens(path).unwrap().execution.fast());
+        use std::io::Write;
+        let mut stream = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+        writeln!(stream, "{}", serde_json::json!({"type":"event_msg","payload":{"type":"task_started"}})).unwrap();
+        assert!(store.tokens(path).unwrap().context_at.is_none());
+        writeln!(stream, "{}", context("xhigh", None)).unwrap();
+        let next = store.tokens(path).unwrap();
+        assert_eq!(next.execution.short(), "6.1 Sol · XH");
+        assert!(next.execution.service_tier.is_none());
+    }
+
+    #[test]
+    fn banked_countdown_requires_explicit_next_grant_not_quota_or_expiry() {
+        let mut v = serde_json::json!({"rateLimits":{"primary":{"usedPercent":30,"windowDurationMins":10080,"resetsAt":1800000000}},"rateLimitResetCredits":{"credits":[{"expiresAt":1799990000,"grantedAt":1799000000}]}});
+        assert!(quotas(&v)[0].banked_reset.is_none());
+        v["rateLimitResetCredits"]["nextGrantAt"] = serde_json::json!(1800000100);
+        let q = quotas(&v).remove(0);
+        assert_eq!(q.banked_reset, Some(1800000100.));
+        assert_eq!(q.reset, Some(1800000000.));
+    }
+
+    #[test]
+    fn indexed_turn_context_survives_large_output_and_never_crosses_turns() {
+        let (paths, dir) = fixture("indexed-context");
+        let file = dir.join("indexed.jsonl");
+        let context = serde_json::json!({"type":"turn_context","payload":{"turn_id":"current","model":"gpt-6-astra","effort":"xhigh","service_tier":"fast"}});
+        std::fs::write(&file, format!("{context}\n{}\n", " ".repeat(300000))).unwrap();
+        let mut store = Store::new(&paths);
+        let path = file.to_str().unwrap();
+        assert!(store.tokens(path).unwrap().execution.model.is_empty());
+        assert_eq!(store.turn_context(path, "current", 0).unwrap().short(), "6 Astra · XH ⚡");
+        assert!(store.turn_context(path, "next", 0).is_none());
     }
 
     #[test]
