@@ -224,12 +224,12 @@ fn snapshot(paths: &Paths) -> View {
 pub fn start(paths: &Paths, state: &State, stop: &Stop) -> thread::JoinHandle<()> {
     let (paths, state, stop) = (paths.clone(), state.clone(), stop.clone());
     thread::spawn(move || {
-        let mut retry = Instant::now() - Duration::from_secs(60);
+        let mut retry: Option<Instant> = None;
         while !stop.load(Ordering::Relaxed) {
             let mut view = snapshot(&paths);
             let running = unsafe { FindWindowW(w!("RustMemoryWatch"), None).is_ok() };
-            if view.enabled && !running && retry.elapsed() > Duration::from_secs(60) {
-                retry = Instant::now();
+            if view.enabled && !running && retry.is_none_or(|at| at.elapsed() > Duration::from_secs(60)) {
+                retry = Some(Instant::now());
                 if let Some((exe, home)) = backend(&paths) {
                     let result = fs::create_dir_all(&home).and_then(|_| {
                         Command::new(exe)

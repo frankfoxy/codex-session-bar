@@ -141,34 +141,59 @@ pub fn watch(paths: &Paths, events: Arc<Events>, stop: Stop) -> std::thread::Joi
 
 pub struct Gate {
     pub generation: u64,
-    pub updated: Instant,
+    pub updated: Option<Instant>,
 }
 impl Gate {
     pub fn new() -> Self {
         Self {
             generation: u64::MAX,
-            updated: Instant::now() - Duration::from_secs(600),
+            updated: None,
         }
     }
     pub fn due(&self, generation: u64, minimum: u64, fallback: u64) -> bool {
-        let elapsed = self.updated.elapsed();
+        self.due_at(generation, minimum, fallback, Instant::now())
+    }
+    fn due_at(&self, generation: u64, minimum: u64, fallback: u64, at: Instant) -> bool {
+        let Some(updated) = self.updated else { return true; };
+        let elapsed = at.saturating_duration_since(updated);
         elapsed >= Duration::from_secs(fallback)
             || (generation != self.generation && elapsed >= Duration::from_secs(minimum))
     }
     pub fn mark(&mut self, generation: u64) {
         self.generation = generation;
-        self.updated = Instant::now();
+        self.updated = Some(Instant::now());
     }
     pub fn pause(&self, events: &Events, minimum: u64) {
         // Once an event is pending, coalesce its burst until the minimum gap.
         if events.generation() != self.generation {
             std::thread::sleep(
                 Duration::from_millis(50)
-                    .min(Duration::from_secs(minimum).saturating_sub(self.updated.elapsed())),
+                    .min(Duration::from_secs(minimum).saturating_sub(self.updated.map(|at| at.elapsed()).unwrap_or_default())),
             );
         } else {
             events.wait(self.generation, Duration::from_secs(1));
         }
+    }
+}
+
+// Failures have their own deadline, independent of file notifications and the
+// normal fallback interval. No fabricated Instant before the system boot time.
+#[derive(Default)]
+pub struct Retry {
+    failures: u32,
+    next: Option<Instant>,
+}
+impl Retry {
+    pub fn pending(&self) -> bool { self.next.is_some() }
+    pub fn due(&self) -> bool { self.due_at(Instant::now()) }
+    fn due_at(&self, at: Instant) -> bool { self.next.is_some_and(|next| at >= next) }
+    pub fn waiting(&self) -> bool { self.pending() && !self.due() }
+    pub fn success(&mut self) { *self = Self::default(); }
+    pub fn failed(&mut self) { self.failed_at(Instant::now()); }
+    fn failed_at(&mut self, at: Instant) {
+        let delay = match self.failures { 0 => 1, 1 => 2, _ => 5 };
+        self.next = Some(at + Duration::from_secs(delay));
+        self.failures = self.failures.saturating_add(1);
     }
 }
 
@@ -184,11 +209,33 @@ mod tests {
         assert!(!gate.due(events.generation(), 1, 60));
         events.notify();
         assert!(!gate.due(events.generation(), 1, 60));
-        gate.updated -= Duration::from_secs(2);
-        assert!(gate.due(events.generation(), 1, 60));
+        let at = gate.updated.unwrap();
+        assert!(gate.due_at(events.generation(), 1, 60, at + Duration::from_secs(2)));
         gate.mark(events.generation());
-        gate.updated -= Duration::from_secs(61);
-        assert!(gate.due(events.generation(), 1, 60));
+        assert!(gate.due_at(events.generation(), 1, 60, gate.updated.unwrap() + Duration::from_secs(61)));
+    }
+    #[test]
+    fn cold_start_and_failed_sync_never_depend_on_uptime_or_source_events() {
+        let gate = Gate::new();
+        let at = Instant::now();
+        assert!(gate.updated.is_none());
+        assert!(gate.due_at(0, 5, 300, at));
+        let mut retry = Retry::default();
+        assert!(!retry.pending());
+        for delay in [1, 2, 5, 5, 5] {
+            retry.failed_at(at);
+            assert_eq!(retry.next.unwrap().duration_since(at), Duration::from_secs(delay));
+            assert!(!retry.due_at(at + Duration::from_millis(delay*1000-1)));
+            assert!(retry.due_at(at + Duration::from_secs(delay)));
+        }
+        retry.success();
+        assert!(!retry.pending());
+        retry.failed_at(at);
+        assert_eq!(retry.next.unwrap().duration_since(at), Duration::from_secs(1));
+        let mut another_source = Retry::default();
+        another_source.failed_at(at);
+        retry.success();
+        assert!(another_source.pending(), "One source recovering must not cancel another source's retry");
     }
     #[test]
     fn refresh_options_migrate_clamp_and_roundtrip() {

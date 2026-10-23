@@ -209,6 +209,7 @@ pub struct Shared {
     pub view: Option<String>,
     pub view_label: String,
     pub view_error: String,
+    pub snapshot_error: String,
     pub detected_at: f64,
     pub slot: Option<[i32; 4]>,
     pub slot_host: isize,

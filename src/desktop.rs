@@ -150,7 +150,15 @@ impl Rpc {
         bail!("Desktop request timed out")
     }
     pub fn tool(&mut self, name: &str, args: Value, context: &str) -> Result<Value> {
-        for attempt in 0..2 {
+        self.tool_attempts(name, args, context, 2)
+    }
+    fn read_tool(&mut self, name: &str, args: Value, context: &str) -> Result<Value> {
+        // Background retries are scheduled externally; avoid chaining two
+        // blocking requests before allowing the other source to update.
+        self.tool_attempts(name, args, context, 1)
+    }
+    fn tool_attempts(&mut self, name: &str, args: Value, context: &str, attempts: usize) -> Result<Value> {
+        for attempt in 0..attempts {
             if self
                 .child
                 .as_mut()
@@ -166,7 +174,7 @@ impl Rpc {
                 Ok(result) => return payload(&result),
                 Err(e) => {
                     self.close();
-                    if attempt == 1 || self.stop.load(Ordering::Relaxed) {
+                    if attempt + 1 == attempts || self.stop.load(Ordering::Relaxed) {
                         return Err(e);
                     }
                 }
@@ -233,6 +241,11 @@ fn payload(value: &Value) -> Result<Value> {
     }
     bail!("Desktop response did not include structured data")
 }
+fn synced_quotas(value: &Value) -> Result<Vec<crate::data::Quota>> {
+    let windows = quotas(value);
+    anyhow::ensure!(!windows.is_empty(), "Account limits not available yet; retrying");
+    Ok(windows)
+}
 fn context(state: &Shared) -> String {
     state
         .view
@@ -256,6 +269,7 @@ impl Workers {
             let mut store = Store::new(&p);
             let mut last_id = String::new();
             let mut gate = crate::refresh::Gate::new();
+            let mut retry = crate::refresh::Retry::default();
             let events = s.lock().unwrap().refresh_events.clone();
             while !done.load(Ordering::Relaxed) {
                 let (id, auto) = {
@@ -271,60 +285,81 @@ impl Workers {
                 };
                 if let Some(id) = id.filter(|id| !id.is_empty()) {
                     let cfg = s.lock().unwrap().refresh_options.clone();
-                    if id == last_id && !gate.due(events.generation(), cfg.current_secs, cfg.fallback_secs) {
-                        gate.pause(&events,cfg.current_secs);
+                    if id != last_id { retry.success(); }
+                    if retry.waiting() || (id == last_id && !retry.due() && !gate.due(events.generation(), cfg.current_secs, cfg.fallback_secs)) {
+                        if retry.pending() { events.wait(events.generation(),Duration::from_secs(1)); }
+                        else { gate.pause(&events,cfg.current_secs); }
                         continue;
                     }
                     last_id = id.clone();
                     gate.mark(events.generation());
                     match store.read(&id) {
                         Ok(snapshot) => {
+                            retry.success();
                             let mut live = s.lock().unwrap();
                             if (auto && live.auto_thread && live.view.as_deref() == Some(&id))
                                 || (!auto && !live.auto_thread && live.fixed_thread == id)
                             {
                                 live.snapshot = Some(snapshot);
+                                live.snapshot_error.clear();
                             }
                         }
                         Err(e) => {
+                            retry.failed();
                             let mut live = s.lock().unwrap();
-                            if live.view.as_deref() == Some(&id) {
-                                live.view_error = format!("{e:#}");
+                            if (auto && live.auto_thread && live.view.as_deref() == Some(&id))
+                                || (!auto && !live.auto_thread && live.fixed_thread == id) {
+                                live.snapshot_error = format!("{e:#}");
                             }
                         }
                     }
+                } else {
+                    last_id.clear();
+                    retry.success();
                 }
                 events.wait(events.generation(),Duration::from_secs(1));
             }
         }));
         let (p, s, done) = (paths.clone(), state.clone(), stop.clone());
         handles.push(thread::spawn(move||{
-            let mut rpc=Rpc::new(&p,done.clone());let mut store=Store::new(&p);let mut last_quota=0.;
-            let mut last_cache=Instant::now()-Duration::from_secs(600);
+            let mut rpc=Rpc::new(&p,done.clone());let mut store=Store::new(&p);
+            let mut last_quota: Option<Instant> = None;
+            let mut last_cache: Option<Instant> = None;
+            let mut list_retry=crate::refresh::Retry::default();
+            let mut quota_retry=crate::refresh::Retry::default();
             let events=s.lock().unwrap().refresh_events.clone();let mut gate=crate::refresh::Gate::new();
             while !done.load(Ordering::Relaxed) {
                 let cfg=s.lock().unwrap().refresh_options.clone();
                 let forced=s.lock().unwrap().quota_at<0.;
-                if !forced && !gate.due(events.generation(),cfg.list_secs,cfg.fallback_secs) && now()-last_quota<60. {
-                    gate.pause(&events,cfg.list_secs);continue;
+                // A pending manual quota refresh stays flagged until success;
+                // it must not keep refreshing a healthy chat list every second.
+                let list_due = if list_retry.pending() { list_retry.due() } else { (forced && !quota_retry.pending()) || gate.due(events.generation(),cfg.list_secs,cfg.fallback_secs) };
+                let quota_due = if quota_retry.pending() { quota_retry.due() } else { forced || last_quota.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) };
+                if !list_due && !quota_due {
+                    if list_retry.pending() || quota_retry.pending() { events.wait(events.generation(),Duration::from_secs(1)); }
+                    else { gate.pause(&events,cfg.list_secs); }
+                    continue;
                 }
-                gate.mark(events.generation());
                 let ctx=context(&s.lock().unwrap());
-                match rpc.tool("list_threads",json!({"limit":50}),&ctx).and_then(|payload|store.recent(&payload)) {
+                if list_due {
+                gate.mark(events.generation());
+                match rpc.read_tool("list_threads",json!({"limit":50}),&ctx).and_then(|payload|store.recent(&payload)) {
                     Ok(mut recent)=>{
+                        list_retry.success();
                         recent.carry_read_state(&s.lock().unwrap().recent);
-                        if last_cache.elapsed()>=Duration::from_secs(cfg.cache_secs) {
+                        if last_cache.is_none_or(|at| at.elapsed()>=Duration::from_secs(cfg.cache_secs)) {
                             p.write("recent-cache.json",&json!({"schema":1,"rows":recent.rows,"all_rows":recent.all_rows,"busy_count":recent.busy_count,"busy_metrics":recent.busy_metrics,"loaded_at":recent.loaded_at,"stale":false}));
-                            last_cache=Instant::now();
+                            last_cache=Some(Instant::now());
                         }
                         s.lock().unwrap().recent=std::sync::Arc::new(recent);
                     },
-                    Err(e)=>{let mut live=s.lock().unwrap();let recent=std::sync::Arc::make_mut(&mut live.recent);recent.stale=true;recent.error=format!("{e:#}");}
+                    Err(e)=>{list_retry.failed();let mut live=s.lock().unwrap();let recent=std::sync::Arc::make_mut(&mut live.recent);recent.stale=true;recent.error=format!("{e:#}");}
                 }
-                if now()-last_quota>=60. || s.lock().unwrap().quota_at<0. {
-                    match rpc.tool("get_usage_limits",json!({}),&ctx){
-                        Ok(value)=>{let mut live=s.lock().unwrap();live.quota=quotas(&value);live.quota_at=now();live.quota_error.clear();last_quota=now();}
-                        Err(e)=>{s.lock().unwrap().quota_error=format!("{e:#}");last_quota=now()-45.;}
+                }
+                if quota_due {
+                    match rpc.read_tool("get_usage_limits",json!({}),&ctx).and_then(|value|synced_quotas(&value)){
+                        Ok(windows)=>{quota_retry.success();let mut live=s.lock().unwrap();live.quota=windows;live.quota_at=now();live.quota_error.clear();last_quota=Some(Instant::now());}
+                        Err(e)=>{quota_retry.failed();s.lock().unwrap().quota_error=format!("{e:#}");}
                     }
                 }
                 events.wait(events.generation(),Duration::from_secs(1));
@@ -490,6 +525,12 @@ pub fn default_context(paths: &Paths) -> String {
 
 #[cfg(test)]mod tests {
     use super::*;
+    #[test]fn empty_startup_limits_are_retryable_until_real_data_arrives(){
+        assert!(synced_quotas(&json!({"rateLimits":null})).is_err());
+        assert!(synced_quotas(&json!({"rateLimitsByLimitId":{}})).is_err());
+        let ready=synced_quotas(&json!({"rateLimits":{"primary":{"usedPercent":0,"windowDurationMins":10080,"resetsAt":1800000000}}})).unwrap();
+        assert_eq!(ready[0].remaining,100.);
+    }
     #[test]fn bundled_runtime_discovery_ignores_missing_and_unrelated_entries(){
         let paths=Paths::discover().unwrap();let dir=paths.runtime.join(format!("runtime-discovery-test-{}",std::process::id()));
         fs::create_dir_all(dir.join("new-runtime/bin")).unwrap();fs::create_dir_all(dir.join("missing/bin")).unwrap();

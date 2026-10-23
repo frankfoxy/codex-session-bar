@@ -100,10 +100,10 @@ impl Tracker {
             ui,
             document: None,
             hwnd: 0,
-            checked: Instant::now() - Duration::from_secs(2),
+            checked: Instant::now(),
             resolved_name: String::new(),
             resolved_id: None,
-            resolved_at: Instant::now() - Duration::from_secs(10),
+            resolved_at: Instant::now(),
         })
     }
     unsafe fn poll(&mut self, store: &Store) -> Result<(isize, Option<String>, String)> {
@@ -312,7 +312,7 @@ pub fn start(paths: &Paths, state: &State, stop: &Stop) -> Vec<thread::JoinHandl
     handles.push(thread::spawn(move || unsafe {
         let mut tracker = None;
         let mut last_geometry = None;
-        let mut layout_checked = Instant::now() - Duration::from_secs(600);
+        let mut layout_checked = Instant::now();
         while !done.load(Ordering::Relaxed) {
             if tracker.is_none() {
                 tracker = Tracker::new().ok();

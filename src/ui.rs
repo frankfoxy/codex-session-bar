@@ -988,9 +988,9 @@ impl App {
             height: 34,
             popup_size: [640, 460],
             dpi: 1.,
-            last_draw: Instant::now() - std::time::Duration::from_secs(3),
+            last_draw: Instant::now(),
             last_status_draw: Instant::now(),
-            last_diag: Instant::now() - std::time::Duration::from_secs(3),
+            last_diag: Instant::now(),
             last_identity: String::new(),
             ui_language:crate::locale::status().0,
             last_signature: String::new(),
@@ -2995,7 +2995,7 @@ impl App {
         let live = self.snapshot();
         let current = self.current(&live);
         let (_, title, status, _, _) = unsafe { self.bar_text(&live) };
-        self.paths.write(if self.testing{"rust-test-status.json"}else{"live-status.json"},&json!({"pid":std::process::id(),"runtime":"rust","ui_language":{"culture":crate::locale::status().0,"source":if crate::locale::status().1{"codex-uia"}else{"windows-default"}},"refresh":{"file_events":live.refresh_events.watching.load(Ordering::Relaxed),"settings":live.refresh_options},"updated_at":now(),"thread":self.identity(&live),"overview":self.identity(&live).is_empty() && data::visible_chat_title(&live.view_label).is_none(),"display_title":title,"display_status":status,"tokens":current.and_then(|s|s.tokens()),"auto_thread":live.auto_thread,"topmost":true,"user_hidden":self.hidden,"host_hidden":self.host_hidden,"host_window":live.host,"host_rect":self.last_host,"host_offset":self.settings.host_offset,"titlebar_slot":live.slot,"quota":live.quota,"quota_error":live.quota_error,"view_error":live.view_error,"recent_cache":{"rows":live.recent.rows.len(),"busy_count":live.recent.busy_count,"stale":live.recent.stale,"error":live.recent.error},"active_view":{"thread":live.view,"label":live.view_label,"available":live.view.is_some() || data::visible_chat_title(&live.view_label).is_some(),"identity_pending":live.auto_thread && live.view.is_none() && data::visible_chat_title(&live.view_label).is_some(),"source":"uia-current-page"},"action_note":live.action_note,"codex_git_guard":live.guard,"font":{"chinese":self.painter.chinese,"latin":"Segoe UI","emoji":"Segoe UI Emoji","renderer":"DirectWrite / software Direct2D","antialias":"ClearType","per_monitor_dpi":true}}));
+        self.paths.write(if self.testing{"rust-test-status.json"}else{"live-status.json"},&json!({"pid":std::process::id(),"runtime":"rust","ui_language":{"culture":crate::locale::status().0,"source":if crate::locale::status().1{"codex-uia"}else{"windows-default"}},"refresh":{"file_events":live.refresh_events.watching.load(Ordering::Relaxed),"settings":live.refresh_options},"updated_at":now(),"thread":self.identity(&live),"overview":self.identity(&live).is_empty() && data::visible_chat_title(&live.view_label).is_none(),"display_title":title,"display_status":status,"tokens":current.and_then(|s|s.tokens()),"auto_thread":live.auto_thread,"topmost":true,"user_hidden":self.hidden,"host_hidden":self.host_hidden,"host_window":live.host,"host_rect":self.last_host,"host_offset":self.settings.host_offset,"titlebar_slot":live.slot,"quota":live.quota,"quota_error":live.quota_error,"view_error":live.view_error,"snapshot_error":live.snapshot_error,"recent_cache":{"rows":live.recent.rows.len(),"busy_count":live.recent.busy_count,"stale":live.recent.stale,"error":live.recent.error},"active_view":{"thread":live.view,"label":live.view_label,"available":live.view.is_some() || data::visible_chat_title(&live.view_label).is_some(),"identity_pending":live.auto_thread && live.view.is_none() && data::visible_chat_title(&live.view_label).is_some(),"source":"uia-current-page"},"action_note":live.action_note,"codex_git_guard":live.guard,"font":{"chinese":self.painter.chinese,"latin":"Segoe UI","emoji":"Segoe UI Emoji","renderer":"DirectWrite / software Direct2D","antialias":"ClearType","per_monitor_dpi":true}}));
     }
     unsafe fn hit(&mut self, hit: Hit) -> Option<Action> {
         match hit {
