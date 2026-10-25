@@ -1,8 +1,8 @@
 //! GitHub stable releases, explicit consent and a separate transactional installer.
 mod http;
-use crate::{locale, now, read_json, Paths, Stop};
+use crate::{locale, now, read_json, Paths, State, Stop};
 use anyhow::{ensure, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
@@ -14,7 +14,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc,
+        mpsc, Arc,
     },
     thread,
     time::{Duration, Instant},
@@ -147,11 +147,168 @@ fn plain(path: &Path) -> String {
         .trim_start_matches(r"\\?\")
         .to_owned()
 }
-fn status(paths: &Paths, phase: &str, detail: &str) {
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct View {
+    pub phase: String,
+    pub detail: String,
+    pub last_check_at: Option<f64>,
+    pub last_result: String,
+    pub last_detail: String,
+}
+impl View {
+    fn load(paths: &Paths) -> Self {
+        let saved = read_json(&paths.runtime.join("update-status.json"), 16384);
+        let mut view: Self = serde_json::from_value(saved.clone()).unwrap_or_default();
+        if view.last_result.is_empty()
+            && matches!(
+                view.phase.as_str(),
+                "up_to_date" | "available" | "check_failed"
+            )
+        {
+            view.last_check_at = saved["time"].as_f64();
+            view.last_result = view.phase.clone();
+            view.last_detail = view.detail.clone();
+        }
+        if view.busy() {
+            view.phase.clear();
+        }
+        view
+    }
+    fn change(&mut self, phase: &str, detail: &str, at: f64) {
+        self.phase = phase.into();
+        self.detail = detail.into();
+        if matches!(phase, "up_to_date" | "available" | "check_failed") {
+            self.last_check_at = Some(at);
+            self.last_result = phase.into();
+            self.last_detail = detail.into();
+        }
+    }
+    pub fn busy(&self) -> bool {
+        matches!(
+            self.phase.as_str(),
+            "checking" | "downloading" | "restarting"
+        )
+    }
+    pub fn time_label(&self, zh: bool) -> String {
+        let time = self
+            .last_check_at
+            .filter(|at| at.is_finite() && *at > 0.)
+            .and_then(|at| chrono::DateTime::from_timestamp(at as i64, 0))
+            .map(|at| {
+                at.with_timezone(&chrono::Local)
+                    .format("%m-%d %H:%M:%S")
+                    .to_string()
+            });
+        match time {
+            Some(time) => format!(
+                "{} {time}",
+                if zh {
+                    "上次检查："
+                } else {
+                    "Last checked:"
+                }
+            ),
+            None => if zh {
+                "尚未检查"
+            } else {
+                "Not checked yet"
+            }
+            .into(),
+        }
+    }
+    pub fn result_label(&self, zh: bool) -> String {
+        let latest = &self.last_detail;
+        let text = match self.phase.as_str() {
+            "checking" => {
+                if zh {
+                    "正在检查 GitHub…"
+                } else {
+                    "Checking GitHub…"
+                }
+            }
+            "downloading" => {
+                if zh {
+                    "正在下载并校验…"
+                } else {
+                    "Downloading and verifying…"
+                }
+            }
+            "restarting" => {
+                if zh {
+                    "正在重启…"
+                } else {
+                    "Restarting…"
+                }
+            }
+            "error" => {
+                if zh {
+                    "更新失败 · 当前程序继续运行"
+                } else {
+                    "Update failed · current app retained"
+                }
+            }
+            _ => match self.last_result.as_str() {
+                "up_to_date" => {
+                    return if zh {
+                        format!("无需更新 · GitHub {latest}")
+                    } else {
+                        format!("Up to date · GitHub {latest}")
+                    }
+                }
+                "available" => {
+                    return if self.phase == "declined" {
+                        if zh {
+                            format!("发现 {latest} · 已暂缓")
+                        } else {
+                            format!("{latest} available · postponed")
+                        }
+                    } else {
+                        if zh {
+                            format!("发现新版本 {latest}")
+                        } else {
+                            format!("Version {latest} available")
+                        }
+                    }
+                }
+                "check_failed" => {
+                    if zh {
+                        "检查失败 · 可重试"
+                    } else {
+                        "Check failed · retry available"
+                    }
+                }
+                _ => {
+                    if zh {
+                        "每 30 分钟自动检查"
+                    } else {
+                        "Automatic checks every 30 minutes"
+                    }
+                }
+            },
+        };
+        text.into()
+    }
+    pub fn tooltip(&self, zh: bool) -> String {
+        let mut text = format!("{}\n{}", self.time_label(zh), self.result_label(zh));
+        if matches!(self.phase.as_str(), "error" | "check_failed") && !self.detail.is_empty() {
+            text.push('\n');
+            text.push_str(&self.detail);
+        }
+        text
+    }
+}
+fn status(paths: &Paths, state: &State, phase: &str, detail: &str) {
+    let view = {
+        let mut shared = state.lock().unwrap();
+        shared.updater.change(phase, detail, now());
+        shared.updater.clone()
+    };
     paths.write(
         "update-status.json",
         &json!({"time":now(),"current_version":env!("CARGO_PKG_VERSION"),
-        "phase":phase,"detail":detail,"interval_seconds":INTERVAL.as_secs()}),
+        "phase":phase,"detail":detail,"interval_seconds":INTERVAL.as_secs(),
+        "last_check_at":view.last_check_at,"last_result":view.last_result,"last_detail":view.last_detail}),
     );
 }
 fn fetch(etag: &mut String, cache: &mut Option<Release>, stop: &AtomicBool) -> Result<()> {
@@ -179,14 +336,49 @@ fn prompt_text(version: Version, zh: bool) -> String {
 }
 enum Event {
     Stop,
+    Check,
     Decision(Candidate, bool),
+}
+#[derive(Clone)]
+pub struct Control {
+    tx: mpsc::Sender<Event>,
+    busy: Arc<AtomicBool>,
+}
+impl Control {
+    pub fn busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
+    }
+    pub fn request(&self) -> bool {
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        if self.tx.send(Event::Check).is_err() {
+            self.busy.store(false, Ordering::Release);
+            return false;
+        }
+        true
+    }
 }
 pub struct Service {
     tx: mpsc::Sender<Event>,
     handle: Option<thread::JoinHandle<()>>,
+    control: Control,
 }
 impl Service {
-    pub fn start(paths: &Paths, stop: &Stop, bar: isize, quit_message: u32) -> Option<Self> {
+    pub fn control(&self) -> Control {
+        self.control.clone()
+    }
+    pub fn start(
+        paths: &Paths,
+        state: &State,
+        stop: &Stop,
+        bar: isize,
+        quit_message: u32,
+    ) -> Option<Self> {
         // Source-tree tests and staging probes must never update an installation.
         let installed = paths
             .app
@@ -196,8 +388,14 @@ impl Service {
         if std::env::current_exe().ok()?.canonicalize().ok()? != installed {
             return None;
         }
-        let (paths, stop) = (paths.clone(), stop.clone());
+        state.lock().unwrap().updater = View::load(paths);
+        let (paths, state, stop) = (paths.clone(), state.clone(), stop.clone());
         let (tx, rx) = mpsc::channel();
+        let busy = Arc::new(AtomicBool::new(false));
+        let control = Control {
+            tx: tx.clone(),
+            busy: busy.clone(),
+        };
         let events = tx.clone();
         let handle = thread::spawn(move || {
             let mut etag = String::new();
@@ -214,9 +412,12 @@ impl Service {
                     Ok(Event::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     Ok(Event::Decision(release, true)) => {
                         prompt_open = false;
-                        status(&paths, "downloading", &release.version.label());
-                        if let Err(error) = install(&paths, &stop, &release, bar, quit_message) {
-                            status(&paths, "error", &format!("{error:#}"));
+                        busy.store(true, Ordering::Release);
+                        status(&paths, &state, "downloading", &release.version.label());
+                        if let Err(error) =
+                            install(&paths, &state, &stop, &release, bar, quit_message)
+                        {
+                            status(&paths, &state, "error", &format!("{error:#}"));
                             if !stop.load(Ordering::Relaxed) {
                                 let zh = locale::chinese();
                                 let message = if zh {
@@ -241,18 +442,24 @@ impl Service {
                                 });
                             }
                         }
+                        busy.store(false, Ordering::Release);
                     }
                     Ok(Event::Decision(_, false)) => {
                         prompt_open = false;
                         status(
                             &paths,
+                            &state,
                             "declined",
                             "The same version will not prompt again until restart",
                         );
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                    event @ (Ok(Event::Check) | Err(mpsc::RecvTimeoutError::Timeout)) => {
+                        let manual = matches!(event, Ok(Event::Check));
                         next = Instant::now() + INTERVAL;
-                        status(&paths, "checking", "");
+                        if !manual && busy.swap(true, Ordering::AcqRel) {
+                            continue;
+                        }
+                        status(&paths, &state, "checking", "");
                         let result = (|| -> Result<()> {
                             fetch(&mut etag, &mut cache, &stop)?;
                             let Some(release) = cache.as_ref() else {
@@ -263,8 +470,11 @@ impl Service {
                                 Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                             )?;
                             if let Some(release) = newer {
-                                status(&paths, "available", &release.version.label());
-                                if !prompt_open && offered.insert(release.version.label()) {
+                                status(&paths, &state, "available", &release.version.label());
+                                if !prompt_open
+                                    && (manual || !offered.contains(&release.version.label()))
+                                {
+                                    offered.insert(release.version.label());
                                     prompt_open = true;
                                     let tx = events.clone();
                                     let message = prompt_text(release.version, locale::chinese());
@@ -291,13 +501,14 @@ impl Service {
                                     });
                                 }
                             } else {
-                                status(&paths, "up_to_date", &release.tag_name);
+                                status(&paths, &state, "up_to_date", &release.tag_name);
                             }
                             Ok(())
                         })();
                         if let Err(error) = result {
-                            status(&paths, "check_failed", &format!("{error:#}"));
+                            status(&paths, &state, "check_failed", &format!("{error:#}"));
                         }
+                        busy.store(false, Ordering::Release);
                     }
                 }
             }
@@ -305,6 +516,7 @@ impl Service {
         Some(Self {
             tx,
             handle: Some(handle),
+            control,
         })
     }
 }
@@ -392,6 +604,7 @@ fn powershell(
 }
 fn install(
     paths: &Paths,
+    state: &State,
     stop: &AtomicBool,
     release: &Candidate,
     bar: isize,
@@ -484,7 +697,7 @@ fn install(
         }
         thread::sleep(Duration::from_millis(100));
     }
-    status(paths, "restarting", &release.version.label());
+    status(paths, state, "restarting", &release.version.label());
     let result = unsafe {
         let window = HWND(bar as *mut _);
         let mut pid = 0;
@@ -514,6 +727,54 @@ pub fn inspect(_paths: &Paths) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn check_history_survives_progress_declining_and_update_failures() {
+        let mut view = View::default();
+        assert_eq!(view.time_label(true), "尚未检查");
+        view.change("up_to_date", "v0.2.1", 1000.);
+        view.change("checking", "", 1010.);
+        assert_eq!(view.last_check_at, Some(1000.));
+        assert!(view.busy());
+        view.change("available", "0.2.3", 1020.);
+        view.change("declined", "postponed", 1030.);
+        assert_eq!(view.last_check_at, Some(1020.));
+        assert!(view.result_label(true).contains("已暂缓"));
+        view.change("downloading", "0.2.3", 1040.);
+        assert!(view.busy());
+        view.change("error", "download interrupted", 1050.);
+        assert_eq!(view.last_check_at, Some(1020.));
+        assert!(view.tooltip(false).contains("download interrupted"));
+        view.change("check_failed", "HTTP 403", 1060.);
+        assert_eq!(view.last_check_at, Some(1060.));
+        assert_eq!(view.last_result, "check_failed");
+        assert!(view.result_label(true).contains("失败"));
+        assert!(view.result_label(false).contains("failed"));
+        let restored: View = serde_json::from_value(serde_json::to_value(&view).unwrap()).unwrap();
+        assert_eq!(restored.last_detail, "HTTP 403");
+        assert!(!restored.busy());
+    }
+    #[test]
+    fn manual_requests_are_coalesced_and_allow_retry_after_completion() {
+        let (tx, rx) = mpsc::channel();
+        let control = Control {
+            tx,
+            busy: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(control.request());
+        assert!(control.busy());
+        for _ in 0..20 {
+            assert!(!control.request());
+        }
+        assert!(matches!(rx.try_recv().unwrap(), Event::Check));
+        assert!(rx.try_recv().is_err());
+        control.busy.store(false, Ordering::Release);
+        assert!(control.request());
+        assert!(matches!(rx.try_recv().unwrap(), Event::Check));
+        drop(rx);
+        control.busy.store(false, Ordering::Release);
+        assert!(!control.request());
+        assert!(!control.busy());
+    }
     #[test]
     #[ignore = "Read-only GitHub network/download probe; never installs or restarts"]
     fn published_assets_download_and_verify_without_installing() {

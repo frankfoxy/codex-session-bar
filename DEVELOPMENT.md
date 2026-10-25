@@ -44,6 +44,8 @@ Build output and release staging live under workspace `tmp`, not in Git.
 
 ## Automatic updates
 
+Settings can request an immediate check through the same worker channel. Requests are coalesced while a check or installation is in progress, and manual checks can reoffer a postponed version. The last completed check time/result persist across restarts and are published to shared UI state; rendering never polls the status file. Download/confirmation phases do not change the last check timestamp.
+
 `update.rs` checks this repository's latest stable GitHub release ten seconds after startup and every 30 minutes thereafter. A channel deadline keeps the worker asleep between checks; HTTPS uses native WinHTTP with ETags, bounded responses and timeouts, without an extra Git process or account credentials. Drafts, prereleases, equal versions and downgrades are ignored. A separate Chinese/English Yes/No prompt requires confirmation before downloading; declining suppresses the same version until restart. The UI and Git guard remain independent.
 
 Only an installed `bin/codex-session-bar.exe` starts the updater. Downloads, staging and backups stay under a verified workspace `tmp` child. The ZIP must match `SHA256SUMS.txt` and any GitHub asset digest. An embedded Windows PowerShell helper rejects unsafe ZIP paths, linked or duplicate files, unexpected files and oversized expansion, and checks the staged executable's version before the bar exits. It waits on the original process identity, backs up the allowlisted application files, verifies replacement and restarts. Partial failures restore originals; settings, tags and caches are outside the copy list. Diagnostics are in `update-status.json` and the update's temporary directory.

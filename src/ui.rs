@@ -189,6 +189,7 @@ enum Hit {
     Grip,
     Hide,
     Preferences,
+    CheckUpdate,
     Rows(i32),
     TitleWidth(i32),
     ShortcutEnabled,
@@ -569,7 +570,7 @@ impl Painter {
                 self.border(rect(x + 12., y + 9., 7., 7.), TEXT, 3.5);
                 self.line(x + 18., y + 15., x + 22., y + 19., TEXT, 1.5);
             }
-            Hit::Refresh | Hit::ResetPreferences | Hit::GuardRefresh => {
+            Hit::Refresh | Hit::CheckUpdate | Hit::ResetPreferences | Hit::GuardRefresh => {
                 // Two opposing arcs and aligned arrowheads form a clear refresh
                 // glyph; the old single arc resembled a power switch.
                 for start in [-165_f32, 15.] {
@@ -669,6 +670,7 @@ struct App {
     preferences_advanced: bool,
     preferences_guard: bool,
     guard_limits: guard::Limits,
+    update_control: Option<crate::update::Control>,
     guard_events: Vec<guard::LogEntry>,
     guard_log_error: String,
     rows: Vec<Row>,
@@ -780,6 +782,7 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::Grip => "Drag session bar",
         Hit::Hide => "Hide to tray · restore from the tray icon or recent-chats shortcut",
         Hit::Preferences => "Settings · list size, shortcut and extensions",
+        Hit::CheckUpdate => "Check GitHub for updates now · ask before downloading",
         Hit::Rows(n) => if *n < 0 { "Show fewer rows" } else { "Show more rows" },
         Hit::ShortcutEnabled => "Enable shortcut · only while Codex or Session Bar has focus",
         Hit::GuardSettings => "Protection limits and check interval",
@@ -932,6 +935,7 @@ impl App {
             preferences_advanced: false,
             preferences_guard: false,
             guard_limits: guard::Limits::default(),
+            update_control: None,
             guard_events: Vec::new(),
             guard_log_error: String::new(),
             popup_layout: None,
@@ -1117,6 +1121,25 @@ impl App {
             .as_ref()
             .filter(|s| s.id == self.identity(live))
     }
+    fn current_row<'a>(&self, live: &'a crate::Shared) -> Option<&'a Row> {
+        let rows=if live.recent.all_rows.is_empty(){&live.recent.rows}else{&live.recent.all_rows};
+        let id=self.identity(live);
+        if !id.is_empty() {return rows.iter().find(|row|row.id==id);}
+        if !live.auto_thread {return None;}
+        let title=data::visible_chat_title(&live.view_label)?;
+        let title=self.catalog.strip(&title).trim();
+        let mut matching=rows.iter().filter(|row|self.catalog.strip(&row.label).trim()==title);
+        let row=matching.next()?;
+        if matching.any(|other|other.id!=row.id){None}else{Some(row)}
+    }
+    fn bar_usage(&self, live: &crate::Shared)->(Option<u64>,Option<f64>,bool) {
+        let current=self.current(live);let row=self.current_row(live);
+        if current.is_some() || row.is_some() || !self.identity(live).is_empty()
+            || (live.auto_thread && data::visible_chat_title(&live.view_label).is_some()) {
+            (current.and_then(|s|s.tokens()).or_else(||row.and_then(|r|r.tokens)),
+                current.and_then(|s|s.rate()).or_else(||row.filter(|r|r.state=="Busy").and_then(|r|r.rate())),false)
+        } else {live.recent.totals()}
+    }
     unsafe fn bar_text(&self, live: &crate::Shared) -> (String, String, String, String, String) {
         let current = self.current(live);
         let visible = live
@@ -1150,13 +1173,7 @@ impl App {
                 )
             })
             .unwrap_or("Connecting…".into());
-        let (tokens, rate, partial) = if let Some(s) = current {
-            (s.tokens(), s.rate(), false)
-        } else if visible.is_some() || !self.identity(live).is_empty() {
-            (None, None, false)
-        } else {
-            live.recent.totals()
-        };
+        let (tokens, rate, partial) = self.bar_usage(live);
         let tok = format!(
             "{}{}",
             data::compact(tokens),
@@ -1792,7 +1809,20 @@ impl App {
                 }
                 p.ui_label("Settings", rect(16., 8., width - 120., 28.), 14., TEXT, false);
                 p.label(concat!("v", env!("CARGO_PKG_VERSION")), rect(width - 75., 8., 60., 28.), 11., MUTED, false);
-                p.ui_label("Recent chats", rect(20., 46., width - 40., 24.), 12., MUTED, false);
+                let update=&live.updater;
+                let pending=self.update_control.as_ref().is_some_and(|control|control.busy());
+                let enabled=!update.busy() && !pending && (self.testing||self.update_control.is_some());
+                let button=rect(20.,43.,150.,29.);
+                if enabled {area(Hit::CheckUpdate,button);}else{area(Hit::Info(update.tooltip(crate::locale::chinese())),button);}
+                p.fill(button,if enabled{0x293f37}else{0x293238},5.);
+                p.border(button,if enabled{0x48675b}else{0x3b484f},5.);
+                p.action_icon(&Hit::CheckUpdate,26.,46.);
+                p.ui_label(if update.phase=="checking" || (pending && !update.busy()) {"Checking…"}else{"Check for updates"},rect(53.,43.,112.,29.),11.,if enabled{TEXT}else{MUTED},false);
+                let zh=crate::locale::chinese();
+                p.label(&update.time_label(zh),rect(186.,39.,width-206.,18.),11.,MUTED,false);
+                p.label(&update.result_label(zh),rect(186.,57.,width-206.,19.),11.,
+                    if matches!(update.phase.as_str(),"check_failed"|"error"){ORANGE}else if update.last_result=="up_to_date"{GREEN}else{TEXT},false);
+                area(Hit::Info(update.tooltip(zh)),rect(181.,39.,width-201.,37.));
                 p.ui_label("Visible rows", rect(20., 78., 260., 30.), 13., TEXT, false);
                 p.fill(rect(width - 150., 78., 130., 30.), 0x1c2125, 6.);
                 for (delta, x) in [(-1, width - 146.), (1, width - 54.)] {
@@ -2993,9 +3023,8 @@ impl App {
                 "bytes_read":self.body_state.bytes_read,"skipped_oversized_messages":self.body_state.skipped,"error":self.body_state.error,
                 "cache_exists":self.paths.runtime.join("body-search.sqlite").exists(),"on_demand":false}));
         let live = self.snapshot();
-        let current = self.current(&live);
         let (_, title, status, _, _) = unsafe { self.bar_text(&live) };
-        self.paths.write(if self.testing{"rust-test-status.json"}else{"live-status.json"},&json!({"pid":std::process::id(),"runtime":"rust","ui_language":{"culture":crate::locale::status().0,"source":if crate::locale::status().1{"codex-uia"}else{"windows-default"}},"refresh":{"file_events":live.refresh_events.watching.load(Ordering::Relaxed),"settings":live.refresh_options},"updated_at":now(),"thread":self.identity(&live),"overview":self.identity(&live).is_empty() && data::visible_chat_title(&live.view_label).is_none(),"display_title":title,"display_status":status,"tokens":current.and_then(|s|s.tokens()),"auto_thread":live.auto_thread,"topmost":true,"user_hidden":self.hidden,"host_hidden":self.host_hidden,"host_window":live.host,"host_rect":self.last_host,"host_offset":self.settings.host_offset,"titlebar_slot":live.slot,"quota":live.quota,"quota_error":live.quota_error,"view_error":live.view_error,"snapshot_error":live.snapshot_error,"recent_cache":{"rows":live.recent.rows.len(),"busy_count":live.recent.busy_count,"stale":live.recent.stale,"error":live.recent.error},"active_view":{"thread":live.view,"label":live.view_label,"available":live.view.is_some() || data::visible_chat_title(&live.view_label).is_some(),"identity_pending":live.auto_thread && live.view.is_none() && data::visible_chat_title(&live.view_label).is_some(),"source":"uia-current-page"},"action_note":live.action_note,"codex_git_guard":live.guard,"font":{"chinese":self.painter.chinese,"latin":"Segoe UI","emoji":"Segoe UI Emoji","renderer":"DirectWrite / software Direct2D","antialias":"ClearType","per_monitor_dpi":true}}));
+        self.paths.write(if self.testing{"rust-test-status.json"}else{"live-status.json"},&json!({"pid":std::process::id(),"runtime":"rust","ui_language":{"culture":crate::locale::status().0,"source":if crate::locale::status().1{"codex-uia"}else{"windows-default"}},"refresh":{"file_events":live.refresh_events.watching.load(Ordering::Relaxed),"settings":live.refresh_options},"updated_at":now(),"thread":self.identity(&live),"overview":self.identity(&live).is_empty() && data::visible_chat_title(&live.view_label).is_none(),"display_title":title,"display_status":status,"tokens":self.bar_usage(&live).0,"auto_thread":live.auto_thread,"topmost":true,"user_hidden":self.hidden,"host_hidden":self.host_hidden,"host_window":live.host,"host_rect":self.last_host,"host_offset":self.settings.host_offset,"titlebar_slot":live.slot,"quota":live.quota,"quota_error":live.quota_error,"view_error":live.view_error,"snapshot_error":live.snapshot_error,"recent_cache":{"rows":live.recent.rows.len(),"busy_count":live.recent.busy_count,"stale":live.recent.stale,"error":live.recent.error},"active_view":{"thread":live.view,"label":live.view_label,"available":live.view.is_some() || data::visible_chat_title(&live.view_label).is_some(),"identity_pending":live.auto_thread && live.view.is_none() && data::visible_chat_title(&live.view_label).is_some(),"source":"uia-current-page"},"action_note":live.action_note,"codex_git_guard":live.guard,"font":{"chinese":self.painter.chinese,"latin":"Segoe UI","emoji":"Segoe UI Emoji","renderer":"DirectWrite / software Direct2D","antialias":"ClearType","per_monitor_dpi":true}}));
     }
     unsafe fn hit(&mut self, hit: Hit) -> Option<Action> {
         match hit {
@@ -3047,6 +3076,13 @@ impl App {
                 }
             }
             Hit::Preferences => { let _ = self.popup(Popup::Preferences); }
+            Hit::CheckUpdate => {
+                if self.testing {
+                    self.state.lock().unwrap().updater.phase="checking".into();
+                } else if let Some(control)=&self.update_control {
+                    let _=control.request();
+                }
+            }
             Hit::TitleWidth(delta)=>{
                 if let Some(draft)=self.preferences_draft.as_mut(){draft.recent_title_width=(draft.recent_title_width as i32+delta).clamp(140,280) as u32;self.preferences_note="Apply to save changes".into();}
             }
@@ -3913,11 +3949,12 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
             return Ok(());
         }
         register()?;
-        let app = App::new(paths.clone(), settings, state.clone(), stop.clone(), false)?;
+        let mut app = App::new(paths.clone(), settings, state.clone(), stop.clone(), false)?;
         let workers = Workers::start(&paths, &state, &stop, &app.catalog);
         let mut observers = host::start(&paths, &state, &stop);
         observers.push(guard::start(&paths, &state, &stop));
-        let updates = crate::update::Service::start(&paths, &stop, app.bar.0 as isize, QUIT_MESSAGE);
+        let updates = crate::update::Service::start(&paths, &state, &stop, app.bar.0 as isize, QUIT_MESSAGE);
+        app.update_control=updates.as_ref().map(|service|service.control());
         ACTIONS.with(|a| *a.borrow_mut() = Some(workers.actions.clone()));
         APP.with(|a| *a.borrow_mut() = Some(app));
         let focus_hook=SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,None,Some(foreground_changed),0,0,WINEVENT_OUTOFCONTEXT);
@@ -4352,6 +4389,23 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         )?;
         assert!(bar_hits.iter().any(|area| area.hit == Hit::NewResults(2)));
         assert_eq!(app.bar_text(&app.snapshot()).2, "● 3");
+        let original=app.snapshot();
+        for status in ["Done","Stopped"] {
+            let mut idle=original.clone();
+            idle.recent=Arc::new(data::Recent{rows:vec![Row{id:"fixture-0".into(),label:"🧪 xxx 会话名称 · 中文清晰显示".into(),state:status.into(),tokens:Some(241_700_000),..Default::default()}],..Default::default()});
+            idle.snapshot=None;
+            assert_eq!(app.bar_usage(&idle).0,Some(241_700_000));
+            assert_eq!(app.bar_text(&idle).3,data::compact(Some(241_700_000)));
+            idle.snapshot=original.snapshot.clone();
+            idle.snapshot.as_mut().unwrap().tokens_used=None;
+            assert_eq!(app.bar_usage(&idle).0,Some(241_700_000));
+            idle.view=Some("different-chat".into());
+            assert_eq!(app.bar_usage(&idle).0,None,"Never show another chat's token count");
+            idle.view=None;idle.view_label="xxx 会话名称 · 中文清晰显示".into();
+            assert_eq!(app.bar_usage(&idle).0,Some(241_700_000));
+            Arc::make_mut(&mut idle.recent).rows.push(Row{id:"duplicate-title".into(),label:"xxx 会话名称 · 中文清晰显示".into(),tokens:Some(1),..Default::default()});
+            assert_eq!(app.bar_usage(&idle).0,None,"Ambiguous visible titles cannot select a token total");
+        }
         assert!(bar_hits.iter().any(|area| matches!(&area.hit, Hit::Info(text) if text.contains("gpt-6.1-sol") && text.contains("Fast: On"))));
         assert!(bar_hits.iter().any(|area| matches!(&area.hit, Hit::Info(text) if text.contains("Quota reset:") && text.contains("Time remaining:"))));
         assert!(bar_hits.iter().any(|area| matches!(&area.hit, Hit::Info(text) if text.contains("Banked reset"))));
@@ -4740,6 +4794,19 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         let preferences_hits = capture(&app, Some(Popup::Preferences), 560, PREFERENCES_HEIGHT as u32,
             &paths.runtime.join("rust-preferences-verification.png"))?;
         assert!(preferences_hits.iter().any(|a| a.hit == Hit::Guard));
+        let update_button=preferences_hits.iter().find(|a|a.hit==Hit::CheckUpdate).expect("Manual update check must be visible in settings");
+        assert!(update_button.contains(95.,57.));
+        let previous_update=state.lock().unwrap().updater.clone();
+        state.lock().unwrap().updater=crate::update::View{last_check_at:Some(now()),last_result:"up_to_date".into(),last_detail:"v0.2.1".into(),..Default::default()};
+        app.hit(Hit::CheckUpdate);
+        assert_eq!(state.lock().unwrap().updater.phase,"checking");
+        let checking_hits=capture(&app,Some(Popup::Preferences),560,PREFERENCES_HEIGHT as u32,&paths.runtime.join("rust-update-checking-verification.png"))?;
+        assert!(!checking_hits.iter().any(|a|a.hit==Hit::CheckUpdate));
+        state.lock().unwrap().updater.phase="up_to_date".into();
+        let completed_hits=capture(&app,Some(Popup::Preferences),560,PREFERENCES_HEIGHT as u32,&paths.runtime.join("rust-update-result-verification.png"))?;
+        assert!(completed_hits.iter().any(|a|a.hit==Hit::CheckUpdate));
+        assert!(completed_hits.iter().any(|a|matches!(&a.hit,Hit::Info(text) if text.contains("v0.2.1"))));
+        state.lock().unwrap().updater=previous_update;
         assert!(preferences_hits.iter().any(|a| a.hit == Hit::ApplyPreferences));
         assert!(preferences_hits.iter().any(|a| a.hit == Hit::GuardLogs && a.contains(451., 405.)));
         assert!(!preferences_hits.iter().any(|a| a.hit == Hit::Guard && a.contains(451., 405.)));

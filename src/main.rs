@@ -206,6 +206,7 @@ pub struct Shared {
     pub refresh_events: Arc<refresh::Events>,
     pub refresh_options: refresh::Settings,
     pub guard: guard::View,
+    pub updater: update::View,
     pub host: isize,
     pub view: Option<String>,
     pub view_label: String,

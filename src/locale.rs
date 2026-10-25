@@ -18,6 +18,8 @@ pub fn translate(text:&str,zh:bool)->Cow<'_,str>{
     if text.contains(" · ended "){return Cow::Owned(text.replace(" · ended "," · 已结束 "));}
     let translated=match text {
         "Settings"=>"设置","Refresh settings"=>"刷新设置","Recent chats"=>"最近会话","Session details"=>"会话详情",
+        "Check for updates"=>"检查更新","Checking…"=>"正在检查…",
+        "Check GitHub for updates now · ask before downloading"=>"立即检查 GitHub 更新 · 下载前会询问确认",
         "Protection log"=>"防护日志","Session icon"=>"会话图标","Choose a fixed chat"=>"选择固定监看的会话",
         "Protection limits"=>"防护阈值","Process limit"=>"进程数量上限","Total private memory"=>"合计私有内存上限","Normal check interval"=>"正常检查间隔",
         "Protect Codex Git · configurable checks · 1s after trigger"=>"Codex Git 防护 · 检查间隔可配置 · 触发后每秒检查",
