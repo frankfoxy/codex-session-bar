@@ -113,6 +113,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",
+ "flate2",
  "image",
  "notify",
  "pinyin",

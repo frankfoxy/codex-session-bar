@@ -1,20 +1,19 @@
-//! Session Bar controls; enforcement belongs to the independent Memory Watch.
+//! Integrated Codex Git protection, settings and status. No companion process.
+mod worker;
+mod collect;
+mod attribution;
+mod archive;
+mod notice;
 use crate::{now, read_json, Paths, State, Stop};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     fs,
     io::{Read, Seek, SeekFrom},
-    os::windows::process::CommandExt,
     path::PathBuf,
-    process::Command,
     sync::atomic::Ordering,
     thread,
     time::{Duration, Instant},
-};
-use windows::{
-    core::w,
-    Win32::{System::Threading::CREATE_NO_WINDOW, UI::WindowsAndMessaging::*},
 };
 const CONFIG: &str = "codex-git-guard-settings.json";
 const STATUS: &str = "codex-git-guard-status.json";
@@ -45,7 +44,7 @@ impl Default for View {
             max_processes: 16,
             max_private_mib: 1024,
             interval_seconds: 5,
-            note: "Connecting to Memory Watch…".into(),
+            note: "Starting Git protection…".into(),
             storm_count: None,
             storm_active: false,
             tracking_since: String::new(),
@@ -53,6 +52,7 @@ impl Default for View {
     }
 }
 fn dir(paths: &Paths) -> PathBuf {
+    // Keep the legacy directory so upgrades preserve limits, counters and logs.
     paths.runtime.parent().unwrap().join("memory-watch-rust")
 }
 pub fn log_dir(paths: &Paths) -> PathBuf { dir(paths) }
@@ -141,43 +141,14 @@ pub fn set(paths: &Paths, enabled: bool) -> anyhow::Result<()> {
     fs::rename(pending, dir.join(CONFIG))?;
     Ok(())
 }
-fn backend(paths: &Paths) -> Option<(PathBuf, PathBuf)> {
-    let bundled = paths.app.join("bin/memory-watch.exe");
-    if bundled.is_file() {
-        return Some((bundled, paths.app.join("memory-watch")));
-    }
-    if paths
-        .app
-        .parent()
-        .and_then(|p| p.file_name())
-        .is_some_and(|n| n == "tools")
-    {
-        let app = paths.app.parent()?.join("memory-watch-rs");
-        let exe = app.join("bin/memory-watch.exe");
-        if exe.is_file() {
-            return Some((exe, app));
-        }
-    }
-    None
-}
 fn snapshot(paths: &Paths) -> View {
     let dir = dir(paths);
     let cfg = read_json(&dir.join(CONFIG), 4096);
     let status = read_json(&dir.join(STATUS), 16384);
     let enabled = cfg["enabled"].as_bool().unwrap_or(true);
-    let mut pid = 0;
-    let native = unsafe {
-        FindWindowW(w!("RustMemoryWatch"), None)
-            .ok()
-            .map(|window| {
-                GetWindowThreadProcessId(window, Some(&mut pid));
-            })
-            .is_some()
-    };
     let freshness=status["interval_seconds"].as_u64().unwrap_or(5).clamp(1,60)*2+5;
     let fresh = status["version"] == 1
-        && native
-        && status["pid"].as_u64() == Some(pid as u64)
+        && status["pid"].as_u64() == Some(std::process::id() as u64)
         && status["updated_at"]
             .as_f64()
             .is_some_and(|at| (0.0..=freshness as f64).contains(&(now() - at)));
@@ -197,14 +168,12 @@ fn snapshot(paths: &Paths) -> View {
     } else if fresh && !healthy {
         format!(
             "Guard error: {}",
-            status["error"].as_str().unwrap_or("check Memory Watch")
+            status["error"].as_str().unwrap_or("check Git protection logs")
         )
-    } else if native && !fresh {
-        "Memory Watch guard is unavailable or outdated".into()
     } else if fresh {
         "Applying change…".into()
     } else {
-        "Protection unavailable · start Memory Watch".into()
+        "Git protection is starting or unavailable".into()
     };
     View {
         enabled,
@@ -224,49 +193,77 @@ fn snapshot(paths: &Paths) -> View {
 pub fn start(paths: &Paths, state: &State, stop: &Stop) -> thread::JoinHandle<()> {
     let (paths, state, stop) = (paths.clone(), state.clone(), stop.clone());
     thread::spawn(move || {
-        let mut retry: Option<Instant> = None;
+        let folder = dir(&paths);
+        let (tx, rx) = std::sync::mpsc::sync_channel(32);
+        let _enforcement = worker::Runner::start(folder.clone(), tx);
+        let mut refreshed: Option<Instant> = None;
         while !stop.load(Ordering::Relaxed) {
-            let mut view = snapshot(&paths);
-            let running = unsafe { FindWindowW(w!("RustMemoryWatch"), None).is_ok() };
-            if view.enabled && !running && retry.is_none_or(|at| at.elapsed() > Duration::from_secs(60)) {
-                retry = Some(Instant::now());
-                if let Some((exe, home)) = backend(&paths) {
-                    let result = fs::create_dir_all(&home).and_then(|_| {
-                        Command::new(exe)
-                            .arg("--background")
-                            .current_dir(&home)
-                            .env("MEMORY_WATCH_APP_DIR", &home)
-                            .env(
-                                "CODEX_SESSION_BAR_WORKSPACE",
-                                paths.runtime.parent().unwrap().parent().unwrap(),
-                            )
-                            .env("TEMP", &paths.runtime)
-                            .env("TMP", &paths.runtime)
-                            .env("TMPDIR", &paths.runtime)
-                            .creation_flags(CREATE_NO_WINDOW.0)
-                            .spawn()
-                    });
-                    if let Err(error) = result {
-                        view.note = format!("Cannot start Memory Watch: {error}");
-                    } else {
-                        view.note = "Starting Memory Watch…".into();
-                    }
-                }
+            if refreshed.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
+                state.lock().unwrap().guard = snapshot(&paths);
+                refreshed = Some(Instant::now());
             }
-            state.lock().unwrap().guard = view;
-            for _ in 0..10 {
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                thread::sleep(Duration::from_millis(100));
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(worker::Event::Alert(message)) => notice::show(&folder, &message),
+                Ok(worker::Event::Update(message)) => notice::update(&folder, &message),
+                Ok(worker::Event::Status(note)) => { if !note.is_empty() { refreshed = None; } },
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {},
             }
         }
     })
 }
 
 #[cfg(test)]
+fn test_workspace() -> PathBuf {
+    let root = std::env::var_os("CODEX_SESSION_BAR_WORKSPACE").map(PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors().find(|p| p.file_name().is_some_and(|n| n == "tools"))
+            .and_then(|p| p.parent()).unwrap_or(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))).to_path_buf());
+    root.canonicalize().unwrap()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn integrated_worker_preserves_preferences_and_rejects_companion_status() {
+        let temp = test_workspace().join("tmp").canonicalize().unwrap();
+        let folder = temp.join(format!("guard-integrated-test-{}", std::process::id()));
+        let paths = Paths { app: folder.clone(), home: folder.clone(), runtime: folder.join("runtime"), instance: "test".into() };
+        fs::create_dir_all(dir(&paths)).unwrap();
+        let config = json!({"enabled":false,"max_processes":31,"max_private_mib":1024,"interval_seconds":1});
+        fs::write(dir(&paths).join(CONFIG), config.to_string()).unwrap();
+        fs::write(dir(&paths).join("codex-git-guard-counters.json"), json!({
+            "version":1,"tracked_since":"2026-10-20T00:00:00Z","storms":20,"active":false,
+            "terminated":51013,"terminated_at_start":50855
+        }).to_string()).unwrap();
+        fs::write(dir(&paths).join(STATUS), json!({"version":1,"pid":0,"updated_at":now(),"healthy":true,"enabled":false}).to_string()).unwrap();
+        assert!(!snapshot(&paths).available, "Old standalone heartbeat cannot report integrated protection as healthy");
+        let state = std::sync::Arc::new(std::sync::Mutex::new(crate::Shared::default()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = start(&paths, &state, &stop);
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !state.lock().unwrap().guard.available && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let view = state.lock().unwrap().guard.clone();
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        assert!(view.available, "{}", view.note);
+        assert!(!view.enabled);
+        assert_eq!(view.max_processes, 31);
+        assert_eq!(view.storm_count, Some(20));
+        assert_eq!(view.terminated, 51013);
+        assert_eq!(read_json(&dir(&paths).join(CONFIG),4096), config);
+        assert!(!dir(&paths).join("samples.jsonl").exists());
+        assert!(!dir(&paths).join("latest.json").exists());
+        let status=read_json(&dir(&paths).join(STATUS),16384);
+        assert_eq!(status["pid"], std::process::id());
+        let updated = status["updated_at"].clone();
+        thread::sleep(Duration::from_millis(1100));
+        assert_eq!(read_json(&dir(&paths).join(STATUS),16384)["updated_at"], updated, "Worker stops with Session Bar");
+        fs::remove_dir_all(folder).unwrap();
+    }
     #[test]
     fn log_tail_discards_partial_records_and_distinguishes_counts() {
         let data = b"truncated\n{\"type\":\"storm_started\",\"episode\":2,\"count\":100}\n{\"type\":\"termination_result\",\"pid\":123,\"result\":\"terminated\"}\n{\"type\":\"termination_result\",\"pid\":124,\"result\":\"skipped: identity changed\"}\n{\"type\":\"storm_recovered\"}\n{\"type\":";

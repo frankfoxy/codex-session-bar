@@ -1,4 +1,6 @@
-# Memory Watch · 内存排查
+# Memory Watch · 已停用的历史源码
+
+此独立程序已停用，不再构建、启动或打包。Git 内存防护现已内置于 Session Bar 的 `src/guard/`，只使用 Session Bar 的一个托盘图标。以下保留原实现说明供历史参考。
 
 Windows 原生 Rust 托盘程序，默认每 30 秒采样一次，可选择 15、30、60、120、300 秒。
 

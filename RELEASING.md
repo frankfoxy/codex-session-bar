@@ -6,7 +6,7 @@ Git 标签标记源码版本；GitHub Release 提供该版本的说明和可下�
 
 在仓库根目录执行。需要 Rust MSVC 工具链和 Visual Studio C++ Build Tools。
 
-1. 发布新版本时，同步主程序与 `companion/memory-watch` 的 `Cargo.toml`、`Cargo.lock` 中的包版本；填写 `CHANGELOG.md`。
+1. 发布新版本时，更新主程序 `Cargo.toml`、`Cargo.lock` 中的包版本；填写 `CHANGELOG.md`。只构建和分发 `codex-session-bar.exe`。
 2. 运行下列命令。脚本先测试、构建，再生成 Windows x64 ZIP、`SHA256SUMS.txt` 和解压后的可运行目录，最终输出位于仓库的 `releases/v<版本号>/`，不放在 `tmp`。只有构建缓存和临时打包过程使用工作区 `tmp`，成功后删除打包暂存目录。构建不会覆盖正在运行的安装；同版本已有不同 ZIP 时停止，不覆盖旧文件。
 
 ```powershell

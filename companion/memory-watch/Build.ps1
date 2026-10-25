@@ -1,4 +1,5 @@
 param([switch]$NoInstall)
+throw 'Standalone Memory Watch is retired. Build the integrated Codex Session Bar from the repository root instead.'
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../..')).Path
 $workspace = if ($env:CODEX_SESSION_BAR_WORKSPACE) {

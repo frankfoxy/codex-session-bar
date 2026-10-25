@@ -1,4 +1,4 @@
-param([switch]$SkipBuild, [string]$GuardExecutable)
+param([switch]$SkipBuild)
 $ErrorActionPreference = 'Stop'
 $workspace = if ($env:CODEX_SESSION_BAR_WORKSPACE) {
     (Resolve-Path -LiteralPath $env:CODEX_SESSION_BAR_WORKSPACE).Path
@@ -29,14 +29,6 @@ $baseName = 'codex-session-bar-' + $version + '-windows-x64'
 $package = Join-Path $releaseRoot $baseName
 [IO.Directory]::CreateDirectory((Join-Path $package 'bin')) | Out-Null
 Copy-Item -LiteralPath $executable -Destination (Join-Path $package 'bin/codex-session-bar.exe')
-$guardArtifact=if($GuardExecutable){(Resolve-Path -LiteralPath $GuardExecutable).Path}else{Join-Path $tmpRoot 'memory-watch-rust-build/target/release/memory-watch.exe'}
-if (-not (Test-Path -LiteralPath $guardArtifact)) {throw 'Build the Memory Watch companion first'}
-$guardVersionOutput=Join-Path $releaseRoot 'guard-version.txt'
-$guardCheck=Start-Process -FilePath $guardArtifact -ArgumentList '--version' -WindowStyle Hidden -PassThru -Wait -RedirectStandardOutput $guardVersionOutput -RedirectStandardError (Join-Path $releaseRoot 'guard-version.err.txt')
-if($guardCheck.ExitCode -ne 0 -or ([IO.File]::ReadAllText($guardVersionOutput)).Trim() -ne ('Memory Watch '+$version)){throw 'Memory Watch version does not match the release'}
-Copy-Item -LiteralPath $guardArtifact -Destination (Join-Path $package 'bin/memory-watch.exe')
-[IO.Directory]::CreateDirectory((Join-Path $package 'companion/memory-watch')) | Out-Null
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'companion/memory-watch/README.md') -Destination (Join-Path $package 'companion/memory-watch/README.md')
 # An explicit allowlist prevents settings, authentication, logs and caches entering a release.
 foreach ($file in @('emoji_catalog.json', 'Launch.cmd', 'Enable-Autostart.ps1', 'SKILL.md', 'README.md', 'CHANGELOG.md', 'DEVELOPMENT.md', 'CONTRIBUTING.md', 'RELEASING.md', 'UNICODE-LICENSE.txt')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination (Join-Path $package $file)

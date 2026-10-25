@@ -31,7 +31,8 @@ navigates chats, renames them, submits prompts or resumes work.
 ## Repository layout and releases
 
 - `src/`: native Rust application.
-- `companion/memory-watch/`: independent native monitor and Git enforcement backend.
+- `src/guard/`: integrated Git enforcement, process attribution, warnings and compressed event logs.
+- `companion/memory-watch/`: retired source reference; its build entry point is disabled and it is excluded from packages.
 - `assets/images/`: sanitized README screenshots and docking illustration.
 - `emoji_catalog.json`: runtime emoji catalog.
 - `Build.ps1`: build/test; `-NoInstall` keeps the installed executable untouched.
@@ -43,11 +44,13 @@ Build output and release staging live under workspace `tmp`, not in Git.
 
 ## Codex Git guard
 
-The Session Bar `guard.rs` only reads fresh, PID-matched Memory Watch state and writes its enable preference, preserving advanced limits. It can start a bundled companion hidden. The native monitor owns enumeration, user/session and ancestry checks, command classification, logging, termination and warning windows. Shared files live under workspace `tmp/memory-watch-rust`; heartbeat expiry is 15 seconds. A missing backend is shown as unavailable.
+Git protection runs inside the Session Bar process. `guard.rs` owns settings and the status view; `guard/worker.rs` runs enforcement on a dedicated worker. Warnings use a separate thread, so an unanswered dialog or a full notification queue cannot pause enforcement. There is no standalone Memory Watch executable, monitor window, second tray icon, whole-system sampler or periodic sample log. The lightweight collector retains only process identities, ancestry and private bytes needed for Git checks; it performs no CPU history, grouping or memory-history recording.
 
-Enforcement runs every five seconds even when ordinary 30-second recording is paused. Two snapshots confirm a breach; only verified read-query Git handles are terminated, after a durable intent record. Creation-time validation prevents PID reuse errors. An executable name alone is insufficient; installed Codex path, account and Windows session are verified. Write/unknown commands are never killed. Shutdown/cancellation does not stop unrelated applications.
+Existing configuration, episode counters and event logs remain in workspace `tmp/memory-watch-rust` for upgrade compatibility. Status must match the current Session Bar PID and have a fresh heartbeat; old companion status is rejected. Default limits remain 16 processes / 1024 MiB / five seconds, while saved user limits are preserved. Event logs retain compressed rotation. Protection remains active when the bar is hidden; exiting Session Bar stops its protection worker.
 
-The default companion tests are read-only or synthetic. Its ignored controlled native test requires a deliberately built sleeping `git.exe` fixture under workspace `tmp`, supplied as `CODEX_GUARD_FIXTURE_EXE`; test-only PID/birth scoping confines termination to children the test owns. It checks disabling, real termination and log records, while leaving its `commit` fixture alive. No production scope override is compiled into release builds.
+Enforcement normally runs every five seconds, switches to one second after a breach or failure, and returns to the configured interval after 60 stable seconds. Two snapshots confirm a breach; only verified read-query Git handles are terminated, with an intent record before termination. Creation-time validation prevents PID reuse errors. An executable name alone is insufficient; installed Codex path, account and Windows session are verified. Write/unknown commands are never killed. Shutdown/cancellation does not stop unrelated applications.
+
+The default guard tests are read-only or synthetic. The ignored controlled native test requires a deliberately built sleeping `git.exe` fixture under workspace `tmp`, supplied as `CODEX_GUARD_FIXTURE_EXE`; test-only PID/birth scoping confines termination to children the test owns. It checks disabling, real termination and log records, while leaving its `commit` fixture alive. No production scope override is compiled into release builds.
 
 ## Data and desktop integration
 
@@ -93,8 +96,8 @@ The bar follows the Codex window without activation. Only the center grip
 starts dragging. Saved offsets are host-relative and cannot cover header menu
 controls. If the blank header is too narrow, docking falls below the menu.
 Closing hides to tray and sets an explicit hidden flag; host movement cannot
-restore a user-hidden bar. Quit terminates the companion and its own adapter
-children. It never stops Codex or another task.
+restore a user-hidden bar. Quit stops its integrated guard worker and its own
+adapter children. It never stops Codex or another task.
 
 Preferences remain in ignored `settings.json`. Runtime files stay in the
 workspace's direct `tmp/codex-session-bar` directory. Set

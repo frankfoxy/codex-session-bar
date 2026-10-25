@@ -1743,7 +1743,7 @@ impl App {
                 let since = chrono::DateTime::parse_from_rfc3339(&live.guard.tracking_since).ok()
                     .map(|t| t.format("%m-%d %H:%M").to_string());
                 p.ui_label(&since.map(|s|format!("Episode tracking since {s} · earlier alarms are not counted"))
-                    .unwrap_or_else(|| "Episode counter unavailable · update Memory Watch".into()),
+                    .unwrap_or_else(|| "Episode counter is not available yet".into()),
                     rect(18., 72., width - 36., 22.), 11., MUTED, false);
                 for (slot, entry) in self.guard_events.iter().skip(self.scroll).take(8).enumerate() {
                     let y = 104. + slot as f32 * 42.;

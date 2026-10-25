@@ -33,9 +33,6 @@ if ($Check) {
 & (Join-Path $toolchain 'cargo.exe') build --release --locked --jobs 2 --manifest-path $manifest
 if ($LASTEXITCODE -ne 0) { throw 'Rust build failed' }
 $artifact = Join-Path $env:CARGO_TARGET_DIR 'release/codex-session-bar.exe'
-$env:CODEX_SESSION_BAR_WORKSPACE=$workspace
-& (Join-Path $PSScriptRoot 'companion/memory-watch/Build.ps1') -NoInstall
-$guardArtifact=Join-Path $tmpRoot 'memory-watch-rust-build/target/release/memory-watch.exe'
 if ($NoInstall) {
     Write-Output ('Built ' + $artifact)
     return
@@ -43,5 +40,4 @@ if ($NoInstall) {
 $destination = Join-Path $PSScriptRoot 'bin'
 [IO.Directory]::CreateDirectory($destination) | Out-Null
 Copy-Item -LiteralPath $artifact -Destination (Join-Path $destination 'codex-session-bar.exe') -Force
-Copy-Item -LiteralPath $guardArtifact -Destination (Join-Path $destination 'memory-watch.exe') -Force
 Write-Output ('Built ' + (Join-Path $destination 'codex-session-bar.exe'))
