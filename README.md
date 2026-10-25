@@ -4,7 +4,7 @@
 
 一个 Rust 原生 Windows 会话悬浮条，支持标签筛选、快速切换与实时状态查看，默认停靠在 Codex 标题栏中央。
 
-**稳定版：[v0.2.1](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.2.1)** · 无需 Python 或 Qt
+**稳定版：[v0.2.1](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.2.1)** · **开发中：0.2.2（未发布）** · 无需 Python 或 Qt
 
 ## 用 Tag 管理会话
 
