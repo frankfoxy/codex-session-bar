@@ -46,6 +46,40 @@ pub fn get(
     limit: u64,
     stop: &AtomicBool,
 ) -> Result<Response> {
+    request(
+        url,
+        etag,
+        output,
+        limit,
+        stop,
+        &["api.github.com", "github.com"],
+    )
+}
+/// Public announcement reads have a separate host allowlist from update assets.
+pub fn get_notice(
+    url: &str,
+    etag: &str,
+    output: &mut impl Write,
+    limit: u64,
+    stop: &AtomicBool,
+) -> Result<Response> {
+    request(
+        url,
+        etag,
+        output,
+        limit,
+        stop,
+        &["divin.cc", "codex-resets.com"],
+    )
+}
+fn request(
+    url: &str,
+    etag: &str,
+    output: &mut impl Write,
+    limit: u64,
+    stop: &AtomicBool,
+    hosts: &[&str],
+) -> Result<Response> {
     ensure!(!stop.load(Ordering::Relaxed), "Update cancelled");
     ensure!(
         url.len() < 4096 && !url.contains(['\r', '\n']),
@@ -69,10 +103,7 @@ pub fn get(
             parts.lpszHostName.0,
             parts.dwHostNameLength as usize,
         ));
-        ensure!(
-            matches!(host.as_str(), "api.github.com" | "github.com"),
-            "Unexpected update host"
-        );
+        ensure!(hosts.contains(&host.as_str()), "Unexpected HTTPS host");
         let mut path = String::from_utf16_lossy(std::slice::from_raw_parts(
             parts.lpszUrlPath.0,
             parts.dwUrlPathLength as usize,
@@ -122,7 +153,7 @@ pub fn get(
         let headers: Vec<u16> = headers.encode_utf16().collect();
         let began = Instant::now();
         WinHttpSendRequest(request.0, Some(&headers), None, 0, 0, 0)
-            .context("Cannot contact GitHub")?;
+            .context("Cannot contact HTTPS endpoint")?;
         WinHttpReceiveResponse(request.0, ptr::null_mut())?;
         let mut status = 0u32;
         let mut length = 4;
@@ -159,17 +190,14 @@ pub fn get(
                 bytes: 0,
             });
         }
-        ensure!(
-            status == 200,
-            "GitHub returned HTTP {status}; the next check is in 30 minutes"
-        );
+        ensure!(status == 200, "HTTPS endpoint returned HTTP {status}");
         let mut buffer = [0u8; 65536];
         let mut total = 0u64;
         loop {
             ensure!(!stop.load(Ordering::Relaxed), "Update cancelled");
             ensure!(
                 began.elapsed() < Duration::from_secs(120),
-                "GitHub download timed out"
+                "HTTPS request timed out"
             );
             let mut count = 0;
             WinHttpReadData(

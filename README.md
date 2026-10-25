@@ -4,7 +4,7 @@
 
 一个 Rust 原生 Windows 会话悬浮条，支持标签筛选、快速切换与实时状态查看，默认停靠在 Codex 标题栏中央。
 
-**稳定版：[v0.2.2](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.2.2)** · **开发中：0.3.0（未发布）** · 无需 Python 或 Qt
+**稳定版：[v0.3.0](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.3.0)** · 无需 Python 或 Qt
 
 ## 用 Tag 管理会话
 
@@ -38,14 +38,15 @@
 - **快捷操作**：默认 `Ctrl + Alt + J` 打开会话列表，仅在 Codex 或会话条获得焦点时生效；右键可复制会话链接、Markdown 或工作目录。
 - **可配置**：齿轮中调整列表、快捷键与刷新策略；界面和提示跟随 Codex 的中文或英文设置。
 - **自动更新**：每半小时检查 GitHub 正式版，确认后更新并重启，保留现有设置；设置中可手动检查并查看上次检查时间和结果。
+- **重置公告提醒**：在设置下拉框选择 [AI 哨兵](https://divin.cc/) 或 [Codex Resets](https://codex-resets.com/)，用独立开关启停；铃铛显示公开预告的时间与倒计时，悬停查看原文、译文和近期记录，点击返回来源网站。没有明确时间或预告已过期时只保留灰色铃铛。Banked Reset 用银行图标表示已有重置券的到期时间。
 
 ![详细模式下的会话名称、最近提问、统计和标签](assets/images/preview-chats.png)
 
-![悬浮条中的会话状态、Token、速度与账户额度](assets/images/preview-bar.png)
+![悬浮条中的会话状态、额度、重置券到期与重置预告](assets/images/preview-bar.png)
 
 ## 快速开始
 
-1. 到 [v0.2.2 发布页](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.2.2) 下载 **codex-session-bar-0.2.2-windows-x64.zip**，解压到固定目录。
+1. 到 [v0.3.0 发布页](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.3.0) 下载 **codex-session-bar-0.3.0-windows-x64.zip**，解压到固定目录。
 2. 打开并登录 Codex Desktop，双击 **Launch.cmd**。
 3. 点击悬浮条的会话名称打开列表，点击标签按钮筛选，点击会话图标设置图标。
 

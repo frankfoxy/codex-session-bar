@@ -1,5 +1,5 @@
 //! GitHub stable releases, explicit consent and a separate transactional installer.
-mod http;
+pub(crate) mod http;
 use crate::{locale, now, read_json, Paths, State, Stop};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};

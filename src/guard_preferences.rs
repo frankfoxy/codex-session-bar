@@ -32,7 +32,7 @@ unsafe fn verify_guard_preferences(app:&mut App,paths:&Paths)->Result<()> {
     let folder=fixture.join("memory-watch-rust");std::fs::create_dir_all(&folder)?;
     std::fs::write(folder.join("codex-git-guard-settings.json"),serde_json::to_vec(&config)?)?;
     app.popup(Popup::Preferences)?;
-    let controls=capture(app,Some(Popup::Preferences),560,464,&paths.runtime.join("rust-guard-button-hit-verification.png"))?;
+    let controls=capture(app,Some(Popup::Preferences),560,PREFERENCES_HEIGHT as u32,&paths.runtime.join("rust-guard-button-hit-verification.png"))?;
     let actual=controls.iter().find(|a|a.contains(373.,407.)).map(|a|a.hit.clone());
     assert_eq!(actual,Some(Hit::GuardSettings),"Settings button must not toggle protection");
     assert_eq!(controls.iter().find(|a|a.contains(418.,407.)).map(|a|a.hit.clone()),Some(Hit::GuardLogs));
@@ -42,7 +42,7 @@ unsafe fn verify_guard_preferences(app:&mut App,paths:&Paths)->Result<()> {
     app.hit(Hit::GuardLimit(0,-1));app.hit(Hit::ApplyPreferences);
     config=crate::read_json(&folder.join("codex-git-guard-settings.json"),4096);
     assert_eq!(config["enabled"],false);assert_eq!(config["max_processes"],16);assert_eq!(config["max_private_mib"],1024);assert_eq!(config["interval_seconds"],5);
-    capture(app,Some(Popup::Preferences),560,464,&paths.runtime.join("rust-guard-settings-verification.png"))?;
+    capture(app,Some(Popup::Preferences),560,PREFERENCES_HEIGHT as u32,&paths.runtime.join("rust-guard-settings-verification.png"))?;
     app.hit(Hit::RefreshBack);assert!(!app.preferences_guard);
     app.close_popup();app.paths=original;
     paths.write("rust-guard-settings-test.json",&json!({"configurable_limits":true,"defaults":"16 / 1024 MiB / 5s","apply_preserves_enabled_state":true,"effective_interval_display":true}));

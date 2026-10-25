@@ -50,7 +50,7 @@ const MODEL: u32 = 0xffdc91;
 const GREEN: u32 = 0x65d69b;
 const NEW_RESULT: u32 = 0x70b7ff;
 const DETAILS_HEIGHT: i32 = 310;
-const PREFERENCES_HEIGHT: i32 = 464;
+const PREFERENCES_HEIGHT: i32 = 540;
 const RECENT_ROW: i32 = 48;
 const LAYOUT_CACHE_LIMIT: usize = 256;
 const RECENT_TOP: i32 = 48;
@@ -190,6 +190,9 @@ enum Hit {
     Hide,
     Preferences,
     CheckUpdate,
+    ResetNotice(String),
+    ResetNoticeEnabled,
+    ResetNoticeInterval(i32),
     Rows(i32),
     TitleWidth(i32),
     ShortcutEnabled,
@@ -524,6 +527,19 @@ impl Painter {
         );
         self.circle(x + if on { 20. } else { 8. }, y + 8., 6., 0xffffff);
     }
+    unsafe fn banked_icon(&self,x:f32,y:f32,rgb:u32) {
+        self.line(x+1.,y+4.,x+8.,y,rgb,1.1);self.line(x+8.,y,x+15.,y+4.,rgb,1.1);
+        self.line(x+1.,y+5.,x+15.,y+5.,rgb,1.1);
+        for column in [4.,8.,12.] {self.line(x+column,y+7.,x+column,y+12.,rgb,1.1);}
+        self.line(x+2.,y+14.,x+14.,y+14.,rgb,1.1);self.line(x,y+16.,x+16.,y+16.,rgb,1.1);
+    }
+    unsafe fn notice_bell(&self,x:f32,y:f32,active:bool) {
+        let color=if active {ORANGE}else{MUTED};
+        let points=[(3.,16.),(5.,13.),(5.,8.),(6.,5.),(8.,3.),(11.,2.),(14.,3.),(16.,5.),(17.,8.),(17.,13.),(19.,16.),(3.,16.)];
+        for pair in points.windows(2){self.line(x+pair[0].0,y+pair[0].1,x+pair[1].0,y+pair[1].1,color,1.25);}
+        self.line(x+11.,y,x+11.,y+2.,color,1.25);
+        self.line(x+9.,y+19.,x+10.,y+20.,color,1.25);self.line(x+10.,y+20.,x+12.,y+20.,color,1.25);self.line(x+12.,y+20.,x+13.,y+19.,color,1.25);
+    }
     unsafe fn action_icon(&self, hit: &Hit, x: f32, y: f32) {
         let c = if *hit == Hit::Refresh {
             0xaed8cc
@@ -531,6 +547,9 @@ impl Painter {
             MUTED
         };
         match hit {
+            Hit::ResetNotice(_) => {
+                self.notice_bell(x,y,true);
+            }
             Hit::GuardLogs => {
                 self.border(rect(x + 4., y + 2., 15., 19.), c, 2.);
                 for dy in [7., 11., 15.] { self.line(x + 8., y + dy, x + 15., y + dy, c, 1.3); }
@@ -671,6 +690,7 @@ struct App {
     preferences_guard: bool,
     guard_limits: guard::Limits,
     update_control: Option<crate::update::Control>,
+    notice_control: Option<crate::reset_notice::Control>,
     guard_events: Vec<guard::LogEntry>,
     guard_log_error: String,
     rows: Vec<Row>,
@@ -768,7 +788,7 @@ impl Drop for Tips {
 }
 fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
     match hit {
-        Hit::Info(text) => return text.clone(),
+        Hit::Info(text) | Hit::ResetNotice(text) => return text.clone(),
         Hit::Icon | Hit::ChatIcon(_) => "Change chat icon",
         Hit::ChatCopy(0) => "Copy a link to this chat",
         Hit::ChatCopy(1) => "Copy the conversation text as Markdown",
@@ -783,6 +803,8 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::Hide => "Hide to tray · restore from the tray icon or recent-chats shortcut",
         Hit::Preferences => "Settings · list size, shortcut and extensions",
         Hit::CheckUpdate => "Check GitHub for updates now · ask before downloading",
+        Hit::ResetNoticeEnabled => "Follow published Codex reset announcements · selected source only",
+        Hit::ResetNoticeInterval(_) => "Announcement check interval · 1–60 minutes · changes apply immediately",
         Hit::Rows(n) => if *n < 0 { "Show fewer rows" } else { "Show more rows" },
         Hit::ShortcutEnabled => "Enable shortcut · only while Codex or Session Bar has focus",
         Hit::GuardSettings => "Protection limits and check interval",
@@ -936,6 +958,7 @@ impl App {
             preferences_guard: false,
             guard_limits: guard::Limits::default(),
             update_control: None,
+            notice_control: None,
             guard_events: Vec::new(),
             guard_log_error: String::new(),
             popup_layout: None,
@@ -1068,6 +1091,32 @@ impl App {
             .context("Could not save settings")?;
         Ok(())
     }
+    fn set_reset_notice(&mut self,mut config:crate::reset_notice::Settings)->Result<()> {
+        config.clamp();
+        let mut next=self.settings.clone();next.reset_notice=config.clone();
+        self.write_settings(&next)?;
+        self.settings=next;
+        if let Some(draft)=self.preferences_draft.as_mut(){draft.reset_notice=config.clone();}
+        if self.testing {
+            let mut live=self.state.lock().unwrap();
+            if live.reset_notice.source!=config.source {
+                live.reset_notice=Arc::new(crate::reset_notice::View{source:config.source,..Default::default()});
+            }
+            if !config.enabled {Arc::make_mut(&mut live.reset_notice).current=None;}
+        } else if let Some(control)=&self.notice_control {control.configure(config);}
+        self.preferences_note="Saved · changes are active".into();
+        Ok(())
+    }
+    unsafe fn change_notice_source(&mut self) {
+        let index=SendMessageW(self.combo,CB_GETCURSEL,WPARAM(0),LPARAM(0)).0;
+        let mut config=self.settings.reset_notice.clone();
+        config.source=if index==1{crate::reset_notice::Source::CodexResets}else{crate::reset_notice::Source::Divin};
+        if let Err(error)=self.set_reset_notice(config){
+            self.preferences_note=format!("Could not save: {error}");
+            let previous=usize::from(self.settings.reset_notice.source==crate::reset_notice::Source::CodexResets);
+            let _=SendMessageW(self.combo,CB_SETCURSEL,WPARAM(previous),LPARAM(0));
+        }
+    }
     fn refresh_guard_events(&mut self) {
         if self.testing { return; }
         match guard::recent_events(&self.paths) {
@@ -1199,7 +1248,7 @@ impl App {
         let mut area = |hit: Hit, r: D2D_RECT_F| {
             // Informational regions are registered after their foreground is
             // painted. They must never paint an opaque hover background.
-            if !matches!(hit, Hit::Info(_)) && self.hover.as_ref() == Some(&hit) {
+            if !matches!(hit, Hit::Info(_) | Hit::ResetNotice(_)) && self.hover.as_ref() == Some(&hit) {
                 p.fill(r, 0x35434a, 5.);
             }
             hits.push(Area { hit, r });
@@ -1348,13 +1397,24 @@ impl App {
                         .unwrap_or_else(|| if zh { "额度数据暂不可用".into() } else { "Quota data unavailable".into() });
                     area(Hit::Info(tooltip), rect(quota_left, 2., x - quota_left, 30.));
                     if let Some(reset) = quota.and_then(|q| q.banked_reset).filter(|r| *r > now()) {
-                        let text = format!("↶ {}", crate::telemetry::countdown(reset, now()));
-                        let w = p.width(&text, 11.) + 2.;
-                        let color = if reset-now() <= 86400. { ORANGE } else if reset-now() <= 3.*86400. { MODEL } else { MUTED };
-                        p.label(&text, rect(x, 2., w, 30.), 11., color, false);
+                        let text = crate::telemetry::countdown(reset, now());
+                        let w = p.width(&text, 11.) + 19.;
+                        let color = if reset-now() <= 86400. { ORANGE } else { MUTED };
+                        p.banked_icon(x,9.,color);
+                        p.label(&text, rect(x+18., 2., w-18., 30.), 11., color, false);
                         area(Hit::Info(quota.map(|q| q.banked_tooltip(now())).unwrap_or_default()), rect(x, 2., w, 30.));
                         x += w + 8.;
                     }
+                }
+                if self.settings.reset_notice.enabled {
+                    let notice=live.reset_notice.active(now()).filter(|notice|notice.at>now());
+                    let text=notice.map(|notice|notice.short(now(),crate::locale::chinese())).unwrap_or_default();
+                    let w=if notice.is_some(){p.width(&text,11.)+30.}else{24.};
+                    if notice.is_some(){p.fill(rect(x-3.,5.,w+4.,24.),0x44321f,5.);}
+                    area(Hit::ResetNotice(live.reset_notice.tooltip(now(),crate::locale::chinese())),rect(x-3.,2.,w+4.,30.));
+                    p.notice_bell(x,6.,notice.is_some());
+                    if notice.is_some(){p.label(&text,rect(x+25.,2.,w-25.,30.),11.,ORANGE,false);}
+                    x+=w+9.;
                 }
                 area(Hit::Details, rect(x, 3., 25., 28.));
                 p.line(x + 8., 15., x + 12., 19., MUTED, 1.4);
@@ -1902,6 +1962,26 @@ impl App {
                     if live.guard.available { MUTED } else { ORANGE },
                     false,
                 );
+                p.line(16.,456.,width-16.,456.,0x3b484f,1.);
+                p.fill(rect(16.,463.,width-32.,31.),0x293238,6.);
+                p.ui_label("Reset announcements",rect(27.,463.,157.,31.),12.,TEXT,false);
+                if self.testing {
+                    p.fill(rect(190.,465.,288.,27.),0x1c2125,4.);p.border(rect(190.,465.,288.,27.),0x47535b,4.);
+                    p.label(self.settings.reset_notice.source.label(),rect(200.,465.,254.,27.),11.,TEXT,false);
+                    p.line(458.,476.,463.,481.,MUTED,1.2);p.line(463.,481.,468.,476.,MUTED,1.2);
+                }
+                area(Hit::ResetNoticeEnabled,rect(width-73.,463.,57.,31.));
+                p.toggle(width-60.,471.,self.settings.reset_notice.enabled);
+                let api=self.settings.reset_notice.source.api();
+                p.label(api,rect(20.,500.,width-180.,27.),10.,MUTED,false);
+                area(Hit::Info(format!("{}\n{}\n{}",self.settings.reset_notice.source.label(),api,live.reset_notice.tooltip(now(),crate::locale::chinese()))),rect(20.,498.,width-185.,29.));
+                p.fill(rect(width-151.,500.,131.,27.),0x1c2125,5.);
+                for(delta,left)in[(-1,width-148.),(1,width-49.)] {
+                    area(Hit::ResetNoticeInterval(delta),rect(left,500.,27.,27.));
+                    p.line(left+9.,513.,left+18.,513.,MUTED,1.3);
+                    if delta>0 {p.line(left+13.5,508.5,left+13.5,517.5,MUTED,1.3);}
+                }
+                p.label(&format!("{} min",self.settings.reset_notice.check_minutes),rect(width-117.,500.,67.,27.),11.,TEXT,false);
             }
         }
         if kind==Some(Popup::Fixed){self.draw_chat_menu(&mut hits);}
@@ -2019,7 +2099,7 @@ impl App {
             entries,
         };
         let _ = SetWindowTheme(window, w!("DarkMode_Explorer"), PCWSTR::null());
-        let _ = SendMessageW(window, TTM_SETMAXTIPWIDTH, WPARAM(0), LPARAM(360));
+        let _ = SendMessageW(window, TTM_SETMAXTIPWIDTH, WPARAM(0), LPARAM(560));
         let _ = SendMessageW(
             window,
             TTM_SETDELAYTIME,
@@ -2030,7 +2110,7 @@ impl App {
             window,
             TTM_SETDELAYTIME,
             WPARAM(TTDT_AUTOPOP as usize),
-            LPARAM(6000),
+            LPARAM(20000),
         );
         let _ = SendMessageW(
             window,
@@ -2100,9 +2180,13 @@ impl App {
                 );
                 width += p.width(&q.label, 11.) + 5. + 42. + p.width(&percent, 11.) + 9.;
                 if let Some(reset) = q.banked_reset.filter(|r| *r > now()) {
-                    width += p.width(&format!("↶ {}", crate::telemetry::countdown(reset, now())), 11.) + 10.;
+                    width += p.width(&crate::telemetry::countdown(reset, now()), 11.) + 27.;
                 }
             }
+        }
+        if self.settings.reset_notice.enabled {
+            width+=live.reset_notice.active(now()).filter(|notice|notice.at>now())
+                .map(|notice|p.width(&notice.short(now(),crate::locale::chinese()),11.)+39.).unwrap_or(33.);
         }
         if let Some(s) = self.current(&live) {
             let model = s.execution.short();
@@ -2125,9 +2209,13 @@ impl App {
                 if !combo.is_invalid() {
                     let selected=SendMessageW(combo,CB_GETCURSEL,WPARAM(0),LPARAM(0));
                     let _=SendMessageW(combo,CB_RESETCONTENT,WPARAM(0),LPARAM(0));
-                    for group in &self.groups {let _=SendMessageW(combo,CB_ADDSTRING,WPARAM(0),LPARAM(wide_ui(group).as_ptr() as isize));}
+                    if combo==self.combo && self.popup_kind==Some(Popup::Preferences) {
+                        for source in [crate::reset_notice::Source::Divin,crate::reset_notice::Source::CodexResets] {
+                            let _=SendMessageW(combo,CB_ADDSTRING,WPARAM(0),LPARAM(wide(source.label()).as_ptr() as isize));
+                        }
+                    } else {for group in &self.groups {let _=SendMessageW(combo,CB_ADDSTRING,WPARAM(0),LPARAM(wide_ui(group).as_ptr() as isize));}}
                     let _=SendMessageW(combo,CB_SETCURSEL,WPARAM(selected.0.max(0) as usize),LPARAM(0));
-                    if !edit.is_invalid(){let _=SendMessageW(edit,EM_SETCUEBANNER,WPARAM(1),LPARAM(wide_ui("Search all emoji…").as_ptr() as isize));}
+                    if !edit.is_invalid() && !(combo==self.combo && self.popup_kind==Some(Popup::Preferences)){let _=SendMessageW(edit,EM_SETCUEBANNER,WPARAM(1),LPARAM(wide_ui("Search all emoji…").as_ptr() as isize));}
                 }
             }
 
@@ -2782,6 +2870,14 @@ impl App {
             let shortcut = &self.preferences_draft.as_ref().unwrap().recent_shortcut;
             SendMessageW(self.edit, HKM_SETHOTKEY, WPARAM(shortcut.control_word() as usize), LPARAM(0));
             let _ = EnableWindow(self.edit, shortcut.enabled);
+            self.combo=CreateWindowExW(WINDOW_EX_STYLE(0),w!("COMBOBOX"),w!(""),
+                WS_CHILD|WS_VISIBLE|WS_TABSTOP|WINDOW_STYLE(CBS_DROPDOWNLIST as u32|WS_VSCROLL.0),
+                190,465,288,120,self.popup,HMENU(108isize as *mut _),GetModuleHandleW(None)?,None)?;
+            for source in [crate::reset_notice::Source::Divin,crate::reset_notice::Source::CodexResets] {
+                SendMessageW(self.combo,CB_ADDSTRING,WPARAM(0),LPARAM(wide(source.label()).as_ptr() as isize));
+            }
+            let selected=usize::from(self.settings.reset_notice.source==crate::reset_notice::Source::CodexResets);
+            SendMessageW(self.combo,CB_SETCURSEL,WPARAM(selected),LPARAM(0));
         }
         if kind == Popup::Icons {
             self.scroll = 0;
@@ -2994,7 +3090,7 @@ impl App {
             } else {
                 (self.edit, 21, 53, 146, 22)
             },
-            (self.combo, 214, 49, 155, 350),
+            if self.popup_kind==Some(Popup::Preferences) {(self.combo,190,465,288,120)}else{(self.combo, 214, 49, 155, 350)},
         ] {
             if !child.is_invalid() {
                 let _ = MoveWindow(
@@ -3076,6 +3172,20 @@ impl App {
                 }
             }
             Hit::Preferences => { let _ = self.popup(Popup::Preferences); }
+            Hit::ResetNotice(_) => {
+                if !self.testing {
+                    let source=self.settings.reset_notice.source;
+                    let _=ShellExecuteW(self.bar,w!("open"),PCWSTR(wide(source.url()).as_ptr()),PCWSTR::null(),PCWSTR::null(),SW_SHOWNORMAL);
+                }
+            }
+            Hit::ResetNoticeEnabled => {
+                let mut config=self.settings.reset_notice.clone();config.enabled=!config.enabled;
+                if let Err(error)=self.set_reset_notice(config){self.preferences_note=format!("Could not save: {error}");}
+            }
+            Hit::ResetNoticeInterval(delta) => {
+                let mut config=self.settings.reset_notice.clone();config.check_minutes=(config.check_minutes as i64+delta as i64).clamp(1,60) as u64;
+                if let Err(error)=self.set_reset_notice(config){self.preferences_note=format!("Could not save: {error}");}
+            }
             Hit::CheckUpdate => {
                 if self.testing {
                     self.state.lock().unwrap().updater.phase="checking".into();
@@ -3112,14 +3222,14 @@ impl App {
             }
             Hit::GuardSettings => {
                 if let Some(draft)=self.preferences_draft.as_mut(){draft.recent_shortcut=Shortcut::from_control_word(SendMessageW(self.edit,HKM_GETHOTKEY,WPARAM(0),LPARAM(0)).0 as u16,draft.recent_shortcut.enabled);}
-                self.guard_limits=guard::Limits::load(&self.paths);self.preferences_guard=true;self.preferences_advanced=false;self.preferences_note.clear();if !self.testing{let _=SetFocus(self.popup);}let _=ShowWindow(self.edit,SW_HIDE);
+                self.guard_limits=guard::Limits::load(&self.paths);self.preferences_guard=true;self.preferences_advanced=false;self.preferences_note.clear();if !self.testing{let _=SetFocus(self.popup);}let _=ShowWindow(self.edit,SW_HIDE);let _=ShowWindow(self.combo,SW_HIDE);
             }
             Hit::GuardLimit(field,delta) => {self.guard_limits.adjust(field,delta);self.preferences_note="Apply to save changes".into();}
             Hit::RefreshPreferences => {
                 if let Some(draft)=self.preferences_draft.as_mut(){draft.recent_shortcut=Shortcut::from_control_word(SendMessageW(self.edit,HKM_GETHOTKEY,WPARAM(0),LPARAM(0)).0 as u16,draft.recent_shortcut.enabled);}
-                self.preferences_advanced=true;let _=ShowWindow(self.edit,SW_HIDE);
+                self.preferences_advanced=true;let _=ShowWindow(self.edit,SW_HIDE);let _=ShowWindow(self.combo,SW_HIDE);
             }
-            Hit::RefreshBack => {self.preferences_guard=false;self.preferences_advanced=false;let _=ShowWindow(self.edit,SW_SHOW);}
+            Hit::RefreshBack => {self.preferences_guard=false;self.preferences_advanced=false;let _=ShowWindow(self.edit,SW_SHOW);let _=ShowWindow(self.combo,SW_SHOW);}
             Hit::RefreshInterval(field,delta) => {if let Some(draft)=self.preferences_draft.as_mut(){draft.refresh.adjust(field,delta);self.preferences_note="Apply to save changes".into();}}
             Hit::ApplyPreferences => {
                 let result=if self.preferences_guard {self.guard_limits.save(&self.paths)}else{self.apply_preferences()};
@@ -3805,6 +3915,11 @@ unsafe extern "system" fn wndproc(
             WM_COMMAND if !is_bar => {
                 let id = (wparam.0 & 0xffff) as u32;
                 let code = ((wparam.0 >> 16) & 0xffff) as u32;
+                if id==108 && code==CBN_SELCHANGE && app.popup_kind==Some(Popup::Preferences) {
+                    app.change_notice_source();
+                    let _=InvalidateRect(app.popup,None,false);
+                    return Some(LRESULT(0));
+                }
                 if (id == 100 && code == EN_CHANGE) || (id == 101 && code == CBN_SELCHANGE) {
                     app.update_filter();
                 } else if id == 103 && code == EN_CHANGE {
@@ -3955,6 +4070,8 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
         observers.push(guard::start(&paths, &state, &stop));
         let updates = crate::update::Service::start(&paths, &state, &stop, app.bar.0 as isize, QUIT_MESSAGE);
         app.update_control=updates.as_ref().map(|service|service.control());
+        let notices=crate::reset_notice::Service::start(&paths,&state,&stop,app.settings.reset_notice.clone());
+        app.notice_control=Some(notices.control());
         ACTIONS.with(|a| *a.borrow_mut() = Some(workers.actions.clone()));
         APP.with(|a| *a.borrow_mut() = Some(app));
         let focus_hook=SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,None,Some(foreground_changed),0,0,WINEVENT_OUTOFCONTEXT);
@@ -4010,6 +4127,7 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
         if !focus_hook.is_invalid(){let _=UnhookWinEvent(focus_hook);}
         stop.store(true, Ordering::Relaxed);
         drop(updates);
+        drop(notices);
         drop(workers);
         for observer in observers {
             let _ = observer.join();
@@ -4434,6 +4552,43 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         let no_banked_hits = capture(&app, None, app.measure_bar() as u32, 34, &paths.runtime.join("rust-bar-no-banked-verification.png"))?;
         assert!(!no_banked_hits.iter().any(|area| matches!(&area.hit, Hit::Info(text) if text.contains("Banked reset"))));
         state.lock().unwrap().quota[0].banked_reset = Some(now() + 8300.);
+        let saved_notice=state.lock().unwrap().reset_notice.clone();
+        let fixture_notice=crate::reset_notice::View{
+            checked_at:now(),source:crate::reset_notice::Source::Divin,
+            current:Some(crate::reset_notice::Notice{id:"fixture-reset".into(),at:now()+5400.,announced_at:now()-900.,
+                bound:crate::reset_notice::Bound::Before,expression:"Before the announced deadline".into(),
+                posts:vec![crate::reset_notice::Post{author:"Tibo (example)".into(),original:"A reset is scheduled before the published deadline.".into(),
+                    translation:"示例：额度将在公布的截止时间前重置。".into(),url:"https://x.com/thsottiaux/status/123456789".into(),..Default::default()}],..Default::default()}),
+            history:vec![crate::reset_notice::Notice{id:"previous-fixture".into(),announced_at:now()-86400.,summary:"Previous reset example".into(),completed:true,..Default::default()}],..Default::default()};
+        state.lock().unwrap().reset_notice=Arc::new(fixture_notice.clone());
+        let notice_width=app.measure_bar() as u32;
+        let notice_hits=capture(&app,None,notice_width,34,&paths.runtime.join("rust-reset-notice-verification.png"))?;
+        let notice_area=notice_hits.iter().find(|area|matches!(area.hit,Hit::ResetNotice(_))).expect("Explicit forecast must have a clickable alarm badge");
+        let bank_area=notice_hits.iter().find(|area|matches!(&area.hit,Hit::Info(text) if text.contains("Banked reset"))).unwrap();
+        assert!(notice_area.r.left>=bank_area.r.right,"Announcement belongs after the banked-expiry area");
+        assert!(matches!(&notice_area.hit,Hit::ResetNotice(text) if text.contains("Original")&&text.contains("示例")&&text.contains("Previous reset example")));
+        app.hover=Some(notice_area.hit.clone());
+        capture(&app,None,notice_width,34,&paths.runtime.join("rust-reset-notice-hover-verification.png"))?;
+        let plain_notice=image::open(paths.runtime.join("rust-reset-notice-verification.png"))?.to_rgba8();
+        let hover_notice=image::open(paths.runtime.join("rust-reset-notice-hover-verification.png"))?.to_rgba8();
+        for y in 6..28 {for x in (notice_area.r.left as u32+3)..(notice_area.r.left as u32+26) {
+            assert_eq!(plain_notice.get_pixel(x,y),hover_notice.get_pixel(x,y),"Alarm foreground must remain visible on hover");
+        }}
+        app.hit(notice_area.hit.clone());
+        assert_eq!(app.snapshot().reset_notice.current.as_ref().unwrap().id,"fixture-reset");
+        app.hover=None;
+        let notice_before=fixture_notice.current.as_ref().unwrap().at;
+        assert!(fixture_notice.current.as_ref().unwrap().short(notice_before+1.,true).contains("待确认"));
+        Arc::make_mut(&mut state.lock().unwrap().reset_notice).current.as_mut().unwrap().completed=true;
+        let completed_notice_hits=capture(&app,None,app.measure_bar() as u32,34,&paths.runtime.join("rust-reset-notice-completed-verification.png"))?;
+        let gray=completed_notice_hits.iter().find(|area|matches!(area.hit,Hit::ResetNotice(_))).expect("No future forecast keeps a gray clickable bell");
+        assert!(gray.r.right-gray.r.left<35. && app.measure_bar()<notice_width as i32);
+        Arc::make_mut(&mut state.lock().unwrap().reset_notice).current.as_mut().unwrap().completed=false;
+        Arc::make_mut(&mut state.lock().unwrap().reset_notice).current.as_mut().unwrap().at=now()-1.;
+        let expired_notice_hits=capture(&app,None,app.measure_bar() as u32,34,&paths.runtime.join("rust-reset-notice-expired-verification.png"))?;
+        let expired=expired_notice_hits.iter().find(|area|matches!(area.hit,Hit::ResetNotice(_))).unwrap();
+        assert!(expired.r.right-expired.r.left<35.,"Expired predictions show no countdown label");
+        state.lock().unwrap().reset_notice=saved_notice;
         capture_docking(&app, paths)?;
         app.popup_kind = Some(Popup::Recent);
         app.rows = rows.clone();
@@ -4794,6 +4949,26 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         let preferences_hits = capture(&app, Some(Popup::Preferences), 560, PREFERENCES_HEIGHT as u32,
             &paths.runtime.join("rust-preferences-verification.png"))?;
         assert!(preferences_hits.iter().any(|a| a.hit == Hit::Guard));
+        assert!(preferences_hits.iter().any(|a|a.hit==Hit::ResetNoticeEnabled));
+        assert_eq!(SendMessageW(app.combo,CB_GETCOUNT,WPARAM(0),LPARAM(0)).0,2);
+        let saved_notice_config=app.settings.reset_notice.clone();
+        SendMessageW(app.combo,CB_SETCURSEL,WPARAM(1),LPARAM(0));app.change_notice_source();
+        assert_eq!(app.settings.reset_notice.source,crate::reset_notice::Source::CodexResets);
+        assert_eq!(app.snapshot().reset_notice.source,crate::reset_notice::Source::CodexResets);
+        let saved_culture=crate::locale::status().0;
+        crate::locale::follow(0x804);app.tick();
+        assert_eq!(SendMessageW(app.combo,CB_GETCOUNT,WPARAM(0),LPARAM(0)).0,2,"Language refresh must not fill source combo with Emoji categories");
+        assert_eq!(SendMessageW(app.combo,CB_GETCURSEL,WPARAM(0),LPARAM(0)).0,1);
+        capture(&app,Some(Popup::Preferences),560,PREFERENCES_HEIGHT as u32,&paths.runtime.join("rust-reset-source-settings-zh-verification.png"))?;
+        crate::locale::follow(saved_culture);app.tick();
+        app.hit(Hit::ResetNoticeEnabled);assert!(!app.settings.reset_notice.enabled);
+        app.hit(Hit::ResetNoticeInterval(1));assert_eq!(app.settings.reset_notice.check_minutes,6);
+        app.hit(Hit::GuardSettings);
+        assert_eq!(GetWindowLongPtrW(app.combo,GWL_STYLE)&WS_VISIBLE.0 as isize,0);
+        app.hit(Hit::RefreshBack);
+        assert_ne!(GetWindowLongPtrW(app.combo,GWL_STYLE)&WS_VISIBLE.0 as isize,0);
+        app.set_reset_notice(saved_notice_config)?;
+        SendMessageW(app.combo,CB_SETCURSEL,WPARAM(0),LPARAM(0));
         let update_button=preferences_hits.iter().find(|a|a.hit==Hit::CheckUpdate).expect("Manual update check must be visible in settings");
         assert!(update_button.contains(95.,57.));
         let previous_update=state.lock().unwrap().updater.clone();

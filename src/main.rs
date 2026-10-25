@@ -12,6 +12,7 @@ mod refresh;
 mod locale;
 mod telemetry;
 mod update;
+mod reset_notice;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -144,6 +145,8 @@ pub struct Settings {
     pub recent_title_width: u32,
     #[serde(default)]
     pub refresh: refresh::Settings,
+    #[serde(default)]
+    pub reset_notice: reset_notice::Settings,
 }
 fn default_recent_rows() -> usize { 10 }
 fn default_title_width()->u32{200}
@@ -156,6 +159,7 @@ impl Default for Settings {
             compact_recent: false,
             recent_title_width:default_title_width(),
             refresh:refresh::Settings::default(),
+            reset_notice:reset_notice::Settings::default(),
         }
     }
 }
@@ -207,6 +211,7 @@ pub struct Shared {
     pub refresh_options: refresh::Settings,
     pub guard: guard::View,
     pub updater: update::View,
+    pub reset_notice: Arc<reset_notice::View>,
     pub host: isize,
     pub view: Option<String>,
     pub view_label: String,
@@ -241,6 +246,10 @@ fn run() -> Result<()> {
     if args.iter().any(|s| s == "--check-update") {
         return update::inspect(&paths);
     }
+    if args.iter().any(|s|s=="--inspect-reset-notice") {
+        let source=if args.iter().any(|s|s=="--codex-resets"){reset_notice::Source::CodexResets}else{reset_notice::Source::Divin};
+        return reset_notice::inspect(&paths,source);
+    }
     if args.iter().any(|s| s == "--inspect") {
         return desktop::inspect(&paths);
     }
@@ -260,6 +269,7 @@ fn run() -> Result<()> {
                 ..Settings::default()
             },
         );
+    settings.reset_notice.clamp();
     if settings.thread.is_empty() {
         settings.thread = desktop::default_context(&paths);
     }
