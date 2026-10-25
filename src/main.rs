@@ -11,6 +11,7 @@ mod ui;
 mod refresh;
 mod locale;
 mod telemetry;
+mod update;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -235,6 +236,9 @@ fn run() -> Result<()> {
     let paths = Paths::discover()?;
     if args.iter().any(|s| s == "--self-test") {
         return ui::self_test(&paths);
+    }
+    if args.iter().any(|s| s == "--check-update") {
+        return update::inspect(&paths);
     }
     if args.iter().any(|s| s == "--inspect") {
         return desktop::inspect(&paths);

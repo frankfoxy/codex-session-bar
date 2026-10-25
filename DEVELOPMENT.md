@@ -42,6 +42,14 @@ navigates chats, renames them, submits prompts or resumes work.
 `--version` prints the Cargo package version without opening the UI or creating runtime files.
 Build output and release staging live under workspace `tmp`, not in Git.
 
+## Automatic updates
+
+`update.rs` checks this repository's latest stable GitHub release ten seconds after startup and every 30 minutes thereafter. A channel deadline keeps the worker asleep between checks; HTTPS uses native WinHTTP with ETags, bounded responses and timeouts, without an extra Git process or account credentials. Drafts, prereleases, equal versions and downgrades are ignored. A separate Chinese/English Yes/No prompt requires confirmation before downloading; declining suppresses the same version until restart. The UI and Git guard remain independent.
+
+Only an installed `bin/codex-session-bar.exe` starts the updater. Downloads, staging and backups stay under a verified workspace `tmp` child. The ZIP must match `SHA256SUMS.txt` and any GitHub asset digest. An embedded Windows PowerShell helper rejects unsafe ZIP paths, linked or duplicate files, unexpected files and oversized expansion, and checks the staged executable's version before the bar exits. It waits on the original process identity, backs up the allowlisted application files, verifies replacement and restarts. Partial failures restore originals; settings, tags and caches are outside the copy list. Diagnostics are in `update-status.json` and the update's temporary directory.
+
+`--check-update` is a read-only network probe. `pwsh -NoProfile -File tests/Update-Installer.ps1` runs isolated installer fixtures under workspace `tmp`, covering replacement/restart, rollback after a locked-file failure, settings preservation, bad checksums, ZIP traversal and wrong executable versions. It does not replace or restart the real installation. PowerShell 7 is required only for this developer test; runtime installation uses built-in Windows PowerShell 5.1.
+
 ## Codex Git guard
 
 Git protection runs inside the Session Bar process. `guard.rs` owns settings and the status view; `guard/worker.rs` runs enforcement on a dedicated worker. Warnings use a separate thread, so an unanswered dialog or a full notification queue cannot pause enforcement. There is no standalone Memory Watch executable, monitor window, second tray icon, whole-system sampler or periodic sample log. The lightweight collector retains only process identities, ancestry and private bytes needed for Git checks; it performs no CPU history, grouping or memory-history recording.

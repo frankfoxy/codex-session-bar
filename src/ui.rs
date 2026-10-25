@@ -3917,6 +3917,7 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
         let workers = Workers::start(&paths, &state, &stop, &app.catalog);
         let mut observers = host::start(&paths, &state, &stop);
         observers.push(guard::start(&paths, &state, &stop));
+        let updates = crate::update::Service::start(&paths, &stop, app.bar.0 as isize, QUIT_MESSAGE);
         ACTIONS.with(|a| *a.borrow_mut() = Some(workers.actions.clone()));
         APP.with(|a| *a.borrow_mut() = Some(app));
         let focus_hook=SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,None,Some(foreground_changed),0,0,WINEVENT_OUTOFCONTEXT);
@@ -3971,6 +3972,7 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
         }
         if !focus_hook.is_invalid(){let _=UnhookWinEvent(focus_hook);}
         stop.store(true, Ordering::Relaxed);
+        drop(updates);
         drop(workers);
         for observer in observers {
             let _ = observer.join();
