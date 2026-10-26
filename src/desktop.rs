@@ -330,6 +330,7 @@ impl Workers {
             let mut list_retry=crate::refresh::Retry::default();
             let mut quota_retry=crate::refresh::Retry::default();
             let events=s.lock().unwrap().refresh_events.clone();let mut gate=crate::refresh::Gate::new();
+            let mut capacity_fallback=crate::capacity_retry::NativeFallback::default();
             while !done.load(Ordering::Relaxed) {
                 let cfg=s.lock().unwrap().refresh_options.clone();
                 let forced=s.lock().unwrap().quota_at<0.;
@@ -347,6 +348,8 @@ impl Workers {
                 gate.mark(events.generation());
                 match rpc.read_tool("list_threads",json!({"limit":50}),&ctx).and_then(|payload|store.recent(&payload)) {
                     Ok(mut recent)=>{
+                        let capacity_enabled=s.lock().unwrap().capacity_options.enabled;
+                        capacity_fallback.resolve(&p,&mut recent,capacity_enabled,|id|rpc.read_tool("read_thread",json!({"threadId":id,"hostId":"local","turnLimit":1,"includeOutputs":false,"maxOutputCharsPerItem":256}),&ctx));
                         list_retry.success();
                         recent.carry_read_state(&s.lock().unwrap().recent);
                         if last_cache.is_none_or(|at| at.elapsed()>=Duration::from_secs(cfg.cache_secs)) {
@@ -400,10 +403,14 @@ impl Workers {
                 let capacity_action=matches!(action,Action::CapacityRetry(_));
                 let result = (|| -> Result<String> {
                     match action {
-                        Action::CapacityRetry(ref request)=>crate::capacity_retry::dispatch(&p,&s,&store,request,|thread,prompt|{
+                        Action::CapacityRetry(ref request)=>{
+                            let check=if crate::capacity_retry::eligible(&s,request){rpc.read_tool("read_thread",json!({"threadId":request.failure.thread_id,"hostId":"local","turnLimit":1,"includeOutputs":false,"maxOutputCharsPerItem":256}),&ctx)}else{Ok(Value::Null)};
+                            if !crate::capacity_retry::check_native(&p,&s,request,check)? {return Ok("Capacity retry skipped".into());}
+                            let mut verified=request.clone();verified.failure.native_verified_at=Some(crate::now());
+                            crate::capacity_retry::dispatch(&p,&s,&store,&verified,|thread,prompt|{
                             let value=rpc.tool_once("send_message_to_thread",json!({"threadId":thread,"hostId":"local","prompt":prompt}),&ctx)?;
                             anyhow::ensure!(value["threadId"]==thread,"Codex did not confirm the continuation target");Ok(())
-                        }),
+                        })},
                         Action::Refresh => {
                             s.lock().unwrap().quota_at = -1.0;
                             Ok("Refreshing account limits…".into())
@@ -469,6 +476,27 @@ impl Drop for Workers {
     }
 }
 
+pub fn inspect_capacity(paths:&Paths)->Result<()> {
+    let stop=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut rpc=Rpc::new(paths,stop);
+    let mut store=Store::new(paths);
+    let context=default_context(paths);
+    let payload=rpc.read_tool("list_threads",json!({"limit":50}),&context)?;
+    let mut recent=store.recent(&payload)?;
+    crate::capacity_retry::NativeFallback::default().resolve(paths,&mut recent,true,|id|rpc.read_tool("read_thread",json!({"threadId":id,"hostId":"local","turnLimit":1,"includeOutputs":false,"maxOutputCharsPerItem":256}),&context));
+    let mut rows=Vec::new();
+    for failure in recent.capacity_failures.iter().take(12) {
+        let mut row=json!({"thread_id":failure.thread_id,"name":failure.label,"failed_turn":failure.turn_id,"failed_at":failure.failed_at,"observed_at":failure.observed_at,"eligible":failure.fresh(crate::now())});
+        if failure.fresh(crate::now()) {
+            match rpc.read_tool("read_thread",json!({"threadId":failure.thread_id,"hostId":"local","turnLimit":1,"includeOutputs":false,"maxOutputCharsPerItem":256}),&context) {
+                Ok(value)=>{row["native_confirms"]=json!(crate::capacity_retry::native_matches(&value,failure));row["native_status"]=value["thread"]["status"].clone();}
+                Err(error)=>row["native_error"]=json!(format!("{error:#}")),
+            }
+        }
+        rows.push(row);
+    }
+    println!("{}",json!({"version":env!("CARGO_PKG_VERSION"),"available":recent.capacity_available,"failures":rows,"mutations":false}));Ok(())
+}
 pub fn inspect(paths: &Paths) -> Result<()> {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut rpc = Rpc::new(paths, stop);

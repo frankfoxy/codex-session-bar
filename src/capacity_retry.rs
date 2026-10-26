@@ -51,16 +51,20 @@ pub struct Failure {
     pub turn_id: String,
     pub label: String,
     pub failed_at: f64,
+    #[serde(default)]
+    pub observed_at: Option<f64>,
+    #[serde(default)]
+    pub native_verified_at: Option<f64>,
 }
 impl Failure {
     fn key(&self) -> String {
         format!("{}:{}", self.thread_id, self.turn_id)
     }
-    fn fresh(&self, at: f64) -> bool {
+    pub(crate) fn fresh(&self, at: f64) -> bool {
         !self.thread_id.is_empty()
             && !self.turn_id.is_empty()
             && self.failed_at > 0.
-            && (0.0..=MAX_AGE).contains(&(at - self.failed_at))
+            && (0.0..=MAX_AGE).contains(&(at - self.observed_at.unwrap_or(self.failed_at)))
     }
 }
 pub fn failure(
@@ -95,7 +99,137 @@ pub fn failure(
         turn_id: turn_id.into(),
         label: label.chars().take(100).collect(),
         failed_at: failed_at?,
+        observed_at: None,
+        native_verified_at: None,
     })
+}
+pub fn live_error(status: &Value) -> bool {
+    matches!(
+        status.as_str().or_else(|| status["type"].as_str()),
+        Some("systemError" | "system_error")
+    )
+}
+pub fn observe_live(failure: &mut Failure, status: &Value) {
+    if live_error(status) {
+        failure.observed_at = Some(now());
+    }
+}
+pub fn native_failure(value: &Value, id: &str, label: &str) -> Option<Failure> {
+    if value["thread"]["id"] != id
+        || matches!(
+            value["thread"]["status"]["type"].as_str(),
+            Some("active" | "running" | "inProgress")
+        )
+    {
+        return None;
+    }
+    let turn = value["turns"].as_array()?.first()?;
+    let mut result = failure(
+        id,
+        label,
+        turn["id"].as_str()?,
+        turn["status"].as_str()?,
+        Some(&turn["error"].to_string()),
+        Some(
+            turn["completedAt"]
+                .as_f64()
+                .map(|at| if at > 1e12 { at / 1000. } else { at })
+                .unwrap_or_else(now),
+        ),
+    )?;
+    result.observed_at = Some(now());
+    Some(result)
+}
+#[derive(Default)]
+pub struct NativeFallback {
+    cache: HashMap<String, (f64, f64, Option<Failure>, String)>,
+}
+impl NativeFallback {
+    pub fn resolve(
+        &mut self,
+        paths: &Paths,
+        recent: &mut crate::data::Recent,
+        enabled: bool,
+        mut fetch: impl FnMut(&str) -> Result<Value>,
+    ) {
+        if !enabled {
+            self.cache.clear();
+            return;
+        }
+        let ids: HashSet<_> = recent
+            .capacity_unresolved
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.cache.retain(|id, _| ids.contains(id));
+        for (id, label) in &recent.capacity_unresolved {
+            let fingerprint = recent
+                .rows
+                .iter()
+                .find(|row| row.id == *id)
+                .map_or(0., |row| row.updated_at);
+            let due = self
+                .cache
+                .get(id)
+                .is_none_or(|(version, next, _, _)| *version != fingerprint || now() >= *next);
+            if due {
+                let (next, failure, error) = match fetch(id) {
+                    Ok(value) => (
+                        now() + 30.,
+                        native_failure(&value, id, label),
+                        String::new(),
+                    ),
+                    Err(error) => (
+                        now() + 5.,
+                        None,
+                        format!("{error:#}").chars().take(300).collect(),
+                    ),
+                };
+                if !error.is_empty()
+                    && self
+                        .cache
+                        .get(id)
+                        .is_none_or(|(_, _, _, old)| old != &error)
+                {
+                    log(
+                        paths,
+                        "observation_failed",
+                        &Failure {
+                            thread_id: id.clone(),
+                            turn_id: String::new(),
+                            label: label.clone(),
+                            failed_at: 0.,
+                            observed_at: Some(now()),
+                            native_verified_at: None,
+                        },
+                        Some(&error),
+                    );
+                }
+                self.cache
+                    .insert(id.clone(), (fingerprint, next, failure, error));
+            }
+            if let Some((_, _, failure, error)) = self.cache.get(id) {
+                if let Some(failure) = failure {
+                    recent.capacity_failures.push(failure.clone());
+                    for row in recent
+                        .rows
+                        .iter_mut()
+                        .chain(&mut recent.all_rows)
+                        .filter(|row| row.id == *id)
+                    {
+                        row.state = "Failed".into();
+                    }
+                }
+                if !error.is_empty() {
+                    recent.capacity_error = format!("{label}: {error}");
+                }
+            }
+        }
+        // The native API also supports installations without a usable history projection.
+        if !recent.capacity_unresolved.is_empty() {
+            recent.capacity_available = true;
+        }
+    }
 }
 #[derive(Clone, Debug)]
 pub struct Request {
@@ -113,6 +247,11 @@ pub struct View {
     pub in_flight: bool,
     pub last_note: String,
     pub last_error: String,
+    pub observed: usize,
+    pub historical_skips: usize,
+    pub probe_error: String,
+    #[serde(skip)]
+    pub(crate) retry_after: HashMap<String, f64>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -139,6 +278,14 @@ impl View {
                 "已关闭 · 不发送继续消息"
             } else {
                 "Disabled · no continuation messages"
+            }
+            .into();
+        }
+        if !self.probe_error.is_empty() {
+            return if zh {
+                "读取最新错误失败 · 正在重查"
+            } else {
+                "Could not read the latest error · rechecking"
             }
             .into();
         }
@@ -208,9 +355,11 @@ impl Journal {
         if self.seen.iter().any(|attempt| attempt.key == key) {
             return Ok(false);
         }
+        // Only the newest attempted turn of each chat can be retried again.
+        // Keep it across age cutoffs/restarts, including ambiguous submissions.
+        let prefix = format!("{}:", failure.thread_id);
         self.seen
-            .retain(|attempt| attempt.failed_at + MAX_AGE >= now());
-        // Never evict a still-eligible turn: at capacity, stop sending instead.
+            .retain(|attempt| !attempt.key.starts_with(&prefix));
         anyhow::ensure!(
             self.seen.len() < 1024,
             "Capacity retry journal is full; wait for old entries to expire"
@@ -245,6 +394,7 @@ impl Journal {
 struct Schedule {
     pending: HashMap<String, Failure>,
     tried: HashSet<String>,
+    observed: HashSet<String>,
 }
 impl Schedule {
     fn new(journal: Journal) -> Self {
@@ -255,6 +405,7 @@ impl Schedule {
                 .into_iter()
                 .map(|attempt| attempt.key)
                 .collect(),
+            observed: HashSet::new(),
         }
     }
     fn sync(&mut self, failures: &[Failure], at: f64) {
@@ -326,11 +477,46 @@ pub fn start(
                 schedule = Schedule::new(Journal::load(&paths));
                 epoch = Some(revision);
             }
+            {
+                let mut live = state.lock().unwrap();
+                live.capacity_retry.retry_after.retain(|key, deadline| {
+                    if *deadline <= now() {
+                        schedule.tried.remove(key);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
             let fresh = recent.capacity_available
                 && !recent.stale
                 && recent.loaded_at > 0.
                 && (0.0..=120.).contains(&(now() - recent.loaded_at));
             if options.enabled && fresh {
+                for failure in &recent.capacity_failures {
+                    if schedule.observed.insert(failure.key()) {
+                        log(
+                            &paths,
+                            if schedule.tried.contains(&failure.key()) {
+                                "duplicate_skipped"
+                            } else if failure.fresh(now()) {
+                                "detected"
+                            } else {
+                                "historical_skipped"
+                            },
+                            failure,
+                            None,
+                        );
+                    }
+                }
+                if schedule.observed.len() > 1024 {
+                    schedule.observed.retain(|key| {
+                        recent
+                            .capacity_failures
+                            .iter()
+                            .any(|failure| failure.key() == *key)
+                    });
+                }
                 schedule.sync(&recent.capacity_failures, now());
             } else {
                 schedule.pending.clear();
@@ -353,6 +539,13 @@ pub fn start(
                 let mut live = state.lock().unwrap();
                 live.capacity_retry.waiting = schedule.pending.len();
                 live.capacity_retry.available = fresh;
+                live.capacity_retry.observed = recent.capacity_failures.len();
+                live.capacity_retry.historical_skips = recent
+                    .capacity_failures
+                    .iter()
+                    .filter(|failure| !failure.fresh(now()))
+                    .count();
+                live.capacity_retry.probe_error = recent.capacity_error.clone();
             }
             // Reuse the existing source signal; an idle check reads memory only.
             events.wait(generation, Duration::from_secs(1));
@@ -362,6 +555,78 @@ pub fn start(
 fn enabled(state: &State, epoch: u64) -> bool {
     let live = state.lock().unwrap();
     live.capacity_options.enabled && live.capacity_epoch == epoch
+}
+pub fn eligible(state: &State, request: &Request) -> bool {
+    enabled(state, request.epoch) && request.failure.fresh(now())
+}
+pub fn native_matches(value: &Value, expected: &Failure) -> bool {
+    value["thread"]["id"] == expected.thread_id
+        && !matches!(
+            value["thread"]["status"]["type"].as_str(),
+            Some("active" | "running" | "inProgress")
+        )
+        && value["turns"]
+            .as_array()
+            .and_then(|turns| turns.first())
+            .is_some_and(|turn| {
+                turn["id"] == expected.turn_id
+                    && failure(
+                        &expected.thread_id,
+                        &expected.label,
+                        &expected.turn_id,
+                        turn["status"].as_str().unwrap_or(""),
+                        Some(&turn["error"].to_string()),
+                        Some(expected.failed_at),
+                    )
+                    .is_some()
+            })
+}
+pub fn check_native(
+    paths: &Paths,
+    state: &State,
+    request: &Request,
+    result: Result<Value>,
+) -> Result<bool> {
+    let expected = &request.failure;
+    if !eligible(state, request) {
+        log(
+            paths,
+            "skipped",
+            expected,
+            Some("disabled, settings changed or old failure"),
+        );
+        return Ok(false);
+    }
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => {
+            state
+                .lock()
+                .unwrap()
+                .capacity_retry
+                .retry_after
+                .insert(expected.key(), now() + 5.);
+            log(
+                paths,
+                "recheck_pending",
+                expected,
+                Some(&format!("{error:#}")),
+            );
+            return Err(
+                error.context("Could not verify the latest turn; retry verification in 5 seconds")
+            );
+        }
+    };
+    let valid = native_matches(&value, expected);
+    if !valid {
+        log(
+            paths,
+            "skipped",
+            expected,
+            Some("native latest turn changed, recovered or stopped"),
+        );
+    }
+    Ok(valid)
 }
 pub fn dispatch(
     paths: &Paths,
@@ -380,13 +645,33 @@ pub fn dispatch(
         );
         return Ok("Capacity retry skipped".into());
     }
-    let current = store
-        .capacity_failure(&failure.thread_id)
-        .inspect_err(|error| log(paths, "blocked", failure, Some(&format!("{error:#}"))))?;
-    if current
-        .as_ref()
-        .is_none_or(|value| value.turn_id != failure.turn_id || !value.fresh(now()))
-    {
+    let valid = if let Some(at) = failure.native_verified_at {
+        let fresh = (0.0..=5.).contains(&(now() - at));
+        if !fresh {
+            state
+                .lock()
+                .unwrap()
+                .capacity_retry
+                .retry_after
+                .insert(failure.key(), now() + 5.);
+            log(
+                paths,
+                "recheck_pending",
+                failure,
+                Some("native verification expired"),
+            );
+        }
+        fresh && store.capacity_target_exists(&failure.thread_id)?
+    } else {
+        let current = store
+            .capacity_failure(&failure.thread_id)
+            .inspect_err(|error| log(paths, "blocked", failure, Some(&format!("{error:#}"))))?;
+        current.as_ref().is_some_and(|value| {
+            value.turn_id == failure.turn_id
+                && (failure.observed_at.is_some() || value.fresh(now()))
+        })
+    };
+    if !valid {
         log(
             paths,
             "skipped",
@@ -514,7 +799,7 @@ fn log_record(
         let mut file = OpenOptions::new().append(true).create(true).open(path)?;
         serde_json::to_writer(
             &mut file,
-            &json!({"event":event,"time":chrono::Local::now().to_rfc3339(),"at":now(),"thread_id":failure.thread_id,"thread_name":failure.label,"failed_turn":failure.turn_id,"failed_at":failure.failed_at,"retry_number":number,"delay_seconds":delay,"error":error.map(|value|value.chars().take(300).collect::<String>())}),
+            &json!({"event":event,"time":chrono::Local::now().to_rfc3339(),"at":now(),"thread_id":failure.thread_id,"thread_name":failure.label,"failed_turn":failure.turn_id,"failed_at":failure.failed_at,"observed_at":failure.observed_at,"retry_number":number,"delay_seconds":delay,"error":error.map(|value|value.chars().take(300).collect::<String>())}),
         )?;
         file.write_all(b"\n")?;
         Ok(())
@@ -549,6 +834,14 @@ fn parse_events(bytes: &[u8], skip_first: bool, zh: bool) -> Vec<crate::guard::L
         };
         let event = value["event"].as_str().unwrap_or("");
         let label = match (event, zh) {
+            ("detected", true) => "识别到容量限制",
+            ("detected", false) => "Capacity error detected",
+            ("historical_skipped", true) => "跳过非活跃的历史错误",
+            ("historical_skipped", false) => "Inactive historical error skipped",
+            ("recheck_pending", true) => "核验失败，5 秒后重查",
+            ("recheck_pending", false) => "Verification failed; recheck in 5s",
+            ("observation_failed", true) => "读取最新错误失败，稍后重查",
+            ("observation_failed", false) => "Could not read latest error; rechecking",
             ("queued", true) => "等待重试",
             ("queued", false) => "Queued",
             ("send_started", true) => "触发重试",
@@ -594,6 +887,9 @@ fn parse_events(bytes: &[u8], skip_first: bool, zh: bool) -> Vec<crate::guard::L
             match reason {
                 "disabled, settings changed or old failure" => "扩展关闭、设置变更或错误已过期",
                 "latest turn changed, recovered or stopped" => "会话已进入新回合、已恢复或已停止",
+                "native latest turn changed, recovered or stopped" => {
+                    "Codex 最新回合已变化、已恢复或已停止"
+                }
                 other => other,
             }
         } else {
@@ -614,8 +910,10 @@ fn parse_events(bytes: &[u8], skip_first: bool, zh: bool) -> Vec<crate::guard::L
                 if reason.is_empty() { "" } else { " · " },
                 reason.chars().take(300).collect::<String>()
             ),
-            warning: matches!(event, "unconfirmed" | "blocked")
-                || (event == "submitted" && !reason.is_empty()),
+            warning: matches!(
+                event,
+                "unconfirmed" | "blocked" | "recheck_pending" | "observation_failed"
+            ) || (event == "submitted" && !reason.is_empty()),
         });
     }
     rows.reverse();
@@ -632,6 +930,8 @@ mod tests {
             turn_id: "turn".into(),
             label: "Test".into(),
             failed_at: 1000.,
+            observed_at: None,
+            native_verified_at: None,
         }
     }
     #[test]
@@ -735,8 +1035,8 @@ mod tests {
                 )
                 .unwrap();
             let history = rusqlite::Connection::open(root.join("thread_history_1.sqlite")).unwrap();
-            history.execute_batch("CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,error_json TEXT,completed_at REAL,rollout_ordinal INTEGER);").unwrap();
-            history.execute("INSERT INTO thread_turns VALUES('chat','turn','failed',?,?,1)",rusqlite::params![r#"{"codexErrorInfo":"serverOverloaded","message":"Selected model is at capacity. Please try a different model."}"#,now()]).unwrap();
+            history.execute_batch("CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,error_json TEXT,completed_at REAL,rollout_ordinal INTEGER,started_at REAL);").unwrap();
+            history.execute("INSERT INTO thread_turns(thread_id,turn_id,status,error_json,completed_at,rollout_ordinal) VALUES('chat','turn','failed',?,?,1)",rusqlite::params![r#"{"codexErrorInfo":"serverOverloaded","message":"Selected model is at capacity. Please try a different model."}"#,now()]).unwrap();
             Self {
                 paths: Paths {
                     app: root.clone(),
@@ -861,7 +1161,7 @@ mod tests {
         let mut journal = Journal {
             seen: (0..1024)
                 .map(|index| Attempt {
-                    key: format!("chat:{index}"),
+                    key: format!("chat-{index}:turn"),
                     failed_at: at,
                 })
                 .collect(),
@@ -873,16 +1173,185 @@ mod tests {
             ..sample()
         };
         assert!(journal.claim(&fixture.paths, &next).is_err());
-        assert_eq!(journal.seen.first().unwrap().key, "chat:0");
-        journal.seen[0].failed_at = at - MAX_AGE - 10.;
-        assert!(journal.claim(&fixture.paths, &next).unwrap());
+        assert_eq!(journal.seen.first().unwrap().key, "chat-0:turn");
+        let replacement = Failure {
+            thread_id: "chat-0".into(),
+            ..next.clone()
+        };
+        assert!(journal.claim(&fixture.paths, &replacement).unwrap());
         let restored = Journal::for_send(&fixture.paths).unwrap();
         assert_eq!(restored.seen.len(), 1024);
-        assert!(restored.seen.iter().any(|attempt| attempt.key == "chat:1"));
         assert!(restored
             .seen
             .iter()
-            .any(|attempt| attempt.key == next.key()));
+            .any(|attempt| attempt.key == "chat-1:turn"));
+        assert!(restored
+            .seen
+            .iter()
+            .any(|attempt| attempt.key == replacement.key()));
+    }
+    #[test]
+    fn live_capacity_error_older_than_fifteen_minutes_is_retried_once() {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let store = Store::new(&fixture.paths);
+        let history =
+            rusqlite::Connection::open(fixture.paths.home.join("thread_history_1.sqlite")).unwrap();
+        history
+            .execute("UPDATE thread_turns SET completed_at=?", [now() - 3600.])
+            .unwrap();
+        let mut failure = store.capacity_failure("chat").unwrap().unwrap();
+        assert!(!failure.fresh(now()));
+        observe_live(&mut failure, &json!("notLoaded"));
+        assert!(!failure.fresh(now()));
+        observe_live(&mut failure, &json!("systemError"));
+        assert!(failure.fresh(now()));
+        let native = json!({"thread":{"id":"chat","status":{"type":"systemError"}},"turns":[{"id":"turn","status":"failed","error":{"message":"Selected model is at capacity. Please try a different model."}}]});
+        let request = Request { failure, epoch: 0 };
+        assert!(check_native(&fixture.paths, &state, &request, Ok(native)).unwrap());
+        dispatch(&fixture.paths, &state, &store, &request, |_, _| Ok(())).unwrap();
+        let mut journal = Journal::for_send(&fixture.paths).unwrap();
+        let other = Failure {
+            thread_id: "other".into(),
+            failed_at: now(),
+            ..sample()
+        };
+        journal.claim(&fixture.paths, &other).unwrap();
+        assert!(
+            !Journal::for_send(&fixture.paths)
+                .unwrap()
+                .claim(&fixture.paths, &request.failure)
+                .unwrap(),
+            "An old live error remains deduplicated after other chats retry and after restart"
+        );
+    }
+    #[test]
+    fn native_recheck_rejects_changed_turns_and_defers_transport_failure_without_claiming() {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let store = Store::new(&fixture.paths);
+        let request = Request {
+            failure: store.capacity_failure("chat").unwrap().unwrap(),
+            epoch: 0,
+        };
+        let mut native = json!({"thread":{"id":"chat","status":{"type":"systemError"}},"turns":[{"id":"turn","status":"failed","error":{"message":"Selected model is at capacity. Please try a different model."}}]});
+        assert!(native_matches(&native, &request.failure));
+        native["thread"]["status"]["type"] = json!("active");
+        assert!(!native_matches(&native, &request.failure));
+        native["thread"]["status"]["type"] = json!("systemError");
+        native["turns"][0]["id"] = json!("new-turn");
+        assert!(!check_native(&fixture.paths, &state, &request, Ok(native)).unwrap());
+        assert!(check_native(
+            &fixture.paths,
+            &state,
+            &request,
+            Err(anyhow::anyhow!("connection closed"))
+        )
+        .is_err());
+        assert!(state.lock().unwrap().capacity_retry.retry_after[&request.failure.key()] > now());
+        assert!(!fixture.paths.runtime.join(JOURNAL).exists());
+    }
+    #[test]
+    fn latest_capacity_turn_uses_chronology_when_rollout_ordinals_restart() {
+        let fixture = Fixture::new();
+        let store = Store::new(&fixture.paths);
+        let history =
+            rusqlite::Connection::open(fixture.paths.home.join("thread_history_1.sqlite")).unwrap();
+        history
+            .execute(
+                "UPDATE thread_turns SET rollout_ordinal=9999,started_at=?",
+                [now() - 7200.],
+            )
+            .unwrap();
+        history.execute("INSERT INTO thread_turns(thread_id,turn_id,status,rollout_ordinal,started_at) VALUES('chat','new-current','inProgress',1,?)",[now()]).unwrap();
+        assert!(
+            store.capacity_failure("chat").unwrap().is_none(),
+            "Old high ordinals must not hide a newer active turn"
+        );
+    }
+    #[test]
+    fn missing_history_uses_a_cached_native_latest_turn_only_for_live_errors() {
+        let fixture = Fixture::new();
+        let mut fallback = NativeFallback::default();
+        let mut calls = 0;
+        let mut recent = crate::data::Recent {
+            capacity_unresolved: vec![("chat".into(), "Test".into())],
+            rows: vec![crate::data::Row {
+                id: "chat".into(),
+                updated_at: 1.,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let native = json!({"thread":{"id":"chat","status":{"type":"systemError"}},"turns":[{"id":"native-turn","status":"failed","completedAt":now()-3600.,"error":{"message":"Selected model is at capacity. Please try a different model."}}]});
+        fallback.resolve(&fixture.paths, &mut recent, true, |_| {
+            calls += 1;
+            Ok(native.clone())
+        });
+        assert_eq!(calls, 1);
+        assert!(recent.capacity_failures[0].fresh(now()));
+        assert_eq!(recent.rows[0].state, "Failed");
+        recent.capacity_failures.clear();
+        fallback.resolve(&fixture.paths, &mut recent, true, |_| {
+            calls += 1;
+            Ok(native.clone())
+        });
+        assert_eq!(
+            calls, 1,
+            "Stable error metadata must reuse the native result"
+        );
+        recent.rows[0].updated_at = 2.;
+        recent.capacity_failures.clear();
+        fallback.resolve(&fixture.paths, &mut recent, true, |_| {
+            calls += 1;
+            Ok(native.clone())
+        });
+        assert_eq!(calls, 2);
+        recent.capacity_unresolved.clear();
+        fallback.resolve(&fixture.paths, &mut recent, true, |_| {
+            panic!("Normal chats must not add native probes")
+        });
+        recent
+            .capacity_unresolved
+            .push(("chat".into(), "Test".into()));
+        fallback.resolve(&fixture.paths, &mut recent, false, |_| {
+            panic!("Disabled extension must not probe")
+        });
+    }
+    #[test]
+    fn native_verification_can_resume_a_live_error_without_a_local_turn_projection() {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let store = Store::new(&fixture.paths);
+        let history =
+            rusqlite::Connection::open(fixture.paths.home.join("thread_history_1.sqlite")).unwrap();
+        history.execute("DELETE FROM thread_turns", []).unwrap();
+        let native = json!({"thread":{"id":"chat","status":{"type":"systemError"}},"turns":[{"id":"native-only","status":"failed","completedAt":now()-3600.,"error":{"message":"Selected model is at capacity. Please try a different model."}}]});
+        let failure = native_failure(&native, "chat", "Test").unwrap();
+        let mut request = Request { failure, epoch: 0 };
+        assert!(check_native(&fixture.paths, &state, &request, Ok(native)).unwrap());
+        dispatch(&fixture.paths, &state, &store, &request, |_, _| {
+            panic!("An observation alone is not a send-time verification")
+        })
+        .unwrap();
+        request.failure.native_verified_at = Some(now() - 10.);
+        dispatch(&fixture.paths, &state, &store, &request, |_, _| {
+            panic!("Expired verification cannot send")
+        })
+        .unwrap();
+        assert!(state
+            .lock()
+            .unwrap()
+            .capacity_retry
+            .retry_after
+            .contains_key(&request.failure.key()));
+        request.failure.native_verified_at = Some(now());
+        dispatch(&fixture.paths, &state, &store, &request, |_, _| Ok(())).unwrap();
+        assert_eq!(state.lock().unwrap().capacity_retry.submitted, 1);
+        dispatch(&fixture.paths, &state, &store, &request, |_, _| {
+            panic!("Verified native retries still deduplicate")
+        })
+        .unwrap();
     }
     #[test]
     fn retry_totals_persist_and_dedup_does_not_increment_them() {

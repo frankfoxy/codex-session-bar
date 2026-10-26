@@ -260,6 +260,7 @@ fn run() -> Result<()> {
     if args.iter().any(|s| s == "--inspect") {
         return desktop::inspect(&paths);
     }
+    if args.iter().any(|s|s=="--inspect-capacity-retry") {return desktop::inspect_capacity(&paths);}
     if args.iter().any(|s| s == "--observe") {
         return host::inspect(&paths);
     }

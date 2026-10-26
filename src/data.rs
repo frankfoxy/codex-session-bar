@@ -159,6 +159,10 @@ pub struct Recent {
     pub capacity_failures: Vec<crate::capacity_retry::Failure>,
     #[serde(skip)]
     pub capacity_available: bool,
+    #[serde(skip)]
+    pub capacity_unresolved: Vec<(String,String)>,
+    #[serde(skip)]
+    pub capacity_error: String,
     #[serde(default)]
     pub all_rows: Vec<Row>,
     #[serde(default)]
@@ -583,13 +587,17 @@ impl Store {
         anyhow::ensure!(visible>0,"No local chat messages available");
         Ok(output)
     }
+    pub fn capacity_target_exists(&self,id:&str)->Result<bool> {
+        let db=self.db("state_5.sqlite")?;
+        Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM threads WHERE id=? AND archived=0 AND agent_path IS NULL)",[id],|row|row.get(0))?)
+    }
     pub fn capacity_failure(&self,id:&str)->Result<Option<crate::capacity_retry::Failure>> {
         let state=self.db("state_5.sqlite")?;
         let row=state.query_row("SELECT COALESCE(NULLIF(name,''),title),rollout_path FROM threads WHERE id=? AND archived=0 AND agent_path IS NULL",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?;
         let Some((label,path))=row.filter(|(_,path)|std::path::Path::new(path).is_file()) else{return Ok(None);};
         let _=path;
         let history=self.db("thread_history_1.sqlite")?;
-        let latest=history.query_row("SELECT turn_id,status,CASE WHEN length(CAST(error_json AS BLOB))<=8192 THEN error_json ELSE NULL END,completed_at FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<f64>>(3)?))).optional()?;
+        let latest=history.query_row("SELECT turn_id,status,CASE WHEN length(CAST(error_json AS BLOB))<=8192 THEN error_json ELSE NULL END,completed_at FROM thread_turns WHERE thread_id=? ORDER BY COALESCE(started_at,completed_at,0) DESC,rollout_ordinal DESC LIMIT 1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<f64>>(3)?))).optional()?;
         Ok(latest.and_then(|(turn,status,error,at)|crate::capacity_retry::failure(id,&label,&turn,&status,error.as_deref(),at)))
     }
     pub fn read(&mut self, id: &str) -> Result<Snapshot> {
@@ -797,8 +805,9 @@ impl Store {
             crate::body::local_ids(&self.paths, rows.iter().map(|r| r.id.clone()).collect())?;
         rows.retain(|row| local.contains(&row.id));
         let mut turns = history.prepare("SELECT status FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1")?;
-        let mut capacity_turns=history.prepare("SELECT turn_id,status,CASE WHEN length(CAST(error_json AS BLOB))<=8192 THEN error_json ELSE NULL END,completed_at FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1").ok();
+        let mut capacity_turns=history.prepare("SELECT turn_id,status,CASE WHEN length(CAST(error_json AS BLOB))<=8192 THEN error_json ELSE NULL END,completed_at FROM thread_turns WHERE thread_id=? ORDER BY COALESCE(started_at,completed_at,0) DESC,rollout_ordinal DESC LIMIT 1").ok();
         let mut capacity_failures=Vec::new();
+        let mut capacity_unresolved=Vec::new();
         let capacity_available=capacity_turns.is_some();
         let mut durations = history.prepare("SELECT SUM(CASE WHEN started_at IS NOT NULL AND completed_at >= started_at THEN completed_at-started_at END) FROM thread_turns WHERE thread_id=?")?;
         for row in &mut rows {
@@ -836,11 +845,19 @@ impl Store {
                 },
             };
             row.state = state.into();
-            if state=="Failed" {
+            if state=="Failed" || crate::capacity_retry::live_error(&entry["status"]) {
+                let before=capacity_failures.len();
                 if let Some(query)=capacity_turns.as_mut() {
                     if let Ok(Some((turn,status,error,at)))=query.query_row([&row.id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<f64>>(3)?))).optional() {
-                        if let Some(failure)=crate::capacity_retry::failure(&row.id,&row.label,&turn,&status,error.as_deref(),at) {capacity_failures.push(failure);}
+                        if let Some(mut failure)=crate::capacity_retry::failure(&row.id,&row.label,&turn,&status,error.as_deref(),at) {
+                            crate::capacity_retry::observe_live(&mut failure,&entry["status"]);
+                            if failure.observed_at.is_some(){row.state="Failed".into();}
+                            capacity_failures.push(failure);
+                        }
                     }
+                }
+                if crate::capacity_retry::live_error(&entry["status"]) && capacity_failures.len()==before {
+                    capacity_unresolved.push((row.id.clone(),row.label.clone()));
                 }
             }
             row.is_unread = entry["isUnread"].as_bool();
@@ -867,6 +884,8 @@ impl Store {
         Ok(Recent {
             capacity_failures,
             capacity_available,
+            capacity_unresolved,
+            capacity_error:String::new(),
             all_rows,
             rows,
             busy_count: Some(busy_metrics.len()),
@@ -1235,6 +1254,13 @@ mod tests {
         restored.carry_read_state(&cached);
         assert_eq!(restored.rows[0].is_unread, Some(false));
         assert_eq!(restored.new_result_count(), 0);
+        history.execute_batch("ALTER TABLE thread_turns ADD COLUMN turn_id TEXT; ALTER TABLE thread_turns ADD COLUMN error_json TEXT;").unwrap();
+        db.execute("UPDATE threads SET rollout_path=? WHERE id='chat-0'",[rollout.to_str().unwrap()]).unwrap();
+        history.execute("INSERT INTO thread_turns(thread_id,status,rollout_ordinal,started_at,completed_at,turn_id,error_json) VALUES('chat-0','failed',0,?,?,?,?)",rusqlite::params![now()-7200.,now()-3600.,"live-capacity",r#"{"codexErrorInfo":"serverOverloaded"}"#]).unwrap();
+        let live=store.recent(&serde_json::json!({"threads":[{"kind":"codex","hostId":"local","id":"chat-0","status":"systemError"}]})).unwrap();
+        let failure=live.capacity_failures.iter().find(|failure|failure.thread_id=="chat-0").expect("Live error must survive history ordinal resets and an old failure timestamp");
+        assert_eq!(failure.turn_id,"live-capacity");assert!(failure.observed_at.is_some());assert!(failure.fresh(now()));
+        assert_eq!(live.rows.iter().find(|row|row.id=="chat-0").unwrap().state,"Failed");
     }
 
     #[test]
