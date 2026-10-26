@@ -20,6 +20,7 @@ pub fn translate(text:&str,zh:bool)->Cow<'_,str>{
         "Settings"=>"设置","Refresh settings"=>"刷新设置","Recent chats"=>"最近会话","Session details"=>"会话详情",
         "Check for updates"=>"检查更新","Checking…"=>"正在检查…",
         "Reset announcements"=>"官方重置预告",
+        "Reset announcement checks are disabled"=>"重置预告检查已关闭",
         "Follow published Codex reset announcements · selected source only"=>"跟踪公开的 Codex 重置公告 · 只检查选中的来源",
         "Announcement check interval · 1–60 minutes · changes apply immediately"=>"公告检查间隔 · 1–60 分钟 · 修改后立即生效",
         "Check GitHub for updates now · ask before downloading"=>"立即检查 GitHub 更新 · 下载前会询问确认",

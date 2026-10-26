@@ -50,7 +50,7 @@ const MODEL: u32 = 0xffdc91;
 const GREEN: u32 = 0x65d69b;
 const NEW_RESULT: u32 = 0x70b7ff;
 const DETAILS_HEIGHT: i32 = 310;
-const PREFERENCES_HEIGHT: i32 = 540;
+const PREFERENCES_HEIGHT: i32 = 570;
 const RECENT_ROW: i32 = 48;
 const LAYOUT_CACHE_LIMIT: usize = 256;
 const RECENT_TOP: i32 = 48;
@@ -533,8 +533,7 @@ impl Painter {
         for column in [4.,8.,12.] {self.line(x+column,y+7.,x+column,y+12.,rgb,1.1);}
         self.line(x+2.,y+14.,x+14.,y+14.,rgb,1.1);self.line(x,y+16.,x+16.,y+16.,rgb,1.1);
     }
-    unsafe fn notice_bell(&self,x:f32,y:f32,active:bool) {
-        let color=if active {ORANGE}else{MUTED};
+    unsafe fn notice_bell(&self,x:f32,y:f32,color:u32) {
         let points=[(3.,16.),(5.,13.),(5.,8.),(6.,5.),(8.,3.),(11.,2.),(14.,3.),(16.,5.),(17.,8.),(17.,13.),(19.,16.),(3.,16.)];
         for pair in points.windows(2){self.line(x+pair[0].0,y+pair[0].1,x+pair[1].0,y+pair[1].1,color,1.25);}
         self.line(x+11.,y,x+11.,y+2.,color,1.25);
@@ -548,7 +547,7 @@ impl Painter {
         };
         match hit {
             Hit::ResetNotice(_) => {
-                self.notice_bell(x,y,true);
+                self.notice_bell(x,y,ORANGE);
             }
             Hit::GuardLogs => {
                 self.border(rect(x + 4., y + 2., 15., 19.), c, 2.);
@@ -691,6 +690,7 @@ struct App {
     guard_limits: guard::Limits,
     update_control: Option<crate::update::Control>,
     notice_control: Option<crate::reset_notice::Control>,
+    notice_alert_due: Instant,
     guard_events: Vec<guard::LogEntry>,
     guard_log_error: String,
     rows: Vec<Row>,
@@ -959,6 +959,7 @@ impl App {
             guard_limits: guard::Limits::default(),
             update_control: None,
             notice_control: None,
+            notice_alert_due:Instant::now(),
             guard_events: Vec::new(),
             guard_log_error: String::new(),
             popup_layout: None,
@@ -1407,13 +1408,13 @@ impl App {
                     }
                 }
                 if self.settings.reset_notice.enabled {
-                    let notice=live.reset_notice.active(now()).filter(|notice|notice.at>now());
-                    let text=notice.map(|notice|notice.short(now(),crate::locale::chinese())).unwrap_or_default();
-                    let w=if notice.is_some(){p.width(&text,11.)+30.}else{24.};
-                    if notice.is_some(){p.fill(rect(x-3.,5.,w+4.,24.),0x44321f,5.);}
+                    let (bell,text)=live.reset_notice.badge(now(),crate::locale::chinese());
+                    let color=match bell {crate::reset_notice::Bell::Upcoming=>ORANGE,crate::reset_notice::Bell::Reset=>GREEN,_=>MUTED};
+                    let w=if !text.is_empty(){p.width(&text,11.)+30.}else{24.};
+                    if bell!=crate::reset_notice::Bell::Neutral {p.fill(rect(x-3.,5.,w+4.,24.),if bell==crate::reset_notice::Bell::Reset {0x254136}else{0x44321f},5.);}
                     area(Hit::ResetNotice(live.reset_notice.tooltip(now(),crate::locale::chinese())),rect(x-3.,2.,w+4.,30.));
-                    p.notice_bell(x,6.,notice.is_some());
-                    if notice.is_some(){p.label(&text,rect(x+25.,2.,w-25.,30.),11.,ORANGE,false);}
+                    p.notice_bell(x,6.,color);
+                    if !text.is_empty(){p.label(&text,rect(x+25.,2.,w-25.,30.),11.,color,false);}
                     x+=w+9.;
                 }
                 area(Hit::Details, rect(x, 3., 25., 28.));
@@ -1982,6 +1983,10 @@ impl App {
                     if delta>0 {p.line(left+13.5,508.5,left+13.5,517.5,MUTED,1.3);}
                 }
                 p.label(&format!("{} min",self.settings.reset_notice.check_minutes),rect(width-117.,500.,67.,27.),11.,TEXT,false);
+                let check=if self.settings.reset_notice.enabled {live.reset_notice.check_status(crate::locale::chinese())}
+                    else {crate::locale::text("Reset announcement checks are disabled").into_owned()};
+                p.label(&check,rect(20.,534.,width-40.,23.),10.,if live.reset_notice.error.is_empty(){MUTED}else{ORANGE},false);
+                area(Hit::Info(format!("{}\n{}",live.reset_notice.tooltip(now(),crate::locale::chinese()),self.paths.runtime.join("reset-notice-checks.jsonl").display())),rect(18.,532.,width-36.,27.));
             }
         }
         if kind==Some(Popup::Fixed){self.draw_chat_menu(&mut hits);}
@@ -2185,8 +2190,8 @@ impl App {
             }
         }
         if self.settings.reset_notice.enabled {
-            width+=live.reset_notice.active(now()).filter(|notice|notice.at>now())
-                .map(|notice|p.width(&notice.short(now(),crate::locale::chinese()),11.)+39.).unwrap_or(33.);
+            let (_,text)=live.reset_notice.badge(now(),crate::locale::chinese());
+            width+=if text.is_empty(){33.}else{p.width(&text,11.)+39.};
         }
         if let Some(s) = self.current(&live) {
             let model = s.execution.short();
@@ -2202,6 +2207,7 @@ impl App {
     }
     unsafe fn tick(&mut self) {
         self.finish_chat_copy();
+        self.check_reset_reminders();
         let language=crate::locale::status().0;
         if language!=self.ui_language {
             self.ui_language=language;self.painter.release_layouts();self.tips.clear();
@@ -2432,6 +2438,22 @@ impl App {
         let tip = wide("Codex Session Bar · Rust");
         data.szTip[..tip.len()].copy_from_slice(&tip);
         let _ = Shell_NotifyIconW(if add { NIM_ADD } else { NIM_DELETE }, &data);
+    }
+    unsafe fn check_reset_reminders(&mut self) {
+        if self.testing || !self.settings.reset_notice.enabled || Instant::now()<self.notice_alert_due {return;}
+        let Some(control)=self.notice_control.clone() else {return;};
+        let Some(alert)=control.next_reminder() else {return;};
+        if alert.source!=self.settings.reset_notice.source {control.acknowledge(alert.key,false);return;}
+        let (title,body)=alert.text(crate::locale::chinese());
+        let mut data=NOTIFYICONDATAW{cbSize:size_of::<NOTIFYICONDATAW>() as u32,hWnd:self.bar,uID:1,
+            uFlags:NIF_INFO,dwInfoFlags:NIIF_INFO|NIIF_NOSOUND,..Default::default()};
+        for (target,text) in [(&mut data.szInfoTitle[..],title.as_str()),(&mut data.szInfo[..],body.as_str())] {
+            let limit=target.len()-1;
+            for (index,unit) in text.encode_utf16().take(limit).enumerate(){target[index]=unit;}
+        }
+        let delivered=Shell_NotifyIconW(NIM_MODIFY,&data).as_bool();
+        control.acknowledge(alert.key,delivered);
+        self.notice_alert_due=Instant::now()+std::time::Duration::from_secs(20);
     }
     unsafe fn open_icon_panel(&mut self) -> Result<()> {
         let row_height = if self.popup_kind == Some(Popup::Recent) { self.recent_row_height() as f32 } else { 40. };
@@ -3967,7 +3989,7 @@ unsafe extern "system" fn wndproc(
             }
             TRAY_MESSAGE => {
                 let event = (lparam.0 & 0xffff) as u32;
-                if event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK {
+                if event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK || event == NIN_BALLOONUSERCLICK {
                     app.hidden = false;
                     app.tick();
                 } else if event == WM_RBUTTONUP {
@@ -4579,11 +4601,16 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         app.hover=None;
         let notice_before=fixture_notice.current.as_ref().unwrap().at;
         assert!(fixture_notice.current.as_ref().unwrap().short(notice_before+1.,true).contains("待确认"));
-        Arc::make_mut(&mut state.lock().unwrap().reset_notice).current.as_mut().unwrap().completed=true;
+        {
+            let mut shared=state.lock().unwrap();let notice=Arc::make_mut(&mut shared.reset_notice);
+            let mut completed=notice.current.take().unwrap();completed.completed=true;completed.at=now()-120.;
+            completed.posts[0].observed=true;notice.history.insert(0,completed);
+        }
         let completed_notice_hits=capture(&app,None,app.measure_bar() as u32,34,&paths.runtime.join("rust-reset-notice-completed-verification.png"))?;
-        let gray=completed_notice_hits.iter().find(|area|matches!(area.hit,Hit::ResetNotice(_))).expect("No future forecast keeps a gray clickable bell");
-        assert!(gray.r.right-gray.r.left<35. && app.measure_bar()<notice_width as i32);
-        Arc::make_mut(&mut state.lock().unwrap().reset_notice).current.as_mut().unwrap().completed=false;
+        let green=completed_notice_hits.iter().find(|area|matches!(area.hit,Hit::ResetNotice(_))).expect("Recent confirmed reset must remain visible");
+        assert!(green.r.right-green.r.left>35.);
+        assert_eq!(app.snapshot().reset_notice.badge(now(),true).0,crate::reset_notice::Bell::Reset);
+        state.lock().unwrap().reset_notice=Arc::new(fixture_notice.clone());
         Arc::make_mut(&mut state.lock().unwrap().reset_notice).current.as_mut().unwrap().at=now()-1.;
         let expired_notice_hits=capture(&app,None,app.measure_bar() as u32,34,&paths.runtime.join("rust-reset-notice-expired-verification.png"))?;
         let expired=expired_notice_hits.iter().find(|area|matches!(area.hit,Hit::ResetNotice(_))).unwrap();
@@ -4952,6 +4979,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert!(preferences_hits.iter().any(|a|a.hit==Hit::ResetNoticeEnabled));
         assert_eq!(SendMessageW(app.combo,CB_GETCOUNT,WPARAM(0),LPARAM(0)).0,2);
         let saved_notice_config=app.settings.reset_notice.clone();
+        SendMessageW(app.combo,CB_SETCURSEL,WPARAM(0),LPARAM(0));app.change_notice_source();
+        assert_eq!(app.settings.reset_notice.source,crate::reset_notice::Source::Divin);
         SendMessageW(app.combo,CB_SETCURSEL,WPARAM(1),LPARAM(0));app.change_notice_source();
         assert_eq!(app.settings.reset_notice.source,crate::reset_notice::Source::CodexResets);
         assert_eq!(app.snapshot().reset_notice.source,crate::reset_notice::Source::CodexResets);
@@ -4968,7 +4997,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         app.hit(Hit::RefreshBack);
         assert_ne!(GetWindowLongPtrW(app.combo,GWL_STYLE)&WS_VISIBLE.0 as isize,0);
         app.set_reset_notice(saved_notice_config)?;
-        SendMessageW(app.combo,CB_SETCURSEL,WPARAM(0),LPARAM(0));
+        SendMessageW(app.combo,CB_SETCURSEL,WPARAM(usize::from(app.settings.reset_notice.source==crate::reset_notice::Source::CodexResets)),LPARAM(0));
         let update_button=preferences_hits.iter().find(|a|a.hit==Hit::CheckUpdate).expect("Manual update check must be visible in settings");
         assert!(update_button.contains(95.,57.));
         let previous_update=state.lock().unwrap().updater.clone();

@@ -1,6 +1,8 @@
 //! Public announcement tracking. Aggregator deadlines are not account reset timers.
+mod reminder;
 use crate::{now, read_json, Paths, State, Stop};
 use anyhow::{ensure, Context, Result};
+pub use reminder::Reminder;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -18,14 +20,22 @@ const LOCALE_API: &str = "https://codex-resets.com/api/resets?locale=zh-CN";
 const MAX_RESPONSE: u64 = 1024 * 1024;
 const STALE_AFTER: f64 = 6. * 3600.;
 const PENDING_AFTER: f64 = 3600.;
+const BELL_WINDOW: f64 = 3. * 3600.;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bell {
+    Neutral,
+    Upcoming,
+    Reset,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
-    CodexResets,
+    Divin,
     #[default]
     #[serde(other)]
-    Divin,
+    CodexResets,
 }
 impl Source {
     pub fn label(&self) -> &'static str {
@@ -58,7 +68,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: true,
-            source: Source::Divin,
+            source: Source::CodexResets,
             check_minutes: 5,
         }
     }
@@ -155,11 +165,79 @@ impl Notice {
 pub struct View {
     pub source: Source,
     pub checked_at: f64,
+    pub attempted_at: f64,
+    pub next_check_at: f64,
     pub error: String,
     pub current: Option<Notice>,
     pub history: Vec<Notice>,
 }
 impl View {
+    pub fn badge(&self, at: f64, zh: bool) -> (Bell, String) {
+        if let Some(notice) = self.active(at).filter(|notice| notice.at > at) {
+            return (
+                if notice.at - at <= BELL_WINDOW {
+                    Bell::Upcoming
+                } else {
+                    Bell::Neutral
+                },
+                notice.short(at, zh),
+            );
+        }
+        if self.checked_at > 0. && (0.0..=STALE_AFTER).contains(&(at - self.checked_at)) {
+            if let Some(notice) = self
+                .history
+                .iter()
+                .filter(|notice| {
+                    notice.completed
+                        && notice.at > 0.
+                        && (0.0..=BELL_WINDOW).contains(&(at - notice.at))
+                        && date(notice.at, "%Y-%m-%d") == date(at, "%Y-%m-%d")
+                })
+                .max_by(|a, b| a.at.total_cmp(&b.at))
+            {
+                let observed = notice.posts.first().is_some_and(|post| post.observed);
+                let label = match (observed, zh) {
+                    (true, true) => "已观测",
+                    (false, true) => "已复位",
+                    (true, false) => "Observed",
+                    (false, false) => "Reset",
+                };
+                return (Bell::Reset, format!("{label} {}", date(notice.at, "%H:%M")));
+            }
+        }
+        (Bell::Neutral, String::new())
+    }
+    pub fn check_status(&self, zh: bool) -> String {
+        let checked = date(self.checked_at, "%m-%d %H:%M");
+        let next = date(self.next_check_at, "%H:%M");
+        if self.checked_at <= 0. {
+            if !self.error.is_empty() {
+                return if zh {
+                    "首次检查失败"
+                } else {
+                    "First check failed"
+                }
+                .into();
+            }
+            return if zh {
+                "等待首次检查"
+            } else {
+                "Waiting for first check"
+            }
+            .into();
+        }
+        if self.error.is_empty() {
+            if zh {
+                format!("上次成功：{checked} · 下次：{next}")
+            } else {
+                format!("Last success: {checked} · Next: {next}")
+            }
+        } else if zh {
+            format!("检查异常 · 上次成功：{checked}")
+        } else {
+            format!("Check failed · Last success: {checked}")
+        }
+    }
     pub fn active(&self, at: f64) -> Option<&Notice> {
         if !at.is_finite()
             || !self.checked_at.is_finite()
@@ -188,6 +266,16 @@ impl View {
         } else {
             "\nThird-party announcement tracker; separate from your account reset timer."
         });
+        text.push_str(&format!("\n{}", self.check_status(zh)));
+        text.push_str(if zh {"\n铃铛：预告前 3 小时橙色；来源确认后当天 3 小时内绿色；其余灰色。"}
+            else {"\nBell: orange within 3 hours before; green for 3 hours after a reported reset on the same day; otherwise gray."});
+        if !self.error.is_empty() {
+            text.push_str(&format!(
+                "\n{}: {}",
+                if zh { "刷新提示" } else { "Refresh note" },
+                clip(&self.error, 180)
+            ));
+        }
         if self.checked_at > 0. && at - self.checked_at > STALE_AFTER {
             text.push_str(if zh {"\n缓存已超过 6 小时未成功刷新；灰铃仅供回看，不显示有效倒计时。"}
                 else {"\nCache is over 6 hours old; the gray bell keeps history only, with no active countdown."});
@@ -224,9 +312,9 @@ impl View {
             ));
             if current.at <= at {
                 text.push_str(if zh {
-                    "\n预告时间已到，等待来源确认；不表示已经重置。灰铃不显示倒计时。"
+                    "\n预告时间已到，等待来源确认；不表示已经重置，不再显示预告倒计时。"
                 } else {
-                    "\nAnnounced time has passed; awaiting confirmation, not proof of completion. Gray bell; no countdown."
+                    "\nAnnounced time has passed; awaiting confirmation, not proof of completion. No forecast countdown."
                 });
             }
             if !current.expression.is_empty() {
@@ -494,7 +582,11 @@ pub(crate) fn parse_divin(bytes: &[u8], at: f64) -> Result<View> {
         };
         let notice = Notice {
             id: string(event, "id"),
-            at: timestamp(&forecast["at"]).unwrap_or(0.),
+            at: if event["stage"] == "completed" || !event["completedAt"].is_null() {
+                timestamp(&event["completedAt"]).unwrap_or(0.)
+            } else {
+                timestamp(&forecast["at"]).unwrap_or(0.)
+            },
             announced_at: timestamp(&event["announcedAt"])
                 .or_else(|| timestamp(&event["updatedAt"]))
                 .unwrap_or(0.),
@@ -523,6 +615,7 @@ pub(crate) fn parse_divin(bytes: &[u8], at: f64) -> Result<View> {
         error: String::new(),
         history: keep_recent(history, current.as_ref()),
         current,
+        ..Default::default()
     })
 }
 fn codex_bound(text: &str) -> Bound {
@@ -569,8 +662,11 @@ fn enrich_codex(view: &mut View, bytes: &[u8]) -> Result<()> {
             }
             let text = string(event, "text");
             let announced_at = timestamp(&event["announced_at"]).unwrap_or(0.);
+            // Prefer the localized copy of an item already supplied by v1/status.
+            let id = string(event, "tweet_id");
+            history.retain(|notice| notice.id != id);
             history.push(Notice {
-                id: string(event, "tweet_id"),
+                id,
                 at: announced_at,
                 announced_at,
                 bound: Bound::At,
@@ -614,6 +710,46 @@ pub(crate) fn parse_codex(status_bytes: &[u8], localized_bytes: &[u8], at: f64) 
         checked_at: at,
         ..Default::default()
     };
+    // Completion is available on the primary API even if translations/history
+    // are temporarily unavailable. It is distinct from a future forecast.
+    let latest = &value["data"]["latest_reset"];
+    let observed = latest["source"]["type"] == "observed";
+    let latest_url = string(&latest["source"], "url");
+    let official = latest["source"]["type"] == "x_post"
+        && latest["source"]["author"] == "thsottiaux"
+        && trusted(&latest_url);
+    if latest["reset_type"] == "regular" && (observed || official) {
+        if let Some(time) = timestamp(&latest["announced_at"]) {
+            let id = string(latest, "id");
+            let original = string(latest, "text");
+            if !id.is_empty() && !original.is_empty() {
+                view.history.push(Notice {
+                    id,
+                    at: time,
+                    announced_at: time,
+                    completed: true,
+                    summary: original.clone(),
+                    posts: vec![Post {
+                        author: if observed {
+                            "Codex Resets"
+                        } else {
+                            "Tibo (@thsottiaux)"
+                        }
+                        .into(),
+                        original,
+                        url: if trusted(&latest_url) {
+                            latest_url
+                        } else {
+                            String::new()
+                        },
+                        observed,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                });
+            }
+        }
+    }
     if scheduled["status"] == "scheduled"
         && scheduled["reset_type"] == "regular"
         && scheduled["source"]["type"] == "x_post"
@@ -763,6 +899,7 @@ fn publish(paths: &Paths, state: &State, view: &View) {
 }
 enum Command {
     Configure(Settings),
+    Acknowledged(String, bool),
     Stop,
 }
 #[derive(Clone)]
@@ -770,6 +907,7 @@ pub struct Control {
     tx: mpsc::Sender<Command>,
     settings: Arc<Mutex<Settings>>,
     state: State,
+    alerts: Arc<Mutex<mpsc::Receiver<Reminder>>>,
 }
 impl Control {
     pub fn configure(&self, mut settings: Settings) -> bool {
@@ -778,6 +916,7 @@ impl Control {
         let clear = current.source != settings.source || !settings.enabled;
         *current = settings.clone();
         if clear {
+            while self.alerts.lock().unwrap().try_recv().is_ok() {}
             self.state.lock().unwrap().reset_notice = Arc::new(View {
                 source: settings.source,
                 ..Default::default()
@@ -785,6 +924,22 @@ impl Control {
         }
         self.tx.send(Command::Configure(settings)).is_ok()
     }
+    pub fn next_reminder(&self) -> Option<Reminder> {
+        self.alerts.lock().unwrap().try_recv().ok()
+    }
+    pub fn acknowledge(&self, key: String, delivered: bool) {
+        let _ = self.tx.send(Command::Acknowledged(key, delivered));
+    }
+}
+fn acknowledge(paths: &Paths, tracker: &mut reminder::Tracker, key: &str, delivered: bool) {
+    tracker.acknowledge(key, delivered);
+    if delivered {
+        tracker.save(paths);
+    }
+    reminder::log(
+        paths,
+        json!({"event":"notification","at":now(),"key":key,"submitted_to_windows":delivered}),
+    );
 }
 pub struct Service {
     control: Control,
@@ -805,18 +960,22 @@ impl Service {
                 ..Default::default()
             };
         }
+        initial.next_check_at = if settings.enabled { now() + 5. } else { 0. };
         state.lock().unwrap().reset_notice = Arc::new(initial.clone());
         let (tx, rx) = mpsc::channel();
+        let (alert_tx, alert_rx) = mpsc::channel();
         let requested = Arc::new(Mutex::new(settings.clone()));
         let control = Control {
             tx,
             settings: requested.clone(),
             state: state.clone(),
+            alerts: Arc::new(Mutex::new(alert_rx)),
         };
         let (paths, state, stop) = (paths.clone(), state.clone(), stop.clone());
         let handle = thread::spawn(move || {
             let mut view = initial;
             let mut etags = HashMap::new();
+            let mut reminders = reminder::Tracker::load(&paths);
             let mut next = Instant::now() + Duration::from_secs(5);
             loop {
                 if stop.load(Ordering::Relaxed) {
@@ -829,11 +988,17 @@ impl Service {
                 };
                 match command {
                     Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Ok(Command::Acknowledged(key, delivered)) => {
+                        acknowledge(&paths, &mut reminders, &key, delivered)
+                    }
                     Ok(Command::Configure(mut updated)) => {
                         while let Ok(command) = rx.try_recv() {
                             match command {
                                 Command::Stop => return,
                                 Command::Configure(value) => updated = value,
+                                Command::Acknowledged(key, delivered) => {
+                                    acknowledge(&paths, &mut reminders, &key, delivered)
+                                }
                             }
                         }
                         updated.clamp();
@@ -841,6 +1006,7 @@ impl Service {
                             || updated.enabled != settings.enabled;
                         settings = updated;
                         if restart {
+                            reminders.reset_pending();
                             view = View {
                                 source: settings.source,
                                 ..Default::default()
@@ -854,8 +1020,19 @@ impl Service {
                             } else {
                                 Duration::from_secs(settings.check_minutes * 60)
                             };
+                        view.next_check_at = if settings.enabled {
+                            now() + next.saturating_duration_since(Instant::now()).as_secs_f64()
+                        } else {
+                            0.
+                        };
+                        publish(&paths, &state, &view);
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let attempted = now();
+                        reminder::log(
+                            &paths,
+                            json!({"event":"check_started","at":attempted,"pid":std::process::id(),"source":settings.source,"api":settings.source.api(),"interval_minutes":settings.check_minutes}),
+                        );
                         let result = fetch(
                             settings.source,
                             &view,
@@ -865,10 +1042,15 @@ impl Service {
                             now(),
                         );
                         if stop.load(Ordering::Relaxed) {
+                            reminder::log(
+                                &paths,
+                                json!({"event":"check_cancelled","at":now(),"started_at":attempted,"source":settings.source,"reason":"shutdown"}),
+                            );
                             break;
                         }
-                        let wanted = requested.lock().unwrap().clone();
+                        let wanted = requested.lock().unwrap();
                         if wanted.enabled && wanted.source == settings.source {
+                            let success = result.is_ok();
                             match result {
                                 Ok(fetched) => view = fetched,
                                 Err(error) => {
@@ -876,7 +1058,29 @@ impl Service {
                                     view.error = format!("{error:#}");
                                 }
                             }
+                            view.attempted_at = attempted;
+                            view.next_check_at = now() + (settings.check_minutes * 60) as f64;
+                            if success {
+                                for alert in reminders.collect(&view, now()) {
+                                    let key = alert.key.clone();
+                                    reminder::log(
+                                        &paths,
+                                        json!({"event":"notification_queued","at":now(),"source":alert.source,"key":key,"notice_at":alert.notice.at,"completed":alert.notice.completed}),
+                                    );
+                                    if alert_tx.send(alert).is_err() {
+                                        reminders.acknowledge(&key, false);
+                                    }
+                                }
+                            }
                             publish(&paths, &state, &view);
+                            drop(wanted);
+                            reminder::check_log(&paths, &view, settings.source, success);
+                        } else {
+                            drop(wanted);
+                            reminder::log(
+                                &paths,
+                                json!({"event":"check_cancelled","at":now(),"started_at":attempted,"source":settings.source,"reason":"source changed or disabled"}),
+                            );
                         }
                         next = Instant::now() + Duration::from_secs(settings.check_minutes * 60);
                     }
@@ -911,7 +1115,7 @@ pub fn inspect(_paths: &Paths, source: Source) -> Result<()> {
     )?;
     println!(
         "{}",
-        json!({"source":source.label(),"api":source.api(),"explicit_reset_at":view.current.as_ref().map(|notice|notice.at),"bound":view.current.as_ref().map(|notice|notice.bound),"post_count":view.current.as_ref().map(|notice|notice.posts.len()).unwrap_or(0),"translation_available":view.current.as_ref().is_some_and(|notice|notice.posts.iter().any(|post|!post.translation.is_empty())),"history_count":view.history.len(),"error":view.error})
+        json!({"source":source.label(),"api":source.api(),"explicit_reset_at":view.current.as_ref().map(|notice|notice.at),"bound":view.current.as_ref().map(|notice|notice.bound),"post_count":view.current.as_ref().map(|notice|notice.posts.len()).unwrap_or(0),"translation_available":view.current.as_ref().is_some_and(|notice|notice.posts.iter().any(|post|!post.translation.is_empty())),"history_count":view.history.len(),"latest_completed_at":view.history.iter().filter(|notice|notice.completed).map(|notice|notice.at).max_by(f64::total_cmp),"bell":format!("{:?}",view.badge(now(),true).0),"error":view.error})
     );
     Ok(())
 }
@@ -919,6 +1123,89 @@ pub fn inspect(_paths: &Paths, source: Source) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bell_windows_require_confirmation_and_the_same_local_day() {
+        use chrono::TimeZone;
+        let noon = chrono::Local
+            .with_ymd_and_hms(2026, 10, 26, 12, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp() as f64;
+        let mut view = View {
+            checked_at: noon,
+            current: Some(Notice {
+                id: "next".into(),
+                at: noon + 3. * 3600.,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(view.badge(noon, true).0, Bell::Upcoming);
+        view.current.as_mut().unwrap().at += 1.;
+        assert_eq!(view.badge(noon, true).0, Bell::Neutral);
+        view.current.as_mut().unwrap().at = noon - 1.;
+        assert_eq!(
+            view.badge(noon, true).0,
+            Bell::Neutral,
+            "Passing a forecast alone cannot turn the bell green"
+        );
+        view.current = None;
+        view.history.push(Notice {
+            id: "confirmed".into(),
+            at: noon - 3. * 3600.,
+            completed: true,
+            ..Default::default()
+        });
+        assert_eq!(view.badge(noon, true).0, Bell::Reset);
+        view.history[0].at -= 1.;
+        assert_eq!(view.badge(noon, true).0, Bell::Neutral);
+        let midnight = chrono::Local
+            .with_ymd_and_hms(2026, 10, 26, 0, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp() as f64;
+        view.checked_at = midnight;
+        view.history[0].at = midnight - 3600.;
+        assert_eq!(
+            view.badge(midnight, true).0,
+            Bell::Neutral,
+            "A reset yesterday must not remain green today"
+        );
+    }
+    #[test]
+    fn status_only_completion_drives_bell_and_reminder_without_localized_api() {
+        let bytes=br#"{"data":{"scheduled_reset":null,"latest_reset":{"id":"observed-123","reset_type":"regular","announced_at":"2026-10-26T07:00:00Z","text":"Usage limits reset","source":{"type":"observed"}}}}"#;
+        let at = timestamp(&json!("2026-10-26T08:00:00Z")).unwrap();
+        let view = parse_codex(bytes, &[], at).unwrap();
+        assert!(view.current.is_none());
+        assert_eq!(view.history.len(), 1);
+        assert!(view.history[0].completed && view.history[0].posts[0].observed);
+        assert_eq!(view.badge(at, true).0, Bell::Reset);
+        assert_eq!(reminder::Tracker::default().collect(&view, at).len(), 1);
+        let mut localized = json!({"events":[{"tweet_id":"observed-123","reset_type":"regular","source":"observed","announced_at":"2026-10-26T07:00:00Z","text":"Usage limits reset","display_text":"已观测到复位"}]});
+        let enriched = parse_codex(bytes, &serde_json::to_vec(&localized).unwrap(), at).unwrap();
+        assert_eq!(enriched.history.len(), 1);
+        assert_eq!(enriched.history[0].posts[0].translation, "已观测到复位");
+        localized["events"][0]["reset_type"] = json!("banked");
+        let ignored = parse_codex(
+            br#"{"data":{"scheduled_reset":null}}"#,
+            &serde_json::to_vec(&localized).unwrap(),
+            at,
+        )
+        .unwrap();
+        assert!(ignored.history.is_empty());
+    }
+    #[test]
+    fn explicit_divin_completion_uses_actual_time_instead_of_forecast() {
+        let at = timestamp(&json!("2026-10-26T08:00:00Z")).unwrap();
+        let mut entry = event();
+        entry["stage"] = json!("completed");
+        entry["forecast"] = Value::Null;
+        entry["completedAt"] = json!("2026-10-26T07:00:00Z");
+        let view =
+            parse_divin(&serde_json::to_vec(&json!({"events":[entry]})).unwrap(), at).unwrap();
+        assert_eq!(view.badge(at, false).0, Bell::Reset);
+    }
     #[test]
     fn followup_requests_obey_current_source_and_enabled_setting() {
         let stop = AtomicBool::new(false);
@@ -1003,7 +1290,7 @@ mod tests {
         assert!(view.history.iter().all(|notice| notice.id != "1"));
         let mut settings: Settings = serde_json::from_str("{}").unwrap();
         assert!(settings.enabled);
-        assert_eq!(settings.source, Source::Divin);
+        assert_eq!(settings.source, Source::CodexResets);
         assert_eq!(settings.check_minutes, 5);
         settings.check_minutes = 0;
         settings.clamp();
@@ -1013,7 +1300,7 @@ mod tests {
         assert_eq!(settings.check_minutes, 60);
         assert_eq!(
             serde_json::from_str::<Source>("\"future_source\"").unwrap(),
-            Source::Divin
+            Source::CodexResets
         );
     }
     fn codex() -> (Value, Value) {

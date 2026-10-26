@@ -247,7 +247,7 @@ fn run() -> Result<()> {
         return update::inspect(&paths);
     }
     if args.iter().any(|s|s=="--inspect-reset-notice") {
-        let source=if args.iter().any(|s|s=="--codex-resets"){reset_notice::Source::CodexResets}else{reset_notice::Source::Divin};
+        let source=if args.iter().any(|s|s=="--divin"){reset_notice::Source::Divin}else{reset_notice::Source::CodexResets};
         return reset_notice::inspect(&paths,source);
     }
     if args.iter().any(|s| s == "--inspect") {
