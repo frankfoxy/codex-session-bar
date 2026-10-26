@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
     fs::{self, File},
     io::Read,
     os::windows::process::CommandExt,
@@ -70,12 +69,71 @@ struct Release {
     draft: bool,
     prerelease: bool,
     assets: Vec<Asset>,
+    #[serde(default)]
+    body: Option<String>,
 }
 #[derive(Clone)]
 struct Candidate {
     version: Version,
     archive: Asset,
     checksums: Asset,
+    changes: Highlights,
+}
+#[derive(Clone, Default)]
+struct Highlights {
+    items: Vec<String>,
+    more: bool,
+}
+
+fn plain_note(text: &str) -> String {
+    let text=text.replace("**", "").replace("__", "").replace('`', "");
+    let mut rest=text.as_str();
+    let mut plain=String::new();
+    while let Some(open)=rest.find('[') {
+        let Some(close)=rest[open+1..].find("](").map(|offset|open+1+offset) else {break};
+        let Some(end)=rest[close+2..].find(')').map(|offset|close+2+offset) else {break};
+        plain.push_str(&rest[..open]);
+        plain.push_str(&rest[open+1..close]);
+        rest=&rest[end+1..];
+    }
+    plain.push_str(rest);
+    plain.chars().filter(|c|!c.is_control() || c.is_whitespace())
+        .filter(|c|!matches!(c,'\u{202a}'..='\u{202e}'|'\u{2066}'..='\u{2069}'))
+        .collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn highlights(markdown: &str) -> Highlights {
+    let mut bullets=Vec::new();
+    let mut paragraphs=Vec::new();
+    let mut fence=None;
+    for raw in markdown.lines().take(256) {
+        let line=raw.trim();
+        let marker=if line.starts_with("```"){Some("```")}else if line.starts_with("~~~"){Some("~~~")}else{None};
+        if let Some(marker)=marker {if fence==Some(marker){fence=None;}else if fence.is_none(){fence=Some(marker);}continue;}
+        if fence.is_some() || line.is_empty() {continue;}
+        if line.starts_with('#') {
+            let heading=line.trim_start_matches('#').trim().to_lowercase();
+            if !bullets.is_empty() && ["验证","测试","安装","下载","运行要求","verification","validation","tests","installation","downloads","requirements"].iter().any(|word|heading.starts_with(word)) {break;}
+            continue;
+        }
+        if line.starts_with("![") || line.starts_with('<') || line=="---" || line=="***" {continue;}
+        let bullet=line.strip_prefix("- ").or_else(||line.strip_prefix("* ")).or_else(||line.strip_prefix("+ "))
+            .or_else(||line.split_once(". ").filter(|(number,_)|!number.is_empty() && number.bytes().all(|b|b.is_ascii_digit())).map(|(_,text)|text));
+        let text=plain_note(&line.chars().take(2048).collect::<String>());
+        if let Some(bullet)=bullet {
+            bullets.push(plain_note(&bullet.chars().take(2048).collect::<String>()));
+            if bullets.len()>5 {break;}
+        } else if paragraphs.len()<6 {paragraphs.push(text);}
+    }
+    let source=if bullets.is_empty(){paragraphs}else{bullets};
+    let mut result=Highlights{more:source.len()>5,..Default::default()};
+    for item in source.into_iter().filter(|item|!item.is_empty()).take(5) {
+        let count=item.chars().count();
+        let mut short=item.chars().take(90).collect::<String>();
+        if count>90 {short.push('…');result.more=true;}
+        result.items.push(short);
+    }
+    result
 }
 fn candidate(release: &Release, current: Version) -> Result<Option<Candidate>> {
     if release.draft || release.prerelease {
@@ -112,6 +170,7 @@ fn candidate(release: &Release, current: Version) -> Result<Option<Candidate>> {
         version,
         archive: asset(&name, MAX_ZIP)?,
         checksums: asset("SHA256SUMS.txt", 65536)?,
+        changes: highlights(release.body.as_deref().unwrap_or_default()),
     }))
 }
 fn valid_hash(text: &str) -> bool {
@@ -155,6 +214,7 @@ pub struct View {
     pub last_check_at: Option<f64>,
     pub last_result: String,
     pub last_detail: String,
+    pub available_version: String,
 }
 impl View {
     fn load(paths: &Paths) -> Self {
@@ -173,11 +233,16 @@ impl View {
         if view.busy() {
             view.phase.clear();
         }
+        if view.available_version.is_empty() && view.last_result=="available" {
+            view.available_version=view.last_detail.clone();
+        }
         view
     }
     fn change(&mut self, phase: &str, detail: &str, at: f64) {
         self.phase = phase.into();
         self.detail = detail.into();
+        if phase=="available" {self.available_version=detail.into();}
+        if phase=="up_to_date" {self.available_version.clear();}
         if matches!(phase, "up_to_date" | "available" | "check_failed") {
             self.last_check_at = Some(at);
             self.last_result = phase.into();
@@ -187,8 +252,16 @@ impl View {
     pub fn busy(&self) -> bool {
         matches!(
             self.phase.as_str(),
-            "checking" | "downloading" | "restarting"
+            "checking" | "reviewing" | "downloading" | "restarting"
         )
+    }
+    pub fn available(&self)->bool {
+        !matches!(self.phase.as_str(),"downloading"|"restarting")
+            && Version::parse(&self.available_version).zip(Version::parse(env!("CARGO_PKG_VERSION"))).is_some_and(|(latest,current)|latest>current)
+    }
+    pub fn badge_tip(&self,zh:bool)->String {
+        if zh {format!("有更新：{} · 点击查看主要更新内容",self.available_version)}
+        else {format!("Update available: {} · click to review changes",self.available_version)}
     }
     pub fn time_label(&self, zh: bool) -> String {
         let time = self
@@ -233,6 +306,9 @@ impl View {
                 } else {
                     "Downloading and verifying…"
                 }
+            }
+            "reviewing"=>{
+                if zh {"查看更新内容 · 等待确认"}else{"Reviewing changes · awaiting confirmation"}
             }
             "restarting" => {
                 if zh {
@@ -308,7 +384,7 @@ fn status(paths: &Paths, state: &State, phase: &str, detail: &str) {
         "update-status.json",
         &json!({"time":now(),"current_version":env!("CARGO_PKG_VERSION"),
         "phase":phase,"detail":detail,"interval_seconds":INTERVAL.as_secs(),
-        "last_check_at":view.last_check_at,"last_result":view.last_result,"last_detail":view.last_detail}),
+        "last_check_at":view.last_check_at,"last_result":view.last_result,"last_detail":view.last_detail,"available_version":view.available_version}),
     );
 }
 fn fetch(etag: &mut String, cache: &mut Option<Release>, stop: &AtomicBool) -> Result<()> {
@@ -325,18 +401,22 @@ fn fetch(etag: &mut String, cache: &mut Option<Release>, stop: &AtomicBool) -> R
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
-fn prompt_text(version: Version, zh: bool) -> String {
-    let version = version.label();
+fn prompt_text(release: &Candidate, zh: bool) -> String {
+    let version = release.version.label();
     let current = env!("CARGO_PKG_VERSION");
+    let mut changes=release.changes.items.iter().map(|item|format!("• {item}")).collect::<Vec<_>>().join("\r\n");
+    if changes.is_empty(){changes=if zh{"此版本未提供更新说明。"}else{"No release notes were provided."}.into();}
+    if release.changes.more {changes.push_str(if zh{"\r\n更多内容见 GitHub 发布页。"}else{"\r\nMore details are on the GitHub release page."});}
     if zh {
-        format!("发现新版本 {version}（当前 {current}）。\r\n\r\n是否更新？\r\n确认后将下载更新并重启 Session Bar，保留现有设置。")
+        format!("发现新版本 {version}（当前 {current}）。\r\n\r\n主要更新：\r\n{changes}\r\n\r\n是否更新？\r\n确认后将下载更新并重启 Session Bar，保留现有设置。")
     } else {
-        format!("Version {version} is available (current: {current}).\r\n\r\nUpdate now?\r\nSession Bar will download the update and restart. Your settings will be kept.")
+        format!("Version {version} is available (current: {current}).\r\n\r\nHighlights:\r\n{changes}\r\n\r\nUpdate now?\r\nSession Bar will download the update and restart. Your settings will be kept.")
     }
 }
 enum Event {
     Stop,
     Check,
+    Review,
     Decision(Candidate, bool),
 }
 #[derive(Clone)]
@@ -349,6 +429,12 @@ impl Control {
         self.busy.load(Ordering::Acquire)
     }
     pub fn request(&self) -> bool {
+        self.enqueue(Event::Check)
+    }
+    pub fn review(&self)->bool {
+        self.enqueue(Event::Review)
+    }
+    fn enqueue(&self,event:Event)->bool {
         if self
             .busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
@@ -356,7 +442,7 @@ impl Control {
         {
             return false;
         }
-        if self.tx.send(Event::Check).is_err() {
+        if self.tx.send(event).is_err() {
             self.busy.store(false, Ordering::Release);
             return false;
         }
@@ -400,9 +486,8 @@ impl Service {
         let handle = thread::spawn(move || {
             let mut etag = String::new();
             let mut cache = None;
-            let mut offered = HashSet::new();
             let mut prompt_open = false;
-            // Give the Codex language observer time to initialize before a prompt.
+            // Startup discovery is silent; only an explicit Review can prompt.
             let mut next = Instant::now() + Duration::from_secs(10);
             loop {
                 if stop.load(Ordering::Relaxed) {
@@ -446,15 +531,17 @@ impl Service {
                     }
                     Ok(Event::Decision(_, false)) => {
                         prompt_open = false;
+                        busy.store(false, Ordering::Release);
                         status(
                             &paths,
                             &state,
                             "declined",
-                            "The same version will not prompt again until restart",
+                            "Update postponed; click the update icon to review again",
                         );
                     }
-                    event @ (Ok(Event::Check) | Err(mpsc::RecvTimeoutError::Timeout)) => {
-                        let manual = matches!(event, Ok(Event::Check));
+                    event @ (Ok(Event::Check | Event::Review) | Err(mpsc::RecvTimeoutError::Timeout)) => {
+                        let manual = matches!(event, Ok(Event::Check | Event::Review));
+                        let review=matches!(event,Ok(Event::Review));
                         next = Instant::now() + INTERVAL;
                         if !manual && busy.swap(true, Ordering::AcqRel) {
                             continue;
@@ -471,20 +558,19 @@ impl Service {
                             )?;
                             if let Some(release) = newer {
                                 status(&paths, &state, "available", &release.version.label());
-                                if !prompt_open
-                                    && (manual || !offered.contains(&release.version.label()))
-                                {
-                                    offered.insert(release.version.label());
+                                if review && !prompt_open {
                                     prompt_open = true;
+                                    status(&paths,&state,"reviewing",&release.version.label());
                                     let tx = events.clone();
-                                    let message = prompt_text(release.version, locale::chinese());
+                                    let zh=locale::chinese();
+                                    let message = prompt_text(&release, zh);
                                     thread::spawn(move || {
                                         let accepted = unsafe {
                                             MessageBoxW(
                                                 None,
                                                 PCWSTR(wide(&message).as_ptr()),
                                                 PCWSTR(
-                                                    wide(if locale::chinese() {
+                                                    wide(if zh {
                                                         "Session Bar 更新"
                                                     } else {
                                                         "Session Bar update"
@@ -508,7 +594,7 @@ impl Service {
                         if let Err(error) = result {
                             status(&paths, &state, "check_failed", &format!("{error:#}"));
                         }
-                        busy.store(false, Ordering::Release);
+                        busy.store(prompt_open, Ordering::Release);
                     }
                 }
             }
@@ -768,8 +854,10 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), Event::Check));
         assert!(rx.try_recv().is_err());
         control.busy.store(false, Ordering::Release);
-        assert!(control.request());
-        assert!(matches!(rx.try_recv().unwrap(), Event::Check));
+        assert!(control.review());
+        assert!(!control.review());
+        assert!(!control.request());
+        assert!(matches!(rx.try_recv().unwrap(), Event::Review));
         drop(rx);
         control.busy.store(false, Ordering::Release);
         assert!(!control.request());
@@ -885,7 +973,53 @@ mod tests {
         assert!(expected_hash(&format!("{hash} other.zip"), name).is_err());
         assert!(expected_hash(&format!("{hash} {name}\n{hash} {name}"), name).is_err());
         assert!(expected_hash("bad package.zip", name).is_err());
-        assert!(prompt_text(Version([1, 2, 3]), true).contains("是否更新"));
-        assert!(prompt_text(Version([1, 2, 3]), false).contains("Update now?"));
+        let update=candidate(&release("v1.2.3"),Version([0,0,0])).unwrap().unwrap();
+        assert!(prompt_text(&update, true).contains("是否更新"));
+        assert!(prompt_text(&update, false).contains("Update now?"));
+        assert!(prompt_text(&update,true).contains("未提供更新说明"));
+    }
+    #[test]
+    fn release_notes_become_short_plain_highlights_without_installation_noise() {
+        let mut source=release("v1.2.3");
+        source.body=Some("## 本次更新\n\n新版本说明。\n- **静默检查**，点击图标才确认。\n- 修复 `hover` 遮挡；查看 [详情](https://example.com)。\n```sh\n- 不要显示的命令\n```\n## 验证\n- 不要显示的测试结果".into());
+        let update=candidate(&source,Version([0,0,0])).unwrap().unwrap();
+        assert_eq!(update.changes.items,vec!["静默检查，点击图标才确认。","修复 hover 遮挡；查看 详情。"]);
+        let zh=prompt_text(&update,true);
+        assert!(zh.contains("主要更新：\r\n• 静默检查"));
+        assert!(!zh.contains("不要显示"));
+        assert!(!zh.contains("https://"));
+        assert!(prompt_text(&update,false).contains("Highlights:"));
+        let mut raw=serde_json::to_value(json!({"tag_name":"v1.2.3","draft":false,"prerelease":false,"assets":[]})).unwrap();
+        raw["body"]=serde_json::Value::Null;
+        assert!(serde_json::from_value::<Release>(raw).unwrap().body.is_none());
+    }
+    #[test]
+    fn notes_bound_unicode_length_item_count_and_control_characters() {
+        let notes=(0..20).map(|_|format!("- {}\0\u{202e}","更新".repeat(100))).collect::<Vec<_>>().join("\n");
+        let summary=highlights(&notes);
+        assert_eq!(summary.items.len(),5);
+        assert!(summary.more);
+        assert!(summary.items.iter().all(|item|item.chars().count()<=91 && !item.contains('\0') && !item.contains('\u{202e}')));
+        assert_eq!(highlights("A simple release description.").items,vec!["A simple release description."]);
+    }
+    #[test]
+    fn available_badge_survives_postponing_and_failures_but_clears_after_upgrade() {
+        let mut view=View::default();
+        assert!(!view.available());
+        view.change("available","99.1.0",1000.);
+        assert!(view.available());
+        view.change("declined","postponed",1001.);
+        assert!(view.available());
+        view.change("checking","",1002.);
+        view.change("check_failed","HTTP 503",1003.);
+        let mut restored:View=serde_json::from_value(serde_json::to_value(&view).unwrap()).unwrap();
+        assert!(restored.available());
+        assert!(restored.badge_tip(true).contains("99.1.0"));
+        restored.change("downloading","99.1.0",1004.);
+        assert!(!restored.available());
+        restored.change("up_to_date",env!("CARGO_PKG_VERSION"),1005.);
+        assert!(!restored.available());
+        restored.available_version=env!("CARGO_PKG_VERSION").into();
+        assert!(!restored.available());
     }
 }

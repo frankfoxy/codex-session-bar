@@ -190,6 +190,8 @@ enum Hit {
     Hide,
     Preferences,
     CheckUpdate,
+    ProjectHome,
+    UpdateAvailable(String),
     ResetNotice(String),
     ResetNoticeEnabled,
     ResetNoticeInterval(i32),
@@ -548,6 +550,12 @@ impl Painter {
             MUTED
         };
         match hit {
+            Hit::UpdateAvailable(_) => {
+                self.border(rect(x+2.,y+2.,18.,18.),GREEN,9.);
+                self.line(x+11.,y+6.,x+11.,y+16.,GREEN,1.5);
+                self.line(x+6.5,y+10.5,x+11.,y+6.,GREEN,1.5);
+                self.line(x+15.5,y+10.5,x+11.,y+6.,GREEN,1.5);
+            }
             Hit::ResetNotice(_) => {
                 self.notice_bell(x,y,ORANGE);
             }
@@ -790,7 +798,7 @@ impl Drop for Tips {
 }
 fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
     match hit {
-        Hit::Info(text) | Hit::ResetNotice(text) => return text.clone(),
+        Hit::Info(text) | Hit::ResetNotice(text) | Hit::UpdateAvailable(text) => return text.clone(),
         Hit::Icon | Hit::ChatIcon(_) => "Change chat icon",
         Hit::ChatCopy(0) => "Copy a link to this chat",
         Hit::ChatCopy(1) => "Copy the conversation text as Markdown",
@@ -804,7 +812,8 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::Grip => "Drag session bar",
         Hit::Hide => "Hide to tray · restore from the tray icon or recent-chats shortcut",
         Hit::Preferences => "Settings · list size, shortcut and extensions",
-        Hit::CheckUpdate => "Check GitHub for updates now · ask before downloading",
+        Hit::CheckUpdate => "Check GitHub for updates now · show an icon when an update is available",
+        Hit::ProjectHome=>"Open Codex In-line Bar on GitHub",
         Hit::ResetNoticeEnabled => "Follow published Codex reset announcements · selected source only",
         Hit::ResetNoticeInterval(_) => "Announcement check interval · 1–60 minutes · changes apply immediately",
         Hit::CapacityRetryEnabled=>"Automatically append a continuation only after the latest turn fails because the model is at capacity",
@@ -1426,6 +1435,13 @@ impl App {
                     if !text.is_empty(){p.label(&text,rect(x+25.,2.,w-25.,30.),11.,color,false);}
                     x+=w+9.;
                 }
+                if live.updater.available() {
+                    let hit=Hit::UpdateAvailable(live.updater.badge_tip(crate::locale::chinese()));
+                    p.fill(rect(x,5.,25.,24.),0x254136,5.);
+                    area(hit.clone(),rect(x,3.,25.,28.));
+                    p.action_icon(&hit,x+1.,6.);
+                    x+=29.;
+                }
                 area(Hit::Details, rect(x, 3., 25., 28.));
                 p.line(x + 8., 15., x + 12., 19., MUTED, 1.4);
                 p.line(x + 12., 19., x + 16., 15., MUTED, 1.4);
@@ -1878,7 +1894,12 @@ impl App {
                     return hits;
                 }
                 p.ui_label("Settings", rect(16., 8., width - 120., 28.), 14., TEXT, false);
-                p.label(concat!("v", env!("CARGO_PKG_VERSION")), rect(width - 75., 8., 60., 28.), 11., MUTED, false);
+                let home=concat!("Codex In-line Bar · v",env!("CARGO_PKG_VERSION"));
+                let home_width=p.width(home,11.)+4.;
+                let home_left=width-20.-home_width;
+                area(Hit::ProjectHome,rect(home_left-4.,8.,home_width+8.,28.));
+                p.label(home,rect(home_left,8.,home_width,28.),11.,NEW_RESULT,false);
+                if self.hover==Some(Hit::ProjectHome){p.line(home_left,29.,home_left+home_width-4.,29.,NEW_RESULT,0.8);}
                 let update=&live.updater;
                 let pending=self.update_control.as_ref().is_some_and(|control|control.busy());
                 let enabled=!update.busy() && !pending && (self.testing||self.update_control.is_some());
@@ -1998,8 +2019,8 @@ impl App {
                 area(Hit::Info(format!("{}\n{}",live.reset_notice.tooltip(now(),crate::locale::chinese()),self.paths.runtime.join("reset-notice-checks.jsonl").display())),rect(18.,532.,width-36.,27.));
                 p.line(16.,566.,width-16.,566.,0x3b484f,1.);
                 p.fill(rect(16.,575.,width-32.,31.),0x293238,6.);
-                p.ui_label("Capacity auto-retry",rect(27.,575.,width-110.,31.),12.,TEXT,false);
                 area(Hit::CapacityRetryEnabled,rect(16.,575.,width-32.,31.));
+                p.ui_label("Capacity auto-retry",rect(27.,575.,width-110.,31.),12.,TEXT,false);
                 p.toggle(width-60.,583.,self.settings.capacity_retry.enabled);
                 p.ui_label("Append a continuation after a capacity error",rect(20.,612.,width-180.,27.),10.,MUTED,false);
                 p.fill(rect(width-151.,612.,131.,27.),0x1c2125,5.);
@@ -2223,6 +2244,7 @@ impl App {
             let model = s.execution.short();
             if !model.is_empty() { width += p.width(&model, 11.) + 10.; }
         }
+        if live.updater.available() {width+=29.;}
         width.ceil() as i32
     }
     unsafe fn round_window(hwnd: HWND, width: i32, height: i32, radius: i32) {
@@ -3247,6 +3269,17 @@ impl App {
                     self.state.lock().unwrap().updater.phase="checking".into();
                 } else if let Some(control)=&self.update_control {
                     let _=control.request();
+                }
+            }
+            Hit::UpdateAvailable(_)=>{
+                if !self.testing {
+                    if let Some(control)=&self.update_control {let _=control.review();}
+                }
+            }
+            Hit::ProjectHome=>{
+                if !self.testing {
+                    let result=ShellExecuteW(self.popup,w!("open"),PCWSTR(wide("https://github.com/frankfoxy/codex-session-bar").as_ptr()),PCWSTR::null(),PCWSTR::null(),SW_SHOWNORMAL);
+                    if result.0 as isize<=32 {self.preferences_note="Cannot open GitHub".into();}
                 }
             }
             Hit::TitleWidth(delta)=>{
@@ -4564,6 +4597,18 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         )?;
         assert!(bar_hits.iter().any(|area| area.hit == Hit::NewResults(2)));
         assert_eq!(app.bar_text(&app.snapshot()).2, "● 3");
+        let saved_update=state.lock().unwrap().updater.clone();
+        assert!(!bar_hits.iter().any(|area|matches!(area.hit,Hit::UpdateAvailable(_))));
+        state.lock().unwrap().updater=crate::update::View{available_version:"99.1.0".into(),..Default::default()};
+        let update_width=app.measure_bar() as u32;
+        assert_eq!(update_width,w+29,"An update adds only one compact icon slot");
+        let update_hits=capture(&app,None,update_width,34,&paths.runtime.join("rust-update-available-verification.png"))?;
+        let update_area=update_hits.iter().find(|area|matches!(&area.hit,Hit::UpdateAvailable(text) if text.contains("99.1.0"))).expect("A discovered update must have a clickable icon");
+        assert!(update_area.r.right<=update_hits.iter().find(|area|area.hit==Hit::Details).unwrap().r.left);
+        app.hover=Some(update_area.hit.clone());
+        capture(&app,None,update_width,34,&paths.runtime.join("rust-update-available-hover-verification.png"))?;
+        app.hover=None;
+        state.lock().unwrap().updater=saved_update;
         let original=app.snapshot();
         for status in ["Done","Stopped"] {
             let mut idle=original.clone();
@@ -5013,6 +5058,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert!(preferences_hits.iter().any(|a| a.hit == Hit::Guard));
         assert!(preferences_hits.iter().any(|a|a.hit==Hit::ResetNoticeEnabled));
         assert!(preferences_hits.iter().any(|a|a.hit==Hit::CapacityRetryEnabled));
+        let home=preferences_hits.iter().find(|a|a.hit==Hit::ProjectHome).expect("Settings must link the full product name and version to GitHub");
+        assert!(home.r.top<35. && home.r.left>200. && home.r.right<=560.);
         let saved_capacity=app.settings.capacity_retry.clone();
         assert_eq!(saved_capacity.delay_secs,5);
         app.hit(Hit::CapacityRetryEnabled);assert!(app.settings.capacity_retry.enabled);
@@ -5020,6 +5067,14 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert_eq!(app.snapshot().capacity_options.delay_secs,6);
         let saved_capacity_culture=crate::locale::status().0;crate::locale::follow(0x804);
         capture(&app,Some(Popup::Preferences),560,PREFERENCES_HEIGHT as u32,&paths.runtime.join("rust-capacity-retry-settings-verification.png"))?;
+        app.hover=Some(Hit::CapacityRetryEnabled);
+        capture(&app,Some(Popup::Preferences),560,PREFERENCES_HEIGHT as u32,&paths.runtime.join("rust-capacity-retry-hover-verification.png"))?;
+        app.hover=None;
+        let normal=image::open(paths.runtime.join("rust-capacity-retry-settings-verification.png"))?.to_rgb8();
+        let hovered=image::open(paths.runtime.join("rust-capacity-retry-hover-verification.png"))?.to_rgb8();
+        let bright=|image:&image::RgbImage|->usize{(578..603).flat_map(|y|(27..430).map(move|x|(x,y))).filter(|&(x,y)|image.get_pixel(x,y).0.iter().all(|channel|*channel>180)).count()};
+        let foreground=bright(&normal);
+        assert!(foreground>30 && bright(&hovered)*100>=foreground*90,"Hover background must preserve the extension title foreground");
         crate::locale::follow(saved_capacity_culture);app.set_capacity_retry(saved_capacity)?;
         assert_eq!(SendMessageW(app.combo,CB_GETCOUNT,WPARAM(0),LPARAM(0)).0,2);
         let saved_notice_config=app.settings.reset_notice.clone();
