@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
-    io::Write,
-    sync::{atomic::Ordering, mpsc::Sender},
+    io::{Read, Seek, SeekFrom, Write},
+    sync::{atomic::Ordering, mpsc::Sender, Mutex},
     thread,
     time::Duration,
 };
@@ -17,6 +17,7 @@ const MAX_AGE: f64 = 15. * 60.;
 const JOURNAL: &str = "capacity-retry-state.json";
 const LOG: &str = "capacity-retry-events.jsonl";
 const JOURNAL_BYTES: u64 = 128 * 1024;
+static LOG_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Serialize, Deserialize)]
 struct Attempt {
@@ -107,9 +108,29 @@ pub struct View {
     pub waiting: usize,
     pub submitted: u64,
     pub attempts: u64,
+    pub unconfirmed: u64,
+    pub tracking_since: f64,
     pub in_flight: bool,
     pub last_note: String,
     pub last_error: String,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Counters {
+    attempts: u64,
+    submitted: u64,
+    unconfirmed: u64,
+    since: f64,
+}
+impl Counters {
+    fn apply(&self, view: &mut View) {
+        view.attempts = self.attempts;
+        view.submitted = self.submitted;
+        view.unconfirmed = self
+            .unconfirmed
+            .max(self.attempts.saturating_sub(self.submitted));
+        view.tracking_since = self.since;
+    }
 }
 impl View {
     pub fn text(&self, enabled: bool, zh: bool) -> String {
@@ -160,6 +181,7 @@ impl View {
 #[serde(default)]
 struct Journal {
     seen: Vec<Attempt>,
+    counters: Counters,
 }
 impl Journal {
     fn load(paths: &Paths) -> Self {
@@ -197,6 +219,14 @@ impl Journal {
             key,
             failed_at: failure.failed_at,
         });
+        self.counters.attempts = self.counters.attempts.saturating_add(1);
+        if self.counters.since <= 0. {
+            self.counters.since = now();
+        }
+        self.save(paths)?;
+        Ok(true)
+    }
+    fn save(&self, paths: &Paths) -> Result<()> {
         let pending = paths.runtime.join(format!(
             "capacity-retry-state.{}.pending",
             std::process::id()
@@ -209,7 +239,7 @@ impl Journal {
         fs::write(&pending, bytes).context("Cannot record capacity retry before sending")?;
         fs::rename(pending, paths.runtime.join(JOURNAL))
             .context("Cannot save capacity retry record")?;
-        Ok(true)
+        Ok(())
     }
 }
 struct Schedule {
@@ -275,7 +305,11 @@ pub fn start(
 ) -> thread::JoinHandle<()> {
     let (paths, state, stop) = (paths.clone(), state.clone(), stop.clone());
     thread::spawn(move || {
-        let mut schedule = Schedule::new(Journal::load(&paths));
+        let journal = Journal::load(&paths);
+        journal
+            .counters
+            .apply(&mut state.lock().unwrap().capacity_retry);
+        let mut schedule = Schedule::new(journal);
         let mut epoch = None;
         let events = state.lock().unwrap().refresh_events.clone();
         while !stop.load(Ordering::Relaxed) {
@@ -346,7 +380,9 @@ pub fn dispatch(
         );
         return Ok("Capacity retry skipped".into());
     }
-    let current = store.capacity_failure(&failure.thread_id)?;
+    let current = store
+        .capacity_failure(&failure.thread_id)
+        .inspect_err(|error| log(paths, "blocked", failure, Some(&format!("{error:#}"))))?;
     if current
         .as_ref()
         .is_none_or(|value| value.turn_id != failure.turn_id || !value.fresh(now()))
@@ -360,40 +396,95 @@ pub fn dispatch(
         return Ok("Capacity retry skipped".into());
     }
     if !enabled(state, request.epoch) {
+        log(
+            paths,
+            "skipped",
+            failure,
+            Some("disabled, settings changed or old failure"),
+        );
         return Ok("Capacity retry skipped".into());
     }
-    if !Journal::for_send(paths)?.claim(paths, failure)? {
+    let mut journal = Journal::for_send(paths)
+        .inspect_err(|error| log(paths, "blocked", failure, Some(&format!("{error:#}"))))?;
+    if !journal
+        .claim(paths, failure)
+        .inspect_err(|error| log(paths, "blocked", failure, Some(&format!("{error:#}"))))?
+    {
         log(paths, "duplicate_skipped", failure, None);
         return Ok("Capacity retry already attempted".into());
     }
+    let number = journal.counters.attempts;
+    let delay = state.lock().unwrap().capacity_options.delay_secs;
     {
         let mut live = state.lock().unwrap();
-        live.capacity_retry.attempts += 1;
+        journal.counters.apply(&mut live.capacity_retry);
         live.capacity_retry.in_flight = true;
         live.capacity_retry.last_error.clear();
     }
-    log(paths, "send_started", failure, None);
+    log_record(
+        paths,
+        "send_started",
+        failure,
+        None,
+        Some(number),
+        Some(delay),
+    );
     let result = submit(&failure.thread_id, PROMPT);
+    if result.is_ok() {
+        journal.counters.submitted = journal.counters.submitted.saturating_add(1);
+    } else {
+        journal.counters.unconfirmed = journal.counters.unconfirmed.saturating_add(1);
+    }
+    let persistence_error = journal.save(paths).err().map(|error| format!("{error:#}"));
     let mut live = state.lock().unwrap();
+    journal.counters.apply(&mut live.capacity_retry);
     live.capacity_retry.in_flight = false;
     match result {
         Ok(()) => {
-            live.capacity_retry.submitted += 1;
             live.capacity_retry.last_note = failure.label.clone();
+            if let Some(error) = &persistence_error {
+                live.capacity_retry.last_error =
+                    format!("Continuation submitted; counters could not be saved: {error}");
+            }
             drop(live);
-            log(paths, "submitted", failure, None);
+            log_record(
+                paths,
+                "submitted",
+                failure,
+                persistence_error.as_deref(),
+                Some(number),
+                Some(delay),
+            );
             Ok("Capacity continuation submitted".into())
         }
         Err(error) => {
             live.capacity_retry.last_error = format!("{error:#}").chars().take(300).collect();
             drop(live);
-            log(paths, "unconfirmed", failure, Some(&format!("{error:#}")));
+            log_record(
+                paths,
+                "unconfirmed",
+                failure,
+                Some(&format!("{error:#}")),
+                Some(number),
+                Some(delay),
+            );
             Err(error
                 .context("Continuation unconfirmed; the same failed turn will not be sent again"))
         }
     }
 }
 fn log(paths: &Paths, event: &str, failure: &Failure, error: Option<&str>) {
+    log_record(paths, event, failure, error, None, None);
+}
+fn log_record(
+    paths: &Paths,
+    event: &str,
+    failure: &Failure,
+    error: Option<&str>,
+    number: Option<u64>,
+    delay: Option<u64>,
+) {
+    let _lock = LOG_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let path = paths.runtime.join(LOG);
     let result = (|| -> Result<()> {
         if fs::metadata(&path).is_ok_and(|m| m.len() >= 128 * 1024) {
@@ -423,12 +514,113 @@ fn log(paths: &Paths, event: &str, failure: &Failure, error: Option<&str>) {
         let mut file = OpenOptions::new().append(true).create(true).open(path)?;
         serde_json::to_writer(
             &mut file,
-            &json!({"event":event,"time":chrono::Local::now().to_rfc3339(),"at":now(),"thread_id":failure.thread_id,"thread_name":failure.label,"failed_turn":failure.turn_id,"failed_at":failure.failed_at,"error":error.map(|value|value.chars().take(300).collect::<String>())}),
+            &json!({"event":event,"time":chrono::Local::now().to_rfc3339(),"at":now(),"thread_id":failure.thread_id,"thread_name":failure.label,"failed_turn":failure.turn_id,"failed_at":failure.failed_at,"retry_number":number,"delay_seconds":delay,"error":error.map(|value|value.chars().take(300).collect::<String>())}),
         )?;
         file.write_all(b"\n")?;
         Ok(())
     })();
     let _ = result;
+}
+
+pub fn recent_events(paths: &Paths) -> Result<Vec<crate::guard::LogEntry>> {
+    let mut file = match fs::File::open(paths.runtime.join(LOG)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let start = file.metadata()?.len().saturating_sub(65536);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity(65536);
+    file.take(65536).read_to_end(&mut bytes)?;
+    Ok(parse_events(&bytes, start > 0, crate::locale::chinese()))
+}
+fn parse_events(bytes: &[u8], skip_first: bool, zh: bool) -> Vec<crate::guard::LogEntry> {
+    let end = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let mut rows = Vec::new();
+    for line in bytes[..end]
+        .split(|byte| *byte == b'\n')
+        .skip(usize::from(skip_first))
+    {
+        let Ok(value) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        let event = value["event"].as_str().unwrap_or("");
+        let label = match (event, zh) {
+            ("queued", true) => "等待重试",
+            ("queued", false) => "Queued",
+            ("send_started", true) => "触发重试",
+            ("send_started", false) => "Retry started",
+            ("submitted", true) => "已提交继续消息",
+            ("submitted", false) => "Continuation submitted",
+            ("unconfirmed", true) => "提交未确认",
+            ("unconfirmed", false) => "Submission unconfirmed",
+            ("skipped", true) => "已取消重试",
+            ("skipped", false) => "Retry cancelled",
+            ("duplicate_skipped", true) => "已跳过重复回合",
+            ("duplicate_skipped", false) => "Duplicate skipped",
+            ("blocked", true) => "重试未发起",
+            ("blocked", false) => "Retry blocked",
+            _ => continue,
+        };
+        let number = value["retry_number"]
+            .as_u64()
+            .map(|number| format!(" #{number}"))
+            .unwrap_or_default();
+        let name = value["thread_name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .or_else(|| value["thread_id"].as_str())
+            .unwrap_or("—");
+        let time = value["time"]
+            .as_str()
+            .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+            .map(|time| time.format("%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "—".into());
+        let delay = value["delay_seconds"]
+            .as_u64()
+            .map(|delay| {
+                if zh {
+                    format!(" · 等待 {delay} 秒")
+                } else {
+                    format!(" · Delay {delay}s")
+                }
+            })
+            .unwrap_or_default();
+        let reason = value["error"].as_str().unwrap_or("");
+        let reason = if zh {
+            match reason {
+                "disabled, settings changed or old failure" => "扩展关闭、设置变更或错误已过期",
+                "latest turn changed, recovered or stopped" => "会话已进入新回合、已恢复或已停止",
+                other => other,
+            }
+        } else {
+            reason
+        };
+        rows.push(crate::guard::LogEntry {
+            time,
+            title: format!(
+                "{label}{number} · {}",
+                name.chars().take(100).collect::<String>()
+            ),
+            detail: format!(
+                "{} {} · {} {}{delay}{}{}",
+                if zh { "会话" } else { "Chat" },
+                value["thread_id"].as_str().unwrap_or("—"),
+                if zh { "失败回合" } else { "Failed turn" },
+                value["failed_turn"].as_str().unwrap_or("—"),
+                if reason.is_empty() { "" } else { " · " },
+                reason.chars().take(300).collect::<String>()
+            ),
+            warning: matches!(event, "unconfirmed" | "blocked")
+                || (event == "submitted" && !reason.is_empty()),
+        });
+    }
+    rows.reverse();
+    rows.truncate(64);
+    rows
 }
 
 #[cfg(test)]
@@ -492,6 +684,7 @@ mod tests {
                 key: failure.key(),
                 failed_at: failure.failed_at,
             }],
+            ..Default::default()
         });
         schedule.sync(&[failure.clone()], 1001.);
         assert!(schedule.pending.is_empty());
@@ -672,6 +865,7 @@ mod tests {
                     failed_at: at,
                 })
                 .collect(),
+            ..Default::default()
         };
         let next = Failure {
             turn_id: "next".into(),
@@ -689,6 +883,103 @@ mod tests {
             .seen
             .iter()
             .any(|attempt| attempt.key == next.key()));
+    }
+    #[test]
+    fn retry_totals_persist_and_dedup_does_not_increment_them() {
+        let fixture = Fixture::new();
+        let state = fixture.state();
+        let store = Store::new(&fixture.paths);
+        let first = Request {
+            failure: store.capacity_failure("chat").unwrap().unwrap(),
+            epoch: 0,
+        };
+        dispatch(&fixture.paths, &state, &store, &first, |_, _| Ok(())).unwrap();
+        let history =
+            rusqlite::Connection::open(fixture.paths.home.join("thread_history_1.sqlite")).unwrap();
+        history
+            .execute(
+                "UPDATE thread_turns SET turn_id='second',completed_at=?",
+                [now()],
+            )
+            .unwrap();
+        let second = Request {
+            failure: store.capacity_failure("chat").unwrap().unwrap(),
+            epoch: 0,
+        };
+        assert!(dispatch(
+            &fixture.paths,
+            &state,
+            &store,
+            &second,
+            |_, _| anyhow::bail!("unconfirmed transport")
+        )
+        .is_err());
+        dispatch(&fixture.paths, &state, &store, &second, |_, _| {
+            panic!("Duplicate must not submit")
+        })
+        .unwrap();
+        let restored = Journal::for_send(&fixture.paths).unwrap();
+        let mut view = View::default();
+        restored.counters.apply(&mut view);
+        assert_eq!((view.attempts, view.submitted, view.unconfirmed), (2, 1, 1));
+        assert!(view.tracking_since > 0.);
+        let legacy: Journal = serde_json::from_str(r#"{"seen":[]}"#).unwrap();
+        assert_eq!(
+            legacy.counters.attempts, 0,
+            "Legacy dedup records are not presented as complete historical counts"
+        );
+        let events = recent_events(&fixture.paths).unwrap();
+        assert!(events.iter().any(|event| event.title.contains("#2")
+            && event.warning
+            && event.detail.contains("second")));
+        assert!(events
+            .iter()
+            .any(|event| event.title.contains("#1") && event.detail.contains("5")));
+    }
+    #[test]
+    fn retry_log_tail_ignores_partial_rows_and_exposes_chat_and_turn_context() {
+        let bytes=b"cut first row\n{\"event\":\"send_started\",\"time\":\"2026-10-26T19:00:00+08:00\",\"thread_name\":\"Example\",\"thread_id\":\"chat-123\",\"failed_turn\":\"turn-456\",\"retry_number\":7,\"delay_seconds\":5}\n{\"event\":\"unconfirmed\",\"thread_id\":\"chat-123\",\"failed_turn\":\"turn-456\",\"error\":\"connection lost\"}\n{\"event\":\"submitted\"";
+        let rows = parse_events(bytes, true, false);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].warning && rows[0].detail.contains("connection lost"));
+        assert_eq!(rows[1].time, "10-26 19:00:00");
+        assert!(
+            rows[1].title.contains("#7")
+                && rows[1].detail.contains("chat-123")
+                && rows[1].detail.contains("turn-456")
+        );
+        let zh = parse_events(bytes, true, true);
+        assert!(zh[1].title.contains("触发重试"));
+    }
+    #[test]
+    fn concurrent_event_writes_remain_complete_and_logs_rotate_compressed() {
+        let fixture = Fixture::new();
+        let mut writers = Vec::new();
+        for _ in 0..4 {
+            let paths = fixture.paths.clone();
+            writers.push(std::thread::spawn(move || {
+                for _ in 0..20 {
+                    log(&paths, "queued", &sample(), None);
+                }
+            }));
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert_eq!(recent_events(&fixture.paths).unwrap().len(), 64);
+        let file = OpenOptions::new()
+            .write(true)
+            .open(fixture.paths.runtime.join(LOG))
+            .unwrap();
+        file.set_len(128 * 1024).unwrap();
+        drop(file);
+        log(&fixture.paths, "send_started", &sample(), None);
+        assert!(fixture
+            .paths
+            .runtime
+            .join("capacity-retry-events.1.gz")
+            .is_file());
+        assert_eq!(recent_events(&fixture.paths).unwrap().len(), 1);
     }
     #[test]
     fn cached_failures_and_a_corrupt_retry_journal_cannot_trigger_messages() {

@@ -197,6 +197,9 @@ enum Hit {
     ResetNoticeInterval(i32),
     CapacityRetryEnabled,
     CapacityRetryInterval(i32),
+    CapacityRetryLogs,
+    CapacityRetryRefresh,
+    CapacityRetryFolder,
     Rows(i32),
     TitleWidth(i32),
     ShortcutEnabled,
@@ -559,11 +562,11 @@ impl Painter {
             Hit::ResetNotice(_) => {
                 self.notice_bell(x,y,ORANGE);
             }
-            Hit::GuardLogs => {
+            Hit::GuardLogs | Hit::CapacityRetryLogs => {
                 self.border(rect(x + 4., y + 2., 15., 19.), c, 2.);
                 for dy in [7., 11., 15.] { self.line(x + 8., y + dy, x + 15., y + dy, c, 1.3); }
             }
-            Hit::GuardFolder => {
+            Hit::GuardFolder | Hit::CapacityRetryFolder => {
                 self.border(rect(x + 2., y + 7., 20., 14.), c, 2.);
                 self.line(x + 2., y + 7., x + 2., y + 3., c, 1.4);
                 self.line(x + 2., y + 3., x + 10., y + 3., c, 1.4);
@@ -598,7 +601,7 @@ impl Painter {
                 self.border(rect(x + 12., y + 9., 7., 7.), TEXT, 3.5);
                 self.line(x + 18., y + 15., x + 22., y + 19., TEXT, 1.5);
             }
-            Hit::Refresh | Hit::CheckUpdate | Hit::ResetPreferences | Hit::GuardRefresh => {
+            Hit::Refresh | Hit::CheckUpdate | Hit::ResetPreferences | Hit::GuardRefresh | Hit::CapacityRetryRefresh => {
                 // Two opposing arcs and aligned arrowheads form a clear refresh
                 // glyph; the old single arc resembled a power switch.
                 for start in [-165_f32, 15.] {
@@ -703,6 +706,7 @@ struct App {
     notice_alert_due: Instant,
     guard_events: Vec<guard::LogEntry>,
     guard_log_error: String,
+    capacity_log: bool,
     rows: Vec<Row>,
     recent_rows_at: f64,
     hits: Vec<Area>,
@@ -813,11 +817,14 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::Hide => "Hide to tray · restore from the tray icon or recent-chats shortcut",
         Hit::Preferences => "Settings · list size, shortcut and extensions",
         Hit::CheckUpdate => "Check GitHub for updates now · show an icon when an update is available",
-        Hit::ProjectHome=>"Open Codex In-line Bar on GitHub",
+        Hit::ProjectHome=>"Open Codex Session Bar on GitHub",
         Hit::ResetNoticeEnabled => "Follow published Codex reset announcements · selected source only",
         Hit::ResetNoticeInterval(_) => "Announcement check interval · 1–60 minutes · changes apply immediately",
         Hit::CapacityRetryEnabled=>"Automatically append a continuation only after the latest turn fails because the model is at capacity",
         Hit::CapacityRetryInterval(_)=>"Capacity retry delay · 1–300 seconds · default 5 seconds",
+        Hit::CapacityRetryLogs=>"View capacity retry log · badge counts actual retry attempts, once per failed turn",
+        Hit::CapacityRetryRefresh=>"Refresh recent capacity retry events",
+        Hit::CapacityRetryFolder=>"Open retry log folder · includes compressed history",
         Hit::Rows(n) => if *n < 0 { "Show fewer rows" } else { "Show more rows" },
         Hit::ShortcutEnabled => "Enable shortcut · only while Codex or Session Bar has focus",
         Hit::GuardSettings => "Protection limits and check interval",
@@ -975,6 +982,7 @@ impl App {
             notice_alert_due:Instant::now(),
             guard_events: Vec::new(),
             guard_log_error: String::new(),
+            capacity_log: false,
             popup_layout: None,
             popup_layout_batch: false,
             rows: Vec::new(),
@@ -1138,9 +1146,10 @@ impl App {
     }
     fn refresh_guard_events(&mut self) {
         if self.testing { return; }
-        match guard::recent_events(&self.paths) {
+        let result=if self.capacity_log {crate::capacity_retry::recent_events(&self.paths)}else{guard::recent_events(&self.paths)};
+        match result {
             Ok(entries) => { self.guard_events = entries; self.guard_log_error.clear(); }
-            Err(error) => { self.guard_log_error = format!("Cannot read protection log: {error}"); }
+            Err(error) => { self.guard_events.clear();self.guard_log_error = format!("{}: {error}",crate::locale::text(if self.capacity_log{"Cannot read retry log"}else{"Cannot read protection log"})); }
         }
         self.scroll = self.scroll.min(self.guard_events.len().saturating_sub(8));
     }
@@ -1834,11 +1843,19 @@ impl App {
                 );
             }
             Some(Popup::GuardLogs) => {
-                p.ui_label("Protection log", rect(18., 8., width - 130., 30.), 14., TEXT, false);
-                for (hit, x) in [(Hit::GuardRefresh, width - 92.), (Hit::BackPreferences, width - 48.)] {
+                p.ui_label(if self.capacity_log{"Capacity retry log"}else{"Protection log"}, rect(18., 8., width - 130., 30.), 14., TEXT, false);
+                for (hit, x) in [(if self.capacity_log{Hit::CapacityRetryRefresh}else{Hit::GuardRefresh}, width - 92.), (Hit::BackPreferences, width - 48.)] {
                     area(hit.clone(), rect(x, 8., 32., 30.));
                     p.action_icon(&hit, x + 5., 12.);
                 }
+                if self.capacity_log {
+                    let view=&live.capacity_retry;let zh=crate::locale::chinese();
+                    p.label(&if zh{format!("累计触发 {} 次 · 已提交 {} · 未确认 {}",view.attempts,view.submitted,view.unconfirmed)}else{format!("Retries {} · Submitted {} · Unconfirmed {}",view.attempts,view.submitted,view.unconfirmed)},rect(18.,44.,width-36.,24.),12.,TEXT,false);
+                    let since=chrono::DateTime::from_timestamp(view.tracking_since as i64,0).filter(|_|view.tracking_since>0.).map(|time|time.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string());
+                    let note=if let Some(since)=since {if zh{format!("自 {since} 起统计 · 同一失败回合只计一次 · 旧版记录不补计")}else{format!("Counting since {since} · once per failed turn · older records excluded")}}
+                        else{if zh{"从本版本首次重试开始累计 · 旧版记录仍可查看".into()}else{"Counter starts with the first retry in this version; older logs remain visible".into()}};
+                    p.label(&note,rect(18.,72.,width-36.,22.),11.,MUTED,false);
+                } else {
                 p.ui_label(&format!("Storms {}  ·  {}  ·  Ended {} processes",
                     live.guard.storm_count.map(|v|v.to_string()).unwrap_or_else(|| "—".into()),
                     if !live.guard.available { "Unavailable" } else if !live.guard.enabled { "Protection off" } else if live.guard.storm_active { "Active" } else { "Stable" },
@@ -1848,6 +1865,7 @@ impl App {
                 p.ui_label(&since.map(|s|format!("Episode tracking since {s} · earlier alarms are not counted"))
                     .unwrap_or_else(|| "Episode counter is not available yet".into()),
                     rect(18., 72., width - 36., 22.), 11., MUTED, false);
+                }
                 for (slot, entry) in self.guard_events.iter().skip(self.scroll).take(8).enumerate() {
                     let y = 104. + slot as f32 * 42.;
                     p.fill(rect(14., y, width - 32., 39.), 0x293238, 5.);
@@ -1855,6 +1873,7 @@ impl App {
                     p.label(&entry.title, rect(142., y + 1., width - 170., 20.), 12.,
                         if entry.warning { ORANGE } else { TEXT }, false);
                     p.label(&entry.detail, rect(142., y + 20., width - 170., 17.), 10., MUTED, false);
+                    area(Hit::Info(format!("{}\n{}\n{}",entry.time,entry.title,entry.detail)),rect(14.,y,width-32.,39.));
                 }
                 if self.guard_events.is_empty() {
                     p.ui_label(if self.guard_log_error.is_empty() { "No recent events · open the folder for archived logs" } else { &self.guard_log_error },
@@ -1867,8 +1886,9 @@ impl App {
                     p.fill(rect(width - 10., 106. + offset, 3., thumb), 0x77929f, 1.5);
                 }
                 p.ui_label(&format!("{} recent events · scroll · latest log tail", self.guard_events.len()), rect(18., height - 39., width - 90., 28.), 11., MUTED, false);
-                area(Hit::GuardFolder, rect(width - 54., height - 40., 36., 30.));
-                p.action_icon(&Hit::GuardFolder, width - 48., height - 36.);
+                let folder=if self.capacity_log{Hit::CapacityRetryFolder}else{Hit::GuardFolder};
+                area(folder.clone(), rect(width - 54., height - 40., 36., 30.));
+                p.action_icon(&folder, width - 48., height - 36.);
             }
             Some(Popup::Preferences) => {
                 let draft = self.preferences_draft.as_ref().unwrap_or(&self.settings);
@@ -1894,7 +1914,7 @@ impl App {
                     return hits;
                 }
                 p.ui_label("Settings", rect(16., 8., width - 120., 28.), 14., TEXT, false);
-                let home=concat!("Codex In-line Bar · v",env!("CARGO_PKG_VERSION"));
+                let home=concat!("Codex Session Bar · v",env!("CARGO_PKG_VERSION"));
                 let home_width=p.width(home,11.)+4.;
                 let home_left=width-20.-home_width;
                 area(Hit::ProjectHome,rect(home_left-4.,8.,home_width+8.,28.));
@@ -2019,8 +2039,17 @@ impl App {
                 area(Hit::Info(format!("{}\n{}",live.reset_notice.tooltip(now(),crate::locale::chinese()),self.paths.runtime.join("reset-notice-checks.jsonl").display())),rect(18.,532.,width-36.,27.));
                 p.line(16.,566.,width-16.,566.,0x3b484f,1.);
                 p.fill(rect(16.,575.,width-32.,31.),0x293238,6.);
-                area(Hit::CapacityRetryEnabled,rect(16.,575.,width-32.,31.));
-                p.ui_label("Capacity auto-retry",rect(27.,575.,width-110.,31.),12.,TEXT,false);
+                area(Hit::CapacityRetryEnabled,rect(16.,575.,width-226.,31.));
+                area(Hit::CapacityRetryEnabled,rect(width-73.,575.,57.,31.));
+                p.ui_label("Capacity auto-retry",rect(27.,575.,width-250.,31.),12.,TEXT,false);
+                let badge=rect(width-162.,579.,40.,23.);
+                p.fill(badge,if live.capacity_retry.in_flight{0x62411d}else{0x314759},10.);
+                area(Hit::CapacityRetryLogs,badge);
+                let count=live.capacity_retry.attempts.to_string();
+                let count_width=p.width(&count,11.).min(32.);
+                p.label(&count,rect(width-142.-count_width/2.,579.,count_width+1.,23.),11.,if live.capacity_retry.in_flight{ORANGE}else{NEW_RESULT},false);
+                area(Hit::CapacityRetryLogs,rect(width-113.,575.,32.,31.));
+                p.action_icon(&Hit::CapacityRetryLogs,width-108.,580.);
                 p.toggle(width-60.,583.,self.settings.capacity_retry.enabled);
                 p.ui_label("Append a continuation after a capacity error",rect(20.,612.,width-180.,27.),10.,MUTED,false);
                 p.fill(rect(width-151.,612.,131.,27.),0x1c2125,5.);
@@ -2100,6 +2129,10 @@ impl App {
                         let guard = self.snapshot().guard;
                         format!("{} recorded storm episodes · view log · continuous storms count once; recovered after 60 stable seconds",
                             guard.storm_count.map(|v|v.to_string()).unwrap_or_else(|| "—".into()))
+                    } else if a.hit==Hit::CapacityRetryLogs {
+                        let view=self.snapshot().capacity_retry;
+                        if crate::locale::chinese(){format!("累计触发 {} 次 · 已提交 {} · 未确认 {}\n点击查看日志 · 同一失败回合只计一次，取消等待不计数 · 重启后保留",view.attempts,view.submitted,view.unconfirmed)}
+                        else{format!("{} retry attempts · {} submitted · {} unconfirmed\nView log · once per failed turn, cancelled waits excluded · retained after restart",view.attempts,view.submitted,view.unconfirmed)}
                     } else if let Hit::TagFilter(key)=&a.hit {
                         self.tag_catalog.iter().find(|(tag,_)|&tag.key==key).map(|(tag,count)|format!("{} · {} chats · {} · click to toggle filter",tag.label,count,if tag.kind==tags::Kind::Custom{"custom tag"}else{"synced, read-only"})).unwrap_or_else(||tip_text(&a.hit,&self.catalog))
                     } else { tip_text(&a.hit, &self.catalog) }),
@@ -3229,12 +3262,13 @@ impl App {
                     let _=InvalidateRect(self.popup,None,false);
                 }
             }
-            Hit::GuardLogs => { let _ = self.popup(Popup::GuardLogs); }
-            Hit::GuardRefresh => { self.refresh_guard_events(); }
+            Hit::GuardLogs => { self.capacity_log=false;let _ = self.popup(Popup::GuardLogs); }
+            Hit::CapacityRetryLogs=>{self.capacity_log=true;let _=self.popup(Popup::GuardLogs);}
+            Hit::GuardRefresh | Hit::CapacityRetryRefresh => { self.refresh_guard_events(); }
             Hit::BackPreferences => { let _ = self.popup(Popup::Preferences); }
-            Hit::GuardFolder => {
+            Hit::GuardFolder | Hit::CapacityRetryFolder => {
                 if !self.testing {
-                    let path = guard::log_dir(&self.paths);
+                    let path = if self.capacity_log{self.paths.runtime.clone()}else{guard::log_dir(&self.paths)};
                     let path = path.to_string_lossy().trim_start_matches(r"\\?\").to_string();
                     let result = ShellExecuteW(self.popup, w!("open"), PCWSTR(wide(&path).as_ptr()),
                         PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
@@ -5058,6 +5092,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert!(preferences_hits.iter().any(|a| a.hit == Hit::Guard));
         assert!(preferences_hits.iter().any(|a|a.hit==Hit::ResetNoticeEnabled));
         assert!(preferences_hits.iter().any(|a|a.hit==Hit::CapacityRetryEnabled));
+        assert_eq!(preferences_hits.iter().find(|a|a.contains(418.,590.)).map(|a|&a.hit),Some(&Hit::CapacityRetryLogs));
+        assert_eq!(preferences_hits.iter().find(|a|a.contains(460.,590.)).map(|a|&a.hit),Some(&Hit::CapacityRetryLogs));
         let home=preferences_hits.iter().find(|a|a.hit==Hit::ProjectHome).expect("Settings must link the full product name and version to GitHub");
         assert!(home.r.top<35. && home.r.left>200. && home.r.right<=560.);
         let saved_capacity=app.settings.capacity_retry.clone();
@@ -5075,6 +5111,23 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         let bright=|image:&image::RgbImage|->usize{(578..603).flat_map(|y|(27..430).map(move|x|(x,y))).filter(|&(x,y)|image.get_pixel(x,y).0.iter().all(|channel|*channel>180)).count()};
         let foreground=bright(&normal);
         assert!(foreground>30 && bright(&hovered)*100>=foreground*90,"Hover background must preserve the extension title foreground");
+        let saved_retry_view=state.lock().unwrap().capacity_retry.clone();
+        state.lock().unwrap().capacity_retry=crate::capacity_retry::View{attempts:3,submitted:2,unconfirmed:1,tracking_since:now()-3600.,available:true,..Default::default()};
+        capture(&app,Some(Popup::Preferences),560,PREFERENCES_HEIGHT as u32,&paths.runtime.join("rust-capacity-retry-counter-verification.png"))?;
+        let saved_log_entries=app.guard_events.clone();
+        app.guard_events=vec![guard::LogEntry{time:"10-26 19:00:00".into(),title:"已提交继续消息 #3 · 示例会话".into(),detail:"会话 demo-chat · 失败回合 demo-turn · 等待 5 秒".into(),warning:false}];
+        let enabled_before=app.settings.capacity_retry.enabled;
+        app.hit(Hit::CapacityRetryLogs);
+        assert!(app.capacity_log&&app.popup_kind==Some(Popup::GuardLogs));
+        assert_eq!(app.settings.capacity_retry.enabled,enabled_before,"Log buttons must not toggle the extension");
+        let log_hits=capture(&app,Some(Popup::GuardLogs),640,496,&paths.runtime.join("rust-capacity-retry-log-verification.png"))?;
+        assert!(log_hits.iter().any(|area|area.hit==Hit::CapacityRetryRefresh));
+        assert!(log_hits.iter().any(|area|matches!(&area.hit,Hit::Info(text) if text.contains("demo-chat")&&text.contains("demo-turn"))));
+        app.hit(Hit::BackPreferences);
+        assert_eq!(app.popup_kind,Some(Popup::Preferences));
+        assert_eq!(app.settings.capacity_retry.enabled,enabled_before);
+        app.guard_events=saved_log_entries;
+        state.lock().unwrap().capacity_retry=saved_retry_view;
         crate::locale::follow(saved_capacity_culture);app.set_capacity_retry(saved_capacity)?;
         assert_eq!(SendMessageW(app.combo,CB_GETCOUNT,WPARAM(0),LPARAM(0)).0,2);
         let saved_notice_config=app.settings.reset_notice.clone();
