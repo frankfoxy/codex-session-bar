@@ -13,6 +13,7 @@ mod locale;
 mod telemetry;
 mod update;
 mod reset_notice;
+mod capacity_retry;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -147,6 +148,8 @@ pub struct Settings {
     pub refresh: refresh::Settings,
     #[serde(default)]
     pub reset_notice: reset_notice::Settings,
+    #[serde(default)]
+    pub capacity_retry: capacity_retry::Settings,
 }
 fn default_recent_rows() -> usize { 10 }
 fn default_title_width()->u32{200}
@@ -160,6 +163,7 @@ impl Default for Settings {
             recent_title_width:default_title_width(),
             refresh:refresh::Settings::default(),
             reset_notice:reset_notice::Settings::default(),
+            capacity_retry:capacity_retry::Settings::default(),
         }
     }
 }
@@ -212,6 +216,9 @@ pub struct Shared {
     pub guard: guard::View,
     pub updater: update::View,
     pub reset_notice: Arc<reset_notice::View>,
+    pub capacity_options: capacity_retry::Settings,
+    pub capacity_epoch: u64,
+    pub capacity_retry: capacity_retry::View,
     pub host: isize,
     pub view: Option<String>,
     pub view_label: String,
@@ -270,6 +277,7 @@ fn run() -> Result<()> {
             },
         );
     settings.reset_notice.clamp();
+    settings.capacity_retry.clamp();
     if settings.thread.is_empty() {
         settings.thread = desktop::default_context(&paths);
     }
@@ -277,6 +285,7 @@ fn run() -> Result<()> {
         auto_thread: settings.auto_thread,
         fixed_thread: settings.thread.clone(),
         refresh_options: settings.refresh.clone(),
+        capacity_options:settings.capacity_retry.clone(),
         recent: data::load_recent(&paths).into(),
         ..Shared::default()
     }));

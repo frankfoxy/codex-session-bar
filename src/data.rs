@@ -154,6 +154,11 @@ impl Row {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Recent {
+    // Live projection only: cached errors must never start old conversations.
+    #[serde(skip)]
+    pub capacity_failures: Vec<crate::capacity_retry::Failure>,
+    #[serde(skip)]
+    pub capacity_available: bool,
     #[serde(default)]
     pub all_rows: Vec<Row>,
     #[serde(default)]
@@ -578,6 +583,15 @@ impl Store {
         anyhow::ensure!(visible>0,"No local chat messages available");
         Ok(output)
     }
+    pub fn capacity_failure(&self,id:&str)->Result<Option<crate::capacity_retry::Failure>> {
+        let state=self.db("state_5.sqlite")?;
+        let row=state.query_row("SELECT COALESCE(NULLIF(name,''),title),rollout_path FROM threads WHERE id=? AND archived=0 AND agent_path IS NULL",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?;
+        let Some((label,path))=row.filter(|(_,path)|std::path::Path::new(path).is_file()) else{return Ok(None);};
+        let _=path;
+        let history=self.db("thread_history_1.sqlite")?;
+        let latest=history.query_row("SELECT turn_id,status,CASE WHEN length(CAST(error_json AS BLOB))<=8192 THEN error_json ELSE NULL END,completed_at FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<f64>>(3)?))).optional()?;
+        Ok(latest.and_then(|(turn,status,error,at)|crate::capacity_retry::failure(id,&label,&turn,&status,error.as_deref(),at)))
+    }
     pub fn read(&mut self, id: &str) -> Result<Snapshot> {
         let db = self.db("state_5.sqlite")?;
         let (mut snap, path) = db.query_row(
@@ -783,6 +797,9 @@ impl Store {
             crate::body::local_ids(&self.paths, rows.iter().map(|r| r.id.clone()).collect())?;
         rows.retain(|row| local.contains(&row.id));
         let mut turns = history.prepare("SELECT status FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1")?;
+        let mut capacity_turns=history.prepare("SELECT turn_id,status,CASE WHEN length(CAST(error_json AS BLOB))<=8192 THEN error_json ELSE NULL END,completed_at FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1").ok();
+        let mut capacity_failures=Vec::new();
+        let capacity_available=capacity_turns.is_some();
         let mut durations = history.prepare("SELECT SUM(CASE WHEN started_at IS NOT NULL AND completed_at >= started_at THEN completed_at-started_at END) FROM thread_turns WHERE thread_id=?")?;
         for row in &mut rows {
             row.total_seconds = durations.query_row([&row.id], |r| r.get(0))?;
@@ -819,6 +836,13 @@ impl Store {
                 },
             };
             row.state = state.into();
+            if state=="Failed" {
+                if let Some(query)=capacity_turns.as_mut() {
+                    if let Ok(Some((turn,status,error,at)))=query.query_row([&row.id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<f64>>(3)?))).optional() {
+                        if let Some(failure)=crate::capacity_retry::failure(&row.id,&row.label,&turn,&status,error.as_deref(),at) {capacity_failures.push(failure);}
+                    }
+                }
+            }
             row.is_unread = entry["isUnread"].as_bool();
             let updated = entry["updatedAt"]
                 .as_f64()
@@ -841,6 +865,8 @@ impl Store {
         let mut all_rows = rows.clone();
         all_rows.sort_by_key(|r| r.state != "Busy");
         Ok(Recent {
+            capacity_failures,
+            capacity_available,
             all_rows,
             rows,
             busy_count: Some(busy_metrics.len()),

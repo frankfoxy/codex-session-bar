@@ -62,6 +62,16 @@ The worker waits on its configuration channel between checks (five minutes by de
 
 Scanning diagnostics are retained under workspace `tmp/codex-session-bar/reset-notice-checks.jsonl`: request start/end, selected source/API, timestamps, result/error, discovered forecast/completion IDs and notification submission outcomes. At 128 KiB the log rotates into four gzip archives (`reset-notice-checks.1.gz` through `.4.gz`); no response bodies, credentials or chat contents are logged. Version 0.3.0 only retained an overwritten latest cache, so historical per-check timing cannot be reconstructed retroactively.
 
+## Capacity-error continuation extension
+
+`capacity_retry.rs` consumes the existing live `Recent` metadata projection. It does not poll conversation bodies or start another Codex server. The extension is off by default; its delay defaults to five seconds and is configurable from 1–300 seconds in Settings → Extensions. The metadata worker checks bounded `thread_turns.error_json` only for failed chats, using the existing per-thread index. Cached projections omit these failures, so an old cache cannot start a chat.
+
+A candidate must be the latest failed turn, have structured `serverOverloaded` information (or the exact legacy capacity message without another error code), and be no older than 15 minutes. Before sending, the action worker re-reads the latest turn from the read-only database. New turns, recovery, interruption, disabled settings and outdated configuration epochs cancel the request. The scheduler waits on the existing source signal; its one-second deadline checks memory only. Actual submission can be later than the configured delay while metadata or the desktop connection is unavailable.
+
+App Tools does not expose an in-place retry operation. With the user's consent, the extension calls `send_message_to_thread` once with `继续上次任务`, the original thread ID and local host, omitting model and reasoning overrides. This adds a user message and uses the chat's current configuration. A bounded journal claims the failed turn before the call; corrupt or unwritable journals block submission. Transport failures and ambiguous acknowledgements are not replayed automatically for the same failed turn, even across restarts. A subsequent failed turn is a new candidate.
+
+Diagnostics are in workspace `tmp/codex-session-bar/capacity-retry-events.jsonl`, recording queueing, skips, submission and unconfirmed outcomes with chat/turn identifiers. At 128 KiB the log rotates into four gzip archives. Prompt bodies, authentication and conversation contents are not logged. Unit tests use isolated databases and mock submission callbacks; native self-tests exercise the settings without starting this extension or sending live messages.
+
 ## Codex Git guard
 
 Git protection runs inside the Session Bar process. `guard.rs` owns settings and the status view; `guard/worker.rs` runs enforcement on a dedicated worker. Warnings use a separate thread, so an unanswered dialog or a full notification queue cannot pause enforcement. There is no standalone Memory Watch executable, monitor window, second tray icon, whole-system sampler or periodic sample log. The lightweight collector retains only process identities, ancestry and private bytes needed for Git checks; it performs no CPU history, grouping or memory-history recording.

@@ -50,7 +50,7 @@ const MODEL: u32 = 0xffdc91;
 const GREEN: u32 = 0x65d69b;
 const NEW_RESULT: u32 = 0x70b7ff;
 const DETAILS_HEIGHT: i32 = 310;
-const PREFERENCES_HEIGHT: i32 = 570;
+const PREFERENCES_HEIGHT: i32 = 676;
 const RECENT_ROW: i32 = 48;
 const LAYOUT_CACHE_LIMIT: usize = 256;
 const RECENT_TOP: i32 = 48;
@@ -193,6 +193,8 @@ enum Hit {
     ResetNotice(String),
     ResetNoticeEnabled,
     ResetNoticeInterval(i32),
+    CapacityRetryEnabled,
+    CapacityRetryInterval(i32),
     Rows(i32),
     TitleWidth(i32),
     ShortcutEnabled,
@@ -805,6 +807,8 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::CheckUpdate => "Check GitHub for updates now · ask before downloading",
         Hit::ResetNoticeEnabled => "Follow published Codex reset announcements · selected source only",
         Hit::ResetNoticeInterval(_) => "Announcement check interval · 1–60 minutes · changes apply immediately",
+        Hit::CapacityRetryEnabled=>"Automatically append a continuation only after the latest turn fails because the model is at capacity",
+        Hit::CapacityRetryInterval(_)=>"Capacity retry delay · 1–300 seconds · default 5 seconds",
         Hit::Rows(n) => if *n < 0 { "Show fewer rows" } else { "Show more rows" },
         Hit::ShortcutEnabled => "Enable shortcut · only while Codex or Session Bar has focus",
         Hit::GuardSettings => "Protection limits and check interval",
@@ -1107,6 +1111,11 @@ impl App {
         } else if let Some(control)=&self.notice_control {control.configure(config);}
         self.preferences_note="Saved · changes are active".into();
         Ok(())
+    }
+    fn set_capacity_retry(&mut self,mut config:crate::capacity_retry::Settings)->Result<()> {
+        config.clamp();let mut next=self.settings.clone();next.capacity_retry=config.clone();self.write_settings(&next)?;
+        self.settings=next;if let Some(draft)=self.preferences_draft.as_mut(){draft.capacity_retry=config.clone();}
+        crate::capacity_retry::configure(&self.state,config);self.preferences_note="Saved · changes are active".into();Ok(())
     }
     unsafe fn change_notice_source(&mut self) {
         let index=SendMessageW(self.combo,CB_GETCURSEL,WPARAM(0),LPARAM(0)).0;
@@ -1987,6 +1996,23 @@ impl App {
                     else {crate::locale::text("Reset announcement checks are disabled").into_owned()};
                 p.label(&check,rect(20.,534.,width-40.,23.),10.,if live.reset_notice.error.is_empty(){MUTED}else{ORANGE},false);
                 area(Hit::Info(format!("{}\n{}",live.reset_notice.tooltip(now(),crate::locale::chinese()),self.paths.runtime.join("reset-notice-checks.jsonl").display())),rect(18.,532.,width-36.,27.));
+                p.line(16.,566.,width-16.,566.,0x3b484f,1.);
+                p.fill(rect(16.,575.,width-32.,31.),0x293238,6.);
+                p.ui_label("Capacity auto-retry",rect(27.,575.,width-110.,31.),12.,TEXT,false);
+                area(Hit::CapacityRetryEnabled,rect(16.,575.,width-32.,31.));
+                p.toggle(width-60.,583.,self.settings.capacity_retry.enabled);
+                p.ui_label("Append a continuation after a capacity error",rect(20.,612.,width-180.,27.),10.,MUTED,false);
+                p.fill(rect(width-151.,612.,131.,27.),0x1c2125,5.);
+                for(delta,left)in[(-1,width-148.),(1,width-49.)]{
+                    area(Hit::CapacityRetryInterval(delta),rect(left,612.,27.,27.));
+                    p.line(left+9.,625.,left+18.,625.,MUTED,1.3);
+                    if delta>0 {p.line(left+13.5,620.5,left+13.5,629.5,MUTED,1.3);}
+                }
+                p.label(&format!("{} s",self.settings.capacity_retry.delay_secs),rect(width-117.,612.,67.,27.),11.,TEXT,false);
+                p.label(&live.capacity_retry.text(self.settings.capacity_retry.enabled,crate::locale::chinese()),rect(20.,646.,width-40.,23.),10.,if live.capacity_retry.last_error.is_empty(){MUTED}else{ORANGE},false);
+                let help=if crate::locale::chinese(){format!("仅限最新回合的模型容量不足错误。等待 {} 秒后追加“继续上次任务”，不指定新的模型、推理强度或 Fast。\n已恢复、已停止和旧错误会跳过；相同失败回合只发送一次。\n日志：{}\n{}",self.settings.capacity_retry.delay_secs,self.paths.runtime.join("capacity-retry-events.jsonl").display(),live.capacity_retry.last_error)}
+                    else{format!("Append a continuation after {}s only for the latest capacity failure. Keep the chat's model, effort and Fast settings.\nSkip recovered, stopped and old turns; send once per failed turn.\nLog: {}\n{}",self.settings.capacity_retry.delay_secs,self.paths.runtime.join("capacity-retry-events.jsonl").display(),live.capacity_retry.last_error)};
+                area(Hit::Info(help),rect(18.,644.,width-36.,27.));
             }
         }
         if kind==Some(Popup::Fixed){self.draw_chat_menu(&mut hits);}
@@ -3204,6 +3230,14 @@ impl App {
                 let mut config=self.settings.reset_notice.clone();config.enabled=!config.enabled;
                 if let Err(error)=self.set_reset_notice(config){self.preferences_note=format!("Could not save: {error}");}
             }
+            Hit::CapacityRetryEnabled=>{
+                let mut config=self.settings.capacity_retry.clone();config.enabled=!config.enabled;
+                if let Err(error)=self.set_capacity_retry(config){self.preferences_note=format!("Could not save: {error}");}
+            }
+            Hit::CapacityRetryInterval(delta)=>{
+                let mut config=self.settings.capacity_retry.clone();config.delay_secs=(config.delay_secs as i64+delta as i64).clamp(1,300) as u64;
+                if let Err(error)=self.set_capacity_retry(config){self.preferences_note=format!("Could not save: {error}");}
+            }
             Hit::ResetNoticeInterval(delta) => {
                 let mut config=self.settings.reset_notice.clone();config.check_minutes=(config.check_minutes as i64+delta as i64).clamp(1,60) as u64;
                 if let Err(error)=self.set_reset_notice(config){self.preferences_note=format!("Could not save: {error}");}
@@ -4090,6 +4124,7 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
         let workers = Workers::start(&paths, &state, &stop, &app.catalog);
         let mut observers = host::start(&paths, &state, &stop);
         observers.push(guard::start(&paths, &state, &stop));
+        observers.push(crate::capacity_retry::start(&paths,&state,&stop,workers.actions.clone()));
         let updates = crate::update::Service::start(&paths, &state, &stop, app.bar.0 as isize, QUIT_MESSAGE);
         app.update_control=updates.as_ref().map(|service|service.control());
         let notices=crate::reset_notice::Service::start(&paths,&state,&stop,app.settings.reset_notice.clone());
@@ -4977,6 +5012,15 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             &paths.runtime.join("rust-preferences-verification.png"))?;
         assert!(preferences_hits.iter().any(|a| a.hit == Hit::Guard));
         assert!(preferences_hits.iter().any(|a|a.hit==Hit::ResetNoticeEnabled));
+        assert!(preferences_hits.iter().any(|a|a.hit==Hit::CapacityRetryEnabled));
+        let saved_capacity=app.settings.capacity_retry.clone();
+        assert_eq!(saved_capacity.delay_secs,5);
+        app.hit(Hit::CapacityRetryEnabled);assert!(app.settings.capacity_retry.enabled);
+        app.hit(Hit::CapacityRetryInterval(1));assert_eq!(app.settings.capacity_retry.delay_secs,6);
+        assert_eq!(app.snapshot().capacity_options.delay_secs,6);
+        let saved_capacity_culture=crate::locale::status().0;crate::locale::follow(0x804);
+        capture(&app,Some(Popup::Preferences),560,PREFERENCES_HEIGHT as u32,&paths.runtime.join("rust-capacity-retry-settings-verification.png"))?;
+        crate::locale::follow(saved_capacity_culture);app.set_capacity_retry(saved_capacity)?;
         assert_eq!(SendMessageW(app.combo,CB_GETCOUNT,WPARAM(0),LPARAM(0)).0,2);
         let saved_notice_config=app.settings.reset_notice.clone();
         SendMessageW(app.combo,CB_SETCURSEL,WPARAM(0),LPARAM(0));app.change_notice_source();

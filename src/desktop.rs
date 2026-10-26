@@ -17,6 +17,7 @@ use std::{
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    CapacityRetry(crate::capacity_retry::Request),
     Navigate(String),
     Icon(String, String),
     Refresh,
@@ -152,6 +153,7 @@ impl Rpc {
     pub fn tool(&mut self, name: &str, args: Value, context: &str) -> Result<Value> {
         self.tool_attempts(name, args, context, 2)
     }
+    fn tool_once(&mut self,name:&str,args:Value,context:&str)->Result<Value>{self.tool_attempts(name,args,context,1)}
     fn read_tool(&mut self, name: &str, args: Value, context: &str) -> Result<Value> {
         // Background retries are scheduled externally; avoid chaining two
         // blocking requests before allowing the other source to update.
@@ -395,8 +397,13 @@ impl Workers {
                     action
                 };
                 let ctx = context(&s.lock().unwrap());
+                let capacity_action=matches!(action,Action::CapacityRetry(_));
                 let result = (|| -> Result<String> {
                     match action {
+                        Action::CapacityRetry(ref request)=>crate::capacity_retry::dispatch(&p,&s,&store,request,|thread,prompt|{
+                            let value=rpc.tool_once("send_message_to_thread",json!({"threadId":thread,"hostId":"local","prompt":prompt}),&ctx)?;
+                            anyhow::ensure!(value["threadId"]==thread,"Codex did not confirm the continuation target");Ok(())
+                        }),
                         Action::Refresh => {
                             s.lock().unwrap().quota_at = -1.0;
                             Ok("Refreshing account limits…".into())
@@ -438,6 +445,7 @@ impl Workers {
                     }
                 })();
                 let mut live = s.lock().unwrap();
+                if capacity_action {if let Err(error)=&result {live.capacity_retry.last_error=format!("{error:#}").chars().take(300).collect();}}
                 live.action_note = match result {
                     Ok(note) => note,
                     Err(e) => format!("Action failed: {e:#}"),
