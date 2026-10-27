@@ -118,6 +118,22 @@ Reopening applies the latest Busy-first order. Busy totals cover all scanned
 local roots, including those outside the ten displayed rows. Missing usage is
 shown as unavailable, not zero. Failed refreshes retain previous data as stale.
 
+Recent user previews are handled by `prompts.rs` on the existing metadata worker.
+A resumed rollout filename can bind a visible chat ID to a different physical
+history ID (`...-<chat-id>_<history-id>.jsonl`); that alias is accepted only when
+the corresponding history projection or user records exist. Navigation, titles
+and tags keep the visible ID. No rollout scan or per-chat API request is needed.
+The existing partial user-message index supplies at most 64 candidates, bounded
+by the projection cursor to avoid high ordinals left over during a rebuild.
+The latest meaningful prompt is selected, falling back to an earlier prompt
+longer than ten characters when the newest one is short. Transport/context
+envelopes remain excluded. Cache keys include history source, item identity,
+ordinal and revision for the examined candidate prefix. A warm refresh compares
+that prefix without fetching or parsing message JSON, so edits to fallback
+candidates also invalidate the preview. Each message stays capped at 64 KiB.
+`--inspect-prompts` is a read-only probe showing previews, physical history IDs
+and cold/warm metadata timings; it never sends a continuation or navigates chats.
+
 ## Rendering and window lifecycle
 
 `ui.rs` uses native Win32 windows, software Direct2D and DirectWrite. Chinese

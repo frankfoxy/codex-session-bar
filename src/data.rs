@@ -469,17 +469,18 @@ pub struct Store {
     databases: RefCell<HashMap<String, Rc<Connection>>>,
     cache: HashMap<String, Cache>,
     turn_contexts: HashMap<String, (String, u64, Option<crate::telemetry::Execution>)>,
-    prompts: HashMap<String, (i64, String)>,
+    prompts: crate::prompts::Store,
     tag_sources: crate::tags::Sources,
 }
 impl Store {
+    pub fn prompt_source(&self,id:&str)->Option<&str>{self.prompts.source(id)}
     pub fn new(paths: &Paths) -> Self {
         Self {
             paths: paths.clone(),
             databases: RefCell::new(HashMap::new()),
             cache: HashMap::new(),
             turn_contexts: HashMap::new(),
-            prompts: HashMap::new(),
+            prompts: crate::prompts::Store::default(),
             tag_sources: crate::tags::Sources::default(),
         }
     }
@@ -774,33 +775,8 @@ impl Store {
         }
         // Indexed, bounded latest-user-message lookups stay on the existing worker.
         // JSON is only parsed when the last user item changes, never per repaint.
-        if let (Ok(mut latest), Ok(mut messages)) = (
-            history.prepare("SELECT updated_at_ordinal FROM thread_items WHERE thread_id=? AND item_type='userMessage' ORDER BY rollout_ordinal DESC LIMIT 1"),
-            history.prepare("SELECT CASE WHEN length(CAST(item_json AS BLOB))<=65536 THEN item_json ELSE NULL END FROM thread_items WHERE thread_id=? AND item_type='userMessage' ORDER BY rollout_ordinal DESC LIMIT 64"),
-        ) {
-            for row in &mut rows {
-                let revision=latest.query_row([&row.id],|r|r.get::<_,i64>(0)).optional()?.unwrap_or(-1);
-                if self.prompts.get(&row.id).is_none_or(|(cached,_)|*cached!=revision) {
-                    let mut first=String::new(); let mut chosen=String::new(); let mut seen=false;
-                    if let Ok(mut values)=messages.query([&row.id]) {
-                        while let Some(value)=values.next()? {
-                            let Some(json)=value.get::<_,Option<String>>(0)? else{continue};
-                            let Some(text)=crate::body::history_text(&json) else{continue};
-                            let text=crate::tags::simplify_prompt(&text);
-                            if text.is_empty(){continue;}
-                            let count=text.chars().filter(|c|!c.is_whitespace()).count();
-                            if (!seen && count>=10) || (seen && count>10){chosen=text;break;}
-                            if !seen{first=text;seen=true;}
-                        }
-                    }
-                    if chosen.is_empty(){chosen=first;}
-                    self.prompts.insert(row.id.clone(),(revision,chosen));
-                }
-                row.prompt=self.prompts.get(&row.id).map(|(_,s)|s.clone()).unwrap_or_default();
-            }
-            let ids:std::collections::HashSet<_>=rows.iter().map(|r|r.id.as_str()).collect();
-            self.prompts.retain(|id,_|ids.contains(id.as_str()));
-        }
+        let state=self.db("state_5.sqlite")?;
+        self.prompts.refresh(&state,&history,&mut rows)?;
         let local =
             crate::body::local_ids(&self.paths, rows.iter().map(|r| r.id.clone()).collect())?;
         rows.retain(|row| local.contains(&row.id));
@@ -1300,10 +1276,12 @@ mod tests {
             Row {
                 id: "one".into(),
                 state: "Done".into(),
+                prompt:"刷新后的最近用户提问。".into(),
                 ..Row::default()
             },
         ];
         let fixed = stable_rows(&old, &incoming);
+        assert_eq!(fixed.iter().find(|row|row.id=="one").unwrap().prompt,"刷新后的最近用户提问。");
         assert_eq!(
             fixed.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["one", "two"]

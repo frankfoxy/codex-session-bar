@@ -2,6 +2,7 @@
 
 mod body;
 mod data;
+mod prompts;
 mod desktop;
 mod host;
 mod guard;
@@ -261,6 +262,7 @@ fn run() -> Result<()> {
         return desktop::inspect(&paths);
     }
     if args.iter().any(|s|s=="--inspect-capacity-retry") {return desktop::inspect_capacity(&paths);}
+    if args.iter().any(|s|s=="--inspect-prompts") {return desktop::inspect_prompts(&paths);}
     if args.iter().any(|s| s == "--observe") {
         return host::inspect(&paths);
     }

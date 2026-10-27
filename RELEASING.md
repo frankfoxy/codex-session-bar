@@ -1,6 +1,6 @@
 # 发布版本
 
-Git 标签标记源码版本；GitHub Release 提供该版本的说明和可下载程序。当前稳定版为 **0.3.5**，对应标签 **v0.3.5**。以下命令以稳定版为例；后续版本应使用新的版本号和标签。
+Git 标签标记源码版本；GitHub Release 提供该版本的说明和可下载程序。当前稳定版为 **0.3.6**，对应标签 **v0.3.6**。以下命令以稳定版为例；后续版本应使用新的版本号和标签。
 
 ## 1. 准备与打包
 
@@ -18,19 +18,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Package.ps1
 
 ## 2. 标签与 GitHub Release
 
-以下以 0.3.5 为例：
+以下以 0.3.6 为例：
 
 ```powershell
-git tag -a v0.3.5 -m "Codex Session Bar v0.3.5"
-git push origin v0.3.5
+git tag -a v0.3.6 -m "Codex Session Bar v0.3.6"
+git push origin v0.3.6
 ```
 
-打开仓库的 **Releases → Draft a new release**，选择 `v0.3.5`，标题填写 `Codex Session Bar v0.3.5`。填写变更说明和运行要求，附加打包脚本输出的 ZIP 与 `SHA256SUMS.txt`，确认后点击 **Publish release**。
+打开仓库的 **Releases → Draft a new release**，选择 `v0.3.6`，标题填写 `Codex Session Bar v0.3.6`。填写变更说明和运行要求，附加打包脚本输出的 ZIP 与 `SHA256SUMS.txt`，确认后点击 **Publish release**。
 
 已安装并登录 GitHub CLI 时，也可使用下列命令；将占位路径替换为打包输出的实际文件，发布说明文件放在工作区 `tmp`：
 
 ```powershell
-gh release create v0.3.5 <ZIP路径> <SHA256SUMS.txt路径> --verify-tag --title "Codex Session Bar v0.3.5" --notes-file <发布说明路径>
+gh release create v0.3.6 <ZIP路径> <SHA256SUMS.txt路径> --verify-tag --title "Codex Session Bar v0.3.6" --notes-file <发布说明路径>
 ```
 
 后续版本递增版本号并创建新标签。保留已发布标签，不覆盖旧版本附件。

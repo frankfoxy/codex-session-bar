@@ -497,6 +497,15 @@ pub fn inspect_capacity(paths:&Paths)->Result<()> {
     }
     println!("{}",json!({"version":env!("CARGO_PKG_VERSION"),"available":recent.capacity_available,"failures":rows,"mutations":false}));Ok(())
 }
+pub fn inspect_prompts(paths:&Paths)->Result<()> {
+    let stop=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut rpc=Rpc::new(paths,stop);let mut store=Store::new(paths);let context=default_context(paths);
+    let payload=rpc.read_tool("list_threads",json!({"limit":50}),&context)?;
+    let cold=Instant::now();let recent=store.recent(&payload)?;let cold_ms=cold.elapsed().as_secs_f64()*1000.;
+    let warm=Instant::now();let _=store.recent(&payload)?;let warm_ms=warm.elapsed().as_secs_f64()*1000.;
+    let rows:Vec<_>=recent.rows.iter().take(12).map(|row|json!({"id":row.id,"name":row.label,"prompt":row.prompt,"history_source":store.prompt_source(&row.id)})).collect();
+    println!("{}",json!({"version":env!("CARGO_PKG_VERSION"),"mutations":false,"rows":rows,"local_chats":recent.rows.len(),"cold_ms":cold_ms,"warm_ms":warm_ms}));Ok(())
+}
 pub fn inspect(paths: &Paths) -> Result<()> {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut rpc = Rpc::new(paths, stop);
