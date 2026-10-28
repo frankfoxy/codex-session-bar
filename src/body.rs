@@ -235,6 +235,9 @@ fn publish(output: &Mutex<Status>, state: &Status, control: &Control) {
     }
 }
 pub fn local_ids(paths: &Paths, ids: HashSet<String>) -> Result<HashSet<String>> {
+    let db = Connection::open_with_flags(paths.home.join("state_5.sqlite"), OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    db.busy_timeout(Duration::from_millis(500))?;
+    let internal = crate::visibility::internal_reviews(&db)?;
     let mut local: HashSet<_> = sources(paths, &ids)?
         .into_iter()
         .map(|(id, _)| id)
@@ -246,6 +249,8 @@ pub fn local_ids(paths: &Paths, ids: HashSet<String>) -> Result<HashSet<String>>
             }
         }
     }
+    // Also remove reviews restored from an older recent-list/body-index cache.
+    local.retain(|id| !internal.contains(id));
     Ok(local)
 }
 fn sources(paths: &Paths, ids: &HashSet<String>) -> Result<Vec<(String, PathBuf)>> {

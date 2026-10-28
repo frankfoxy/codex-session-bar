@@ -3,6 +3,7 @@
 mod body;
 mod data;
 mod prompts;
+mod visibility;
 mod desktop;
 mod host;
 mod guard;

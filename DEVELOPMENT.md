@@ -190,6 +190,15 @@ List editing uses a separate owned icon window with independent search/category/
 scroll and hit targets. The list HWND and child edit remain alive. Native combo
 activation is inside the popover; Escape closes the popover before its parent.
 
+Internal Guardian approval reviews are excluded by `thread_source=guardian_review`
+or `source.subagent.other=guardian`, including older restored list caches. An empty
+`agent_path` alone is insufficient to identify a user chat. No title-based filter
+or database mutation is used; missing source columns remain compatible.
+
+Reset announcement tooltips lead with forecast/status, show original/translated
+notice excerpts once, and place source/check metadata last. Bell color rules and
+raw links are omitted; pending/observed/stale/error distinctions remain explicit.
+
 List eligibility is the union of readable local rollout files and cached visible
 user/agent messages. Metadata-only records are excluded from both lists and the
 index denominator; percentages use indexed/local-chat count. The FTS cache keeps

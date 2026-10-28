@@ -498,10 +498,11 @@ impl Store {
     }
     pub fn sessions(&self) -> Result<Vec<Row>> {
         let db = self.db("state_5.sqlite")?;
+        let internal = crate::visibility::internal_reviews(&db)?;
         let mut query=db.prepare("SELECT id,title,updated_at,tokens_used,name,model,reasoning_effort FROM threads WHERE archived=0 AND agent_path IS NULL ORDER BY updated_at DESC,id")
             .or_else(|_|db.prepare("SELECT id,title,updated_at,tokens_used,name FROM threads WHERE archived=0 AND agent_path IS NULL ORDER BY updated_at DESC,id"))?;
         let has_execution = query.column_count() >= 7;
-        let rows = query
+        let mut rows = query
             .query_map([], |r| {
                 Ok(Row {
                     id: r.get(0)?,
@@ -522,6 +523,7 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.retain(|row| !internal.contains(&row.id));
         Ok(rows)
     }
     pub fn resolve(&self, label: &str) -> Result<Option<String>> {
@@ -1142,6 +1144,29 @@ mod tests {
         for label in ["", "Codex", "ChatGPT", "Home", "首页"] {
             assert!(visible_chat_title(label).is_none());
         }
+    }
+
+    #[test]
+    fn internal_approval_reviews_are_excluded_from_live_and_old_cached_lists() {
+        let (mut paths, dir)=fixture("internal-reviews");
+        paths.runtime=dir.clone();
+        let db=Connection::open(dir.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT,title TEXT,name TEXT,updated_at REAL,tokens_used INTEGER,archived INTEGER,agent_path TEXT,source TEXT,thread_source TEXT,rollout_path TEXT);
+            INSERT INTO threads VALUES('review','Guardian review',NULL,20,100,0,NULL,'vscode','guardian_review',NULL),
+                ('user','Guardian review',NULL,10,200,0,NULL,'vscode','user',NULL);").unwrap();
+        let history=Connection::open(dir.join("thread_history_1.sqlite")).unwrap();
+        history.execute_batch("CREATE TABLE thread_items(thread_id TEXT,item_id TEXT,item_type TEXT,updated_at_ordinal INTEGER,item_json TEXT);
+            INSERT INTO thread_items VALUES('review','r','userMessage',1,'{}'),('user','u','userMessage',1,'{}');").unwrap();
+        let store=Store::new(&paths);
+        assert_eq!(store.sessions().unwrap().iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),vec!["user"]);
+        let local=crate::body::local_ids(&paths,std::collections::HashSet::from(["review".into(),"user".into()])).unwrap();
+        assert_eq!(local,std::collections::HashSet::from(["user".into()]));
+        paths.write("recent-cache.json",&json!({"rows":[{"id":"review","label":"Guardian review"},{"id":"user","label":"Guardian review"}],
+            "all_rows":[{"id":"review","label":"Guardian review"},{"id":"user","label":"Guardian review"}]}));
+        let cached=load_recent(&paths);
+        assert_eq!(cached.rows.len(),1);assert_eq!(cached.rows[0].id,"user");
+        assert_eq!(cached.all_rows.len(),1);
+        assert_eq!(db.query_row("SELECT count(*) FROM threads",[],|r|r.get::<_,i64>(0)).unwrap(),2);
     }
 
     #[test]

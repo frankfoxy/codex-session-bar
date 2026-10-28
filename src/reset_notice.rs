@@ -250,226 +250,220 @@ impl View {
         self.current.as_ref().filter(|notice| notice.valid_at(at))
     }
     pub fn tooltip(&self, at: f64, zh: bool) -> String {
-        let mut text = format!(
-            "{}\n{}: {}\n{}",
-            if zh {
-                "Codex 官方成员重置预告"
-            } else {
-                "Codex team reset announcement"
-            },
-            if zh { "整理来源" } else { "Data from" },
-            self.source.label(),
-            self.source.url()
-        );
-        text.push_str(if zh {
-            "\n第三方公告整理；不是账户自身的额度重置计时。"
+        let mut lines = vec![if zh {
+            "Codex 重置预告"
         } else {
-            "\nThird-party announcement tracker; separate from your account reset timer."
-        });
-        text.push_str(&format!("\n{}", self.check_status(zh)));
-        text.push_str(if zh {"\n铃铛：预告前 3 小时橙色；来源确认后当天 3 小时内绿色；其余灰色。"}
-            else {"\nBell: orange within 3 hours before; green for 3 hours after a reported reset on the same day; otherwise gray."});
-        if !self.error.is_empty() {
-            text.push_str(&format!(
-                "\n{}: {}",
-                if zh { "刷新提示" } else { "Refresh note" },
-                clip(&self.error, 180)
-            ));
+            "Codex reset announcement"
         }
-        if self.checked_at > 0. && at - self.checked_at > STALE_AFTER {
-            text.push_str(if zh {"\n缓存已超过 6 小时未成功刷新；灰铃仅供回看，不显示有效倒计时。"}
-                else {"\nCache is over 6 hours old; the gray bell keeps history only, with no active countdown."});
-        }
-        if let Some(current) = &self.current {
-            let qualifier = match current.bound {
-                Bound::Before => {
-                    if zh {
-                        "之前（截止时间）"
-                    } else {
-                        "by (deadline)"
-                    }
-                }
-                Bound::Around => {
-                    if zh {
-                        "左右（预计）"
-                    } else {
-                        "around (estimate)"
-                    }
-                }
-                Bound::At => {
-                    if zh {
-                        "（预告时间）"
-                    } else {
-                        "(announced time)"
-                    }
-                }
+        .to_string()];
+        let current = self.current.as_ref();
+        let stale = self.checked_at > 0.
+            && self.active(at).is_none()
+            && (at - self.checked_at > STALE_AFTER || self.checked_at > at + 300.);
+        if let Some(notice) = current {
+            let qualifier = match (notice.bound, zh) {
+                (Bound::Before, true) => "之前",
+                (Bound::Before, false) => "by",
+                (Bound::Around, true) => "左右",
+                (Bound::Around, false) => "around",
+                _ => "",
             };
-            text.push_str(&format!(
-                "\n{}: {} {}",
-                if zh { "预计复位" } else { "Expected reset" },
-                date(current.at, "%Y-%m-%d %H:%M:%S %:z"),
-                qualifier
-            ));
-            if current.at <= at {
-                text.push_str(if zh {
-                    "\n预告时间已到，等待来源确认；不表示已经重置，不再显示预告倒计时。"
-                } else {
-                    "\nAnnounced time has passed; awaiting confirmation, not proof of completion. No forecast countdown."
-                });
-            }
-            if !current.expression.is_empty() {
-                text.push_str(&format!(
-                    "\n{}: {}",
-                    if zh { "时间原文" } else { "Time wording" },
-                    clip(&current.expression, 180)
-                ));
-            }
-            for post in current.posts.iter().take(3) {
-                let name = if post.observed {
+            if stale {
+                lines.push(
                     if zh {
-                        "站点观测"
+                        "缓存已过期，预告仅供参考"
                     } else {
-                        "Site observation"
+                        "Outdated cache; forecast for reference only"
                     }
-                } else {
-                    post.author.as_str()
-                };
-                text.push_str(&format!(
-                    "\n\n{name}\n{}: {}\n{}: {}",
-                    if zh { "原文" } else { "Original" },
-                    clip(&post.original, 300),
-                    if zh { "译文" } else { "Chinese translation" },
-                    if post.translation.is_empty() {
-                        if zh {
-                            "来源暂未提供译文".into()
-                        } else {
-                            "Not supplied by the source".into()
-                        }
+                    .into(),
+                );
+            } else if notice.at <= at {
+                lines.push(
+                    if zh {
+                        "预告时间已过，尚未确认重置"
                     } else {
-                        clip(&post.translation, 300)
+                        "Forecast time passed; reset not confirmed"
                     }
+                    .into(),
+                );
+            }
+            let time = date(notice.at, "%m-%d %H:%M %:z");
+            lines.push(if zh {
+                format!("预计重置: {time}{qualifier}")
+            } else {
+                format!("Expected reset: {qualifier} {time}").replace(":  ", ": ")
+            });
+            if !stale && self.active(at).is_some() && notice.at > at {
+                lines.push(format!(
+                    "{}: {}",
+                    if zh { "剩余" } else { "In" },
+                    crate::telemetry::countdown(notice.at, at)
                 ));
-                if !post.url.is_empty() {
-                    text.push_str(&format!("\n{}", post.url));
-                }
             }
         } else {
-            text.push_str(if zh {
-                "\n暂无带明确时间的重置预告。"
-            } else {
-                "\nNo reset announcement with an explicit time."
-            });
-            if let Some(previous) = self.history.first() {
-                text.push_str(&format!(
-                    "\n\n{} · {}",
-                    if zh {
-                        "上一条提示（历史记录）"
-                    } else {
-                        "Previous notice (history)"
-                    },
-                    date(previous.announced_at, "%m-%d %H:%M")
-                ));
-                if previous.at > 0. && !previous.completed {
-                    text.push_str(&format!(
-                        "\n{}: {}",
-                        if zh {
-                            "此前预告时间，未据此判定完成"
-                        } else {
-                            "Earlier forecast; not proof of completion"
-                        },
-                        date(previous.at, "%Y-%m-%d %H:%M:%S %:z")
-                    ));
+            lines.push(
+                if zh {
+                    "暂无明确的下一次重置时间"
+                } else {
+                    "No explicit next reset time"
                 }
-                for post in previous.posts.iter().take(2) {
-                    text.push_str(&format!(
-                        "\n{}\n{}: {}\n{}: {}",
-                        if post.observed {
-                            if zh {
-                                "站点观测"
-                            } else {
-                                "Site observation"
-                            }
+                .into(),
+            );
+        }
+        let detail = current.or_else(|| self.history.first());
+        if let Some(notice) = detail {
+            lines.push(String::new());
+            lines.push(format!(
+                "{} · {}{}",
+                if current.is_some() {
+                    if zh {
+                        "本次预告"
+                    } else {
+                        "Announcement"
+                    }
+                } else if zh {
+                    "最近消息"
+                } else {
+                    "Latest notice"
+                },
+                date(notice.announced_at, "%m-%d %H:%M"),
+                notice_marker(notice, zh)
+            ));
+            if current.is_none() && notice.at > 0. {
+                lines.push(format!(
+                    "{}: {}",
+                    if notice.completed {
+                        if zh {
+                            "来源报告重置"
                         } else {
-                            post.author.as_str()
-                        },
-                        if zh { "原文" } else { "Original" },
-                        clip(&post.original, 250),
-                        if zh { "译文" } else { "Chinese translation" },
-                        if post.translation.is_empty() {
-                            if zh {
-                                "来源暂未提供译文".into()
-                            } else {
-                                "Not supplied by the source".into()
-                            }
-                        } else {
-                            clip(&post.translation, 250)
+                            "Source-reported reset"
                         }
-                    ));
+                    } else if zh {
+                        "此前预计（未确认）"
+                    } else {
+                        "Earlier forecast (unconfirmed)"
+                    },
+                    date(notice.at, "%m-%d %H:%M %:z")
+                ));
+            }
+            if notice.posts.is_empty() {
+                if !notice.summary.is_empty() {
+                    lines.push(notice_excerpt(&notice.summary, 180));
+                }
+            } else {
+                for post in notice.posts.iter().take(2) {
+                    if !post.author.is_empty() && !post.observed {
+                        lines.push(clip(&post.author, 60));
+                    }
+                    if !post.original.is_empty() {
+                        lines.push(format!(
+                            "{}: {}",
+                            if zh { "原文" } else { "Original" },
+                            notice_excerpt(&post.original, 180)
+                        ));
+                    }
+                    if !post.translation.is_empty() {
+                        lines.push(format!(
+                            "{}: {}",
+                            if zh { "译文" } else { "Chinese translation" },
+                            notice_excerpt(&post.translation, 180)
+                        ));
+                    }
                 }
             }
         }
-        if !self.history.is_empty() {
-            text.push_str(if zh {
-                "\n\n近期记录"
-            } else {
-                "\n\nRecent notices"
-            });
-            for notice in self.history.iter().take(3) {
+        let others: Vec<_> = self
+            .history
+            .iter()
+            .filter(|notice| detail.is_none_or(|selected| selected.id != notice.id))
+            .take(2)
+            .collect();
+        if !others.is_empty() {
+            lines.push(String::new());
+            lines.push(
+                if zh {
+                    "更早消息"
+                } else {
+                    "Earlier notices"
+                }
+                .into(),
+            );
+            for notice in others {
                 let summary = notice
                     .posts
                     .first()
-                    .filter(|post| !post.translation.is_empty() && zh)
+                    .filter(|post| zh && !post.translation.is_empty())
                     .map(|post| post.translation.as_str())
                     .unwrap_or(&notice.summary);
-                let observed = notice.posts.first().is_some_and(|post| post.observed);
-                text.push_str(&format!(
-                    "\n{}{} · {}",
+                lines.push(format!(
+                    "{}{} · {}",
                     date(notice.announced_at, "%m-%d %H:%M"),
-                    if observed {
-                        if zh {
-                            " [观测]"
-                        } else {
-                            " [observed]"
-                        }
-                    } else if !notice.completed {
-                        if zh {
-                            " [预告]"
-                        } else {
-                            " [forecast]"
-                        }
-                    } else {
-                        ""
-                    },
-                    clip(summary, 90)
+                    notice_marker(notice, zh),
+                    notice_excerpt(summary, 72)
                 ));
             }
         }
-        if self.checked_at > 0. {
-            text.push_str(&format!(
-                "\n\n{}: {}",
-                if zh {
-                    "上次成功检查"
-                } else {
-                    "Last successful check"
-                },
-                date(self.checked_at, "%m-%d %H:%M")
-            ));
-        }
+        lines.push(String::new());
+        lines.push(format!(
+            "{}: {}",
+            if zh { "来源" } else { "Source" },
+            self.source.label()
+        ));
+        lines.push(self.check_status(zh));
         if !self.error.is_empty() {
-            text.push_str(&format!(
-                "\n{}: {}",
-                if zh { "刷新提示" } else { "Refresh note" },
-                clip(&self.error, 180)
+            lines.push(format!(
+                "{}: {}",
+                if zh { "检查失败" } else { "Check error" },
+                notice_excerpt(&self.error, 100)
             ));
         }
-        text.push_str(if zh {
-            "\n点击打开当前来源网站。"
-        } else {
-            "\nClick to open this source website."
-        });
-        clip(&text, 2600)
+        if stale && current.is_none() {
+            lines.push(
+                if zh {
+                    "缓存已过期，仅供参考"
+                } else {
+                    "Outdated cache; for reference only"
+                }
+                .into(),
+            );
+        }
+        lines.push(
+            if zh {
+                "第三方整理，非账户额度倒计时 · 点击查看来源"
+            } else {
+                "Third-party tracker, separate from account limits · Click to open source"
+            }
+            .into(),
+        );
+        lines.join("\n")
     }
 }
+fn notice_marker(notice: &Notice, zh: bool) -> &'static str {
+    if notice.posts.first().is_some_and(|post| post.observed) {
+        if zh {
+            " [观测]"
+        } else {
+            " [observed]"
+        }
+    } else if !notice.completed {
+        if zh {
+            " [预告]"
+        } else {
+            " [forecast]"
+        }
+    } else {
+        ""
+    }
+}
+fn notice_excerpt(text: &str, limit: usize) -> String {
+    let compact = text
+        .split_whitespace()
+        .filter(|word| !word.starts_with("https://") && !word.starts_with("http://"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    clip(&compact, limit)
+}
+
 fn timestamp(value: &Value) -> Option<f64> {
     let time = chrono::DateTime::parse_from_rfc3339(value.as_str()?)
         .ok()?
@@ -1364,10 +1358,10 @@ mod tests {
         assert!(!previous.completed);
         assert_eq!(previous.posts[0].translation, "预告时间之前");
         let tooltip = view.tooltip(expired_at, true);
-        assert!(tooltip.contains("上一条提示"));
+        assert!(tooltip.contains("最近消息"));
         assert!(tooltip.contains("By the stated time"));
         assert!(tooltip.contains("预告时间之前"));
-        assert!(tooltip.contains("未据此判定完成"));
+        assert!(tooltip.contains("此前预计（未确认）"));
     }
     #[test]
     fn disappearing_forecasts_remain_history_without_crossing_sources() {
@@ -1396,7 +1390,7 @@ mod tests {
         copy_enrichment(&mut another, &previous);
         assert!(another.history.is_empty());
         let stale = previous.tooltip(at() + STALE_AFTER + 1., true);
-        assert!(stale.contains("灰铃仅供回看"));
+        assert!(stale.contains("缓存已过期"));
     }
     #[test]
     fn codex_probability_and_unverified_sources_never_become_reset_times() {
@@ -1427,7 +1421,85 @@ mod tests {
         value["posts"][0]["text"] = json!("x".repeat(10000));
         value["posts"][0]["translation"] = json!("译".repeat(10000));
         let view = divin(vec![value]);
-        assert!(view.tooltip(at(), true).chars().count() <= 2600);
+        assert!(view.tooltip(at(), true).chars().count() <= 1400);
+    }
+    #[test]
+    fn tooltip_prioritizes_status_and_deduplicates_history_and_check_details() {
+        let latest = Notice {
+            id: "latest".into(),
+            announced_at: at() - 60.,
+            posts: vec![Post {
+                author: "Tibo".into(),
+                original: "A brief update. https://t.co/example".into(),
+                translation: "简短更新。 https://t.co/example".into(),
+                ..Default::default()
+            }],
+            summary: "A brief update.".into(),
+            ..Default::default()
+        };
+        let view = View {
+            checked_at: at(),
+            next_check_at: at() + 300.,
+            history: vec![latest],
+            ..Default::default()
+        };
+        for zh in [true, false] {
+            let tip = view.tooltip(at(), zh);
+            assert_eq!(tip.matches("A brief update.").count(), 1);
+            assert_eq!(tip.matches("简短更新。").count(), 1);
+            assert!(!tip.contains("https://"));
+            assert!(!tip.contains("Bell:") && !tip.contains("铃铛："));
+            let lines: Vec<_> = tip.lines().collect();
+            assert!(lines[1].contains(if zh { "暂无明确" } else { "No explicit" }));
+            assert_eq!(
+                tip.matches(if zh { "上次成功" } else { "Last success" })
+                    .count(),
+                1
+            );
+        }
+        let mut failed = view.clone();
+        failed.error = "Service unavailable".into();
+        assert_eq!(
+            failed
+                .tooltip(at(), false)
+                .matches("Service unavailable")
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn tooltip_keeps_future_pending_and_stale_forecasts_distinct() {
+        let mut view = View {
+            checked_at: at(),
+            current: Some(Notice {
+                id: "next".into(),
+                at: at() + 300.,
+                bound: Bound::Before,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(view
+            .tooltip(at(), false)
+            .lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("Expected reset: by "));
+        assert!(view.tooltip(at(), true).contains("剩余:"));
+        view.current.as_mut().unwrap().at = at() - 1.;
+        assert!(view
+            .tooltip(at(), true)
+            .lines()
+            .nth(1)
+            .unwrap()
+            .contains("尚未确认重置"));
+        assert!(!view.tooltip(at(), true).contains("剩余:"));
+        assert!(view
+            .tooltip(at() + STALE_AFTER + 1., true)
+            .lines()
+            .nth(1)
+            .unwrap()
+            .contains("缓存已过期"));
     }
     #[test]
     fn divin_keeps_announcement_time_wording_and_latest_revision() {
