@@ -52,8 +52,24 @@ impl Default for View {
     }
 }
 fn dir(paths: &Paths) -> PathBuf {
-    // Keep the legacy directory so upgrades preserve limits, counters and logs.
-    paths.runtime.parent().unwrap().join("memory-watch-rust")
+    paths.runtime.join("git-guard")
+}
+pub fn migrate_legacy(legacy:&std::path::Path,destination:&std::path::Path)->anyhow::Result<()> {
+    // Copy only small settings/counters; never remove the old records or override
+    // an already initialized installation. Runtime files follow the OS temp root.
+    if !legacy.is_dir() || [CONFIG,STATUS,"codex-git-guard-counters.json"].iter().any(|name|destination.join(name).exists()) {return Ok(());}
+    for name in [CONFIG,STATUS,"codex-git-guard-counters.json"] {
+        let source=legacy.join(name);
+        if !fs::metadata(&source).is_ok_and(|m|m.is_file()&&m.len()<=16384) {continue;}
+        fs::create_dir_all(destination)?;
+        let mut input=fs::File::open(&source)?;
+        match fs::OpenOptions::new().write(true).create_new(true).open(destination.join(name)) {
+            Ok(mut output)=>{std::io::copy(&mut input,&mut output)?;},
+            Err(error) if error.kind()==std::io::ErrorKind::AlreadyExists=>{},
+            Err(error)=>return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 pub fn log_dir(paths: &Paths) -> PathBuf { dir(paths) }
 #[derive(Clone,Debug,Serialize,Deserialize)]
@@ -99,6 +115,9 @@ fn parse_events(bytes: &[u8], skip_first: bool) -> Vec<LogEntry> {
         let kind = value["type"].as_str().unwrap_or("");
         let pid = value["pid"].as_u64().unwrap_or(0);
         let (title, detail, warning) = match kind {
+            "storage_restored" | "storage_recovered" => (
+                if crate::locale::chinese() {"防护文件已恢复"} else {"Protection storage recovered"}.into(),
+                if crate::locale::chinese() {"继续使用最近有效设置与累计计数；进程检查未因写入错误停用"} else {"Continuing checks with last valid settings and counters"}.into(), false),
             "storm_started" => (format!("Git storm #{} detected", value["episode"].as_u64().unwrap_or(0)),
                 format!("{} Git · {:.0} MiB · protection activated", value["count"].as_u64().unwrap_or(0), value["private_bytes"].as_u64().unwrap_or(0) as f64 / 1048576.), true),
             "storm_recovered" => ("Storm recovered".into(), "Below limits for 60 seconds".into(), false),
@@ -214,7 +233,7 @@ pub fn start(paths: &Paths, state: &State, stop: &Stop) -> thread::JoinHandle<()
 }
 
 #[cfg(test)]
-fn test_workspace() -> PathBuf {
+pub(crate) fn test_workspace() -> PathBuf {
     let root = std::env::var_os("CODEX_SESSION_BAR_WORKSPACE").map(PathBuf::from)
         .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors().find(|p| p.file_name().is_some_and(|n| n == "tools"))
@@ -225,6 +244,22 @@ fn test_workspace() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_settings_and_counts_are_copied_without_overwriting_new_settings() {
+        let root=test_workspace().join("tmp").canonicalize().unwrap();
+        let fixture=root.join(format!("guard-migration-{}",std::process::id()));
+        let legacy=fixture.join("old");let target=fixture.join("new/git-guard");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join(CONFIG),br#"{"enabled":false,"max_processes":24}"#).unwrap();
+        fs::write(legacy.join(STATUS),br#"{"storm_count":20,"terminated":51013}"#).unwrap();
+        migrate_legacy(&legacy,&target).unwrap();
+        assert_eq!(read_json(&target.join(CONFIG),4096)["max_processes"],24);
+        assert!(legacy.join(CONFIG).is_file());
+        fs::write(legacy.join(CONFIG),br#"{"max_processes":64}"#).unwrap();
+        migrate_legacy(&legacy,&target).unwrap();
+        assert_eq!(read_json(&target.join(CONFIG),4096)["max_processes"],24);
+        fs::remove_dir_all(fixture).unwrap();
+    }
     #[test]
     fn integrated_worker_preserves_preferences_and_rejects_companion_status() {
         let temp = test_workspace().join("tmp").canonicalize().unwrap();

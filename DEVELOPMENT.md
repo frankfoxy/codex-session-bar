@@ -21,7 +21,7 @@ compiler directly, without asking rustup to update a toolchain.
 
 `-Check` runs the unit suite before producing the release binary. `--self-test`
 uses sanitized fixtures, hidden windows and software-rendered captures under
-`tmp/codex-session-bar`. It verifies the home-page overview, fixed recent-list
+`%TEMP%/codex-session-bar` (tests redirect TEMP into workspace `tmp`). It verifies the home-page overview, fixed recent-list
 order, emoji catalog/search, bound random-icon actions and separate drag area.
 Inspect its PNGs before changing curated README previews. The other two probes
 are read-only: `--inspect` checks real recent-chat and quota RPC responses;
@@ -60,7 +60,7 @@ The bell is orange within three hours before a future explicit timestamp, green 
 
 The worker waits on its configuration channel between checks (five minutes by default, configurable 1–60). Source switches immediately clear shared state and queued reminders; stale in-flight results are discarded. Primary `latest_reset` records remain usable even when the translation endpoint fails. `reminder.rs` detects fresh forecasts and newly reported completions (24-hour catch-up limit), queues nonblocking Windows tray notifications and persists deduplication after successful submission. Windows quiet-hours settings can still suppress a submitted notification; the same-day green badge remains independent of notification delivery. The UI clones an `Arc<View>` and performs no announcement-file polling. `--inspect-reset-notice` (Codex Resets) and `--inspect-reset-notice --divin` are read-only network probes. Native self-tests use synthetic notices without opening a browser or starting live tracking.
 
-Scanning diagnostics are retained under workspace `tmp/codex-session-bar/reset-notice-checks.jsonl`: request start/end, selected source/API, timestamps, result/error, discovered forecast/completion IDs and notification submission outcomes. At 128 KiB the log rotates into four gzip archives (`reset-notice-checks.1.gz` through `.4.gz`); no response bodies, credentials or chat contents are logged. Version 0.3.0 only retained an overwritten latest cache, so historical per-check timing cannot be reconstructed retroactively.
+Scanning diagnostics are retained under system `%TEMP%/codex-session-bar/reset-notice-checks.jsonl`: request start/end, selected source/API, timestamps, result/error, discovered forecast/completion IDs and notification submission outcomes. At 128 KiB the log rotates into four gzip archives (`reset-notice-checks.1.gz` through `.4.gz`); no response bodies, credentials or chat contents are logged. Version 0.3.0 only retained an overwritten latest cache, so historical per-check timing cannot be reconstructed retroactively.
 
 ## Capacity-error continuation extension
 
@@ -74,13 +74,13 @@ App Tools does not expose an in-place retry operation. With the user's consent, 
 
 The extension row includes a retry-count badge and log button, both opening the shared native log viewer without toggling the extension. Counts represent actual submission attempts, once per failed turn; cancelled waits are excluded. Counters and the start time are saved with the dedup journal before sending, then results are saved after acknowledgement. Restarting retains totals; claims without a confirmed outcome remain unconfirmed. Legacy journals retain their dedup identities but start the new counters at the first retry after upgrading; older logs are visible without claiming a complete historical total.
 
-Diagnostics are in workspace `tmp/codex-session-bar/capacity-retry-events.jsonl`, recording queueing, skips, preflight failures, retry numbers, configured delays, submission and unconfirmed outcomes with chat/turn identifiers. A mutex serializes writes and rotation. At 128 KiB the log rotates into four gzip archives. The viewer reads at most a 64 KiB tail on open or explicit refresh, ignores partial records, shows up to 64 recent events and exposes full IDs/reasons in hover text; it performs no periodic log polling. Prompt bodies, authentication and conversation contents are not logged. Unit tests use isolated databases and mock submission callbacks; native self-tests exercise the settings and viewer without starting this extension or sending live messages.
+Diagnostics are in system `%TEMP%/codex-session-bar/capacity-retry-events.jsonl`, recording queueing, skips, preflight failures, retry numbers, configured delays, submission and unconfirmed outcomes with chat/turn identifiers. A mutex serializes writes and rotation. At 128 KiB the log rotates into four gzip archives. The viewer reads at most a 64 KiB tail on open or explicit refresh, ignores partial records, shows up to 64 recent events and exposes full IDs/reasons in hover text; it performs no periodic log polling. Prompt bodies, authentication and conversation contents are not logged. Unit tests use isolated databases and mock submission callbacks; native self-tests exercise the settings and viewer without starting this extension or sending live messages.
 
 ## Codex Git guard
 
 Git protection runs inside the Session Bar process. `guard.rs` owns settings and the status view; `guard/worker.rs` runs enforcement on a dedicated worker. Warnings use a separate thread, so an unanswered dialog or a full notification queue cannot pause enforcement. There is no standalone Memory Watch executable, monitor window, second tray icon, whole-system sampler or periodic sample log. The lightweight collector retains only process identities, ancestry and private bytes needed for Git checks; it performs no CPU history, grouping or memory-history recording.
 
-Existing configuration, episode counters and event logs remain in workspace `tmp/memory-watch-rust` for upgrade compatibility. Status must match the current Session Bar PID and have a fresh heartbeat; old companion status is rejected. Default limits remain 16 processes / 1024 MiB / five seconds, while saved user limits are preserved. Event logs retain compressed rotation. Protection remains active when the bar is hidden; exiting Session Bar stops its protection worker.
+Configuration, episode counters and event logs use `%TEMP%/codex-session-bar/git-guard`. Initial startup copies small settings/counter/status files from the legacy workspace `tmp/memory-watch-rust` if the new store is uninitialized; the source is preserved. Deleted directories self-heal using the last valid in-memory settings and totals. Storage failures do not stop process enforcement, retry at 1 second, and produce at most one popup per minute. Status must match the current Session Bar PID and have a fresh heartbeat; old companion status is rejected. Default limits remain 16 processes / 1024 MiB / five seconds, while saved user limits are preserved. Event logs retain compressed rotation. Protection remains active when the bar is hidden; exiting Session Bar stops its protection worker.
 
 Enforcement normally runs every five seconds, switches to one second after a breach or failure, and returns to the configured interval after 60 stable seconds. Two snapshots confirm a breach; only verified read-query Git handles are terminated, with an intent record before termination. Creation-time validation prevents PID reuse errors. An executable name alone is insufficient; installed Codex path, account and Windows session are verified. Write/unknown commands are never killed. Shutdown/cancellation does not stop unrelated applications.
 
@@ -150,8 +150,7 @@ restore a user-hidden bar. Quit stops its integrated guard worker and its own
 adapter children. It never stops Codex or another task.
 
 Preferences remain in ignored `settings.json`. Runtime files stay in the
-workspace's direct `tmp/codex-session-bar` directory. Set
-`CODEX_SESSION_BAR_WORKSPACE` to an existing workspace when needed. The named
+system `%TEMP%/codex-session-bar` directory, resolved by the OS without a fixed user or drive path. Runtime discovery leaves TEMP/TMP/TMPDIR unchanged; build/test launchers redirect them into workspace `tmp` for isolated verification. Small retry-claim/reminder caches migrate once without overwriting existing files; source files remain intact. The named
 Windows show event keeps the installed opening skill compatible with both
 versions. The native mutex prevents duplicate Rust instances. The scheduled
 task remains named `Codex Session Bar`; the launcher, tray and chat skill can
@@ -173,7 +172,7 @@ reader with complete-line offsets committed every 8 MiB. Only visible
 user/assistant message text is retained.
 Append-only updates resume at those offsets; truncation, replacement and same-size
 rewrites invalidate the affected chat. Incomplete trailing events are retried.
-The private cache is `tmp/codex-session-bar/body-search.sqlite`: FTS5 trigram,
+The private cache is `%TEMP%/codex-session-bar/body-search.sqlite`: FTS5 trigram,
 `detail=none`, indexed LIKE for substrings and cached-text fallback for short words
 or literal wildcard characters. The page cache is 2 MiB; the database cap is
 256 MiB. Visible events above 4 MiB are counted as partial coverage; unavailable

@@ -9,7 +9,7 @@ use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     mem::size_of,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -50,17 +50,22 @@ impl Default for Config {
     }
 }
 pub fn read_config(dir: &Path) -> Result<Config> {
+    read_config_or(dir, &Config::default())
+}
+fn read_config_or(dir: &Path, fallback: &Config) -> Result<Config> {
     let file = dir.join(CONFIG);
-    if !file.exists() {
-        let cfg = Config::default();
-        atomic(dir, CONFIG, &cfg)?;
-        return Ok(cfg);
-    }
-    ensure!(
-        fs::metadata(&file)?.len() <= 4096,
-        "Guard settings too large"
-    );
-    let cfg: Config = serde_json::from_slice(&fs::read(file)?)?;
+    let input = match fs::File::open(&file) {
+        Ok(input) => input,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            atomic(dir, CONFIG, fallback)?;
+            return Ok(fallback.clone());
+        }
+        Err(error) => return Err(error).with_context(|| format!("Read settings: {}", file.display())),
+    };
+    let mut bytes = Vec::new();
+    input.take(4097).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 4096, "Guard settings too large");
+    let cfg: Config = serde_json::from_slice(&bytes)?;
     ensure!(
         (8..=4096).contains(&cfg.max_processes) && (256..=65536).contains(&cfg.max_private_mib) && (1..=60).contains(&cfg.interval_seconds),
         "Invalid Git guard limits"
@@ -68,9 +73,17 @@ pub fn read_config(dir: &Path) -> Result<Config> {
     Ok(cfg)
 }
 fn atomic(dir: &Path, name: &str, data: &impl Serialize) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("Create guard directory: {}", dir.display()))?;
     let pending = dir.join(format!("{name}.{}.pending", std::process::id()));
-    fs::write(&pending, serde_json::to_vec(data)?)?;
-    fs::rename(pending, dir.join(name))?;
+    let bytes = serde_json::to_vec(data)?;
+    for attempt in 0..2 {
+        let result = fs::write(&pending, &bytes).and_then(|_| fs::rename(&pending, dir.join(name)));
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt == 0 && error.kind() == std::io::ErrorKind::NotFound => { fs::create_dir_all(dir)?; }
+            Err(error) => return Err(error).with_context(|| format!("Write guard file: {}", dir.join(name).display())),
+        }
+    }
     Ok(())
 }
 #[derive(Clone, Default, Serialize)]
@@ -124,21 +137,24 @@ impl Incidents {
             ensure!(saved.version == 1, "Unsupported guard counters");
             return Ok(saved);
         }
-        // Preserve the known process total on upgrade; historical alarm logs
-        // cannot reconstruct exact episode counts and must not be guessed.
+        // Recover explicit totals from status if only the counter file was lost.
+        // Older status files have no storm count; never infer one from logs.
         let old = dir.join(STATUS);
         let previous = if fs::metadata(&old).is_ok_and(|m| m.len() <= 16384) {
             serde_json::from_slice::<serde_json::Value>(&fs::read(old)?).unwrap_or_default()
         } else { serde_json::Value::Null };
+        let terminated = previous["terminated"].as_u64().unwrap_or(0) as usize;
         let initial = Self {
-            version: 1, tracked_since: chrono::Local::now().to_rfc3339(), storms: 0,
-            active: false, terminated: previous["terminated"].as_u64().unwrap_or(0) as usize,
-            terminated_at_start: 0, calm_since: None, last_observation: None,
+            version: 1, tracked_since: previous["tracking_since"].as_str().filter(|s| !s.is_empty()).map(str::to_owned).unwrap_or_else(|| chrono::Local::now().to_rfc3339()),
+            storms: previous["storm_count"].as_u64().unwrap_or(0),
+            active: previous["storm_active"].as_bool().unwrap_or(false), terminated,
+            terminated_at_start: terminated.saturating_sub(previous["episode_terminated"].as_u64().unwrap_or(0) as usize), calm_since: None, last_observation: None,
         };
         initial.save(dir)?;
         Ok(initial)
     }
     fn save(&self, dir: &Path) -> Result<()> {
+        fs::create_dir_all(dir)?;
         let pending = dir.join(format!("{COUNTERS}.{}.pending", std::process::id()));
         let mut file = OpenOptions::new().create(true).truncate(true).write(true).open(&pending)?;
         serde_json::to_writer(&mut file, self)?;
@@ -549,6 +565,8 @@ pub struct Guard {
     traffic: attribution::Traffic,
     sources: Vec<Source>,
     skipped: usize,
+    config: Config,
+    storage_error: String,
     #[cfg(test)]
     scope: Option<HashSet<(u32, i64)>>,
 }
@@ -556,6 +574,7 @@ impl Guard {
     pub fn new(dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&dir)?;
         let incidents = Incidents::load(&dir)?;
+        let config = read_config(&dir)?;
         Ok(Self {
             dir,
             normal_interval: 5,
@@ -569,6 +588,8 @@ impl Guard {
             status: Status { terminated: incidents.terminated, storm_count: incidents.storms,
                 storm_active: incidents.active, tracking_since: incidents.tracked_since.clone(), ..Status::default() },
             incidents,
+            config,
+            storage_error: String::new(),
             #[cfg(test)]
             scope: None,
         })
@@ -576,7 +597,8 @@ impl Guard {
     pub fn wait(&self) -> Duration {
         self.next.saturating_duration_since(Instant::now())
     }
-    fn event(&self, value: serde_json::Value) -> Result<()> {
+    fn write_event(&self, value: serde_json::Value) -> Result<()> {
+        fs::create_dir_all(&self.dir)?;
         let path = self.dir.join("codex-git-guard-events.jsonl");
         let closed = self.dir.join("codex-git-guard-events.1.jsonl");
         if closed.exists() {
@@ -604,14 +626,32 @@ impl Guard {
         file.flush()?;
         Ok(())
     }
+    fn storage_failure(&mut self, operation: &str, error: anyhow::Error) {
+        if self.storage_error.is_empty() {
+            self.storage_error = format!("{operation}: {error:#} · {}", self.dir.display());
+        }
+    }
+    fn event(&mut self, value: serde_json::Value) {
+        if let Err(error) = self.write_event(value) { self.storage_failure("Write log", error); }
+    }
+    fn save_incidents(&mut self) {
+        if let Err(error) = self.incidents.save(&self.dir) { self.storage_failure("Save counters", error); }
+    }
+    fn config(&mut self) -> Config {
+        match read_config_or(&self.dir, &self.config) {
+            Ok(config) => self.config = config,
+            Err(error) => self.storage_failure("Read settings; retaining last valid settings", error),
+        }
+        self.config.clone()
+    }
     fn record_observation(&mut self, over: bool) -> Result<()> {
         let mut next = self.incidents.clone();
         let event = next.observe(over, now());
         if let Some(kind) = event {
-            next.save(&self.dir)?;
+            if let Err(error)=next.save(&self.dir) { self.storage_failure("Save counters",error); }
             self.event(json!({"type":kind,"time":chrono::Local::now().to_rfc3339(),
                 "episode":next.storms,"count":self.status.count,"private_bytes":self.status.private_bytes,
-                "stable_seconds":60}))?;
+                "stable_seconds":60}));
         }
         self.incidents = next;
         self.status.storm_count = self.incidents.storms;
@@ -619,65 +659,74 @@ impl Guard {
         Ok(())
     }
     pub fn poll(&mut self) -> (Option<String>, String) {
-        if Instant::now() < self.next {
-            return (None, String::new());
-        }
-        self.next = Instant::now() + Duration::from_secs(5);
-        let started = Instant::now();
-        let mut alert = None;
-        if let Err(e) = self.check(&mut alert) {
+        if Instant::now() < self.next { return (None, String::new()); }
+        let started=Instant::now();
+        let previous_error=!self.status.error.is_empty();
+        self.storage_error.clear();
+        let mut alert=None;
+        if let Err(error)=self.check(&mut alert) {
             self.incidents.pause();
-            self.status.healthy = false;
-            self.status.error = format!("{e:#}");
-            self.status.last_alert = format!("Codex Git 防护失败：{e:#}。请检查 Session Bar 的 Git 防护设置与日志。 ");
-            if self
-                .last_popup
-                .is_none_or(|at| at.elapsed() > Duration::from_secs(60))
-            {
-                alert = Some(self.status.last_alert.clone());
-                self.last_popup = Some(Instant::now());
-            }
+            self.status.healthy=false;
+            self.status.error=format!("{error:#}");
         }
-        self.status.updated_at = now();
-        self.status.interval_seconds = effective_interval(self.status.enabled,self.status.healthy,self.status.storm_active,self.normal_interval);
-        self.next=started+Duration::from_secs(self.status.interval_seconds);
+        if previous_error && self.status.healthy && self.storage_error.is_empty() {
+            self.event(json!({"time":chrono::Local::now().to_rfc3339(),"type":"storage_recovered"}));
+            self.status.last_alert=if crate::locale::chinese() {"Git 防护已恢复正常，正在继续检查。"} else {"Git protection has recovered and checks are continuing."}.into();
+        }
+        if !self.storage_error.is_empty() {
+            self.status.healthy=false;
+            self.status.error=self.storage_error.clone();
+        }
+        self.status.updated_at=now();
         self.status.pending_terminations=self.pending.len();
         self.status.episode_terminated=self.status.terminated.saturating_sub(self.incidents.terminated_at_start);
+        self.status.interval_seconds=effective_interval(self.status.enabled,self.status.healthy,self.status.storm_active,self.normal_interval);
         if self.status.healthy && !self.sources.is_empty() {
             self.status.last_alert=warning(&self.status,&self.sources,self.skipped);
             if alert.is_some(){alert=Some(self.status.last_alert.clone());}
         }
-        if let Ok(file)=OpenOptions::new().write(true).open(self.dir.join("codex-git-guard-events.jsonl")){let _=file.sync_data();}
-        self.status.check_ms = started.elapsed().as_secs_f64() * 1000.;
-        self.status.version = 1;
-        self.status.pid = std::process::id();
-        if let Err(e) = atomic(&self.dir, STATUS, &self.status) {
-            alert = Some(format!("Codex Git 防护无法写入状态：{e}"));
+        self.status.check_ms=started.elapsed().as_secs_f64()*1000.;
+        self.status.version=1;
+        self.status.pid=std::process::id();
+        if let Err(error)=atomic(&self.dir,STATUS,&self.status) {
+            self.storage_failure("Write status",error);
+            self.status.healthy=false;
+            self.status.error=self.storage_error.clone();
+            self.status.interval_seconds=effective_interval(self.status.enabled,false,self.status.storm_active,self.normal_interval);
         }
-        let summary = if !self.status.healthy {
-            format!("Codex Git 防护异常：{}", self.status.error)
-        } else if !self.status.enabled {
-            "Codex Git 防护已关闭".into()
-        } else {
-            format!(
-                "Codex Git 防护已开启 · {} 个 · {:.0} MiB · 风暴 {} 次 · 已结束 {} 个进程",
-                self.status.count,
-                self.status.private_bytes as f64 / MIB as f64,
-                self.status.storm_count,
-                self.status.terminated
-            )
-        };
-        (alert, summary)
+        if !self.status.healthy {
+            self.status.last_alert=if self.storage_error.is_empty() {
+                format!("Git protection check failed: {}",self.status.error)
+            } else if crate::locale::chinese() {
+                format!("Git 防护文件读写异常，进程检查仍继续，沿用最近有效设置。\n每 {} 秒重试；同类弹窗最多每分钟一次。\n{}",self.status.interval_seconds,self.status.error)
+            } else {
+                format!("Git protection storage error. Process checks continue with the last valid settings.\nRetry every {}s; at most one alert per minute.\n{}",self.status.interval_seconds,self.status.error)
+            };
+            if self.last_popup.is_none_or(|at|at.elapsed()>=Duration::from_secs(60)) {
+                alert=Some(self.status.last_alert.clone());self.last_popup=Some(Instant::now());
+            } else { alert=None; }
+        }
+        self.next=started+Duration::from_secs(self.status.interval_seconds);
+        let summary=if !self.status.healthy {format!("Git protection error: {}",self.status.error)}
+            else if !self.status.enabled {"Git protection is off".into()}
+            else {format!("Git protection on · {} Git · {} ended",self.status.count,self.status.terminated)};
+        (alert,summary)
     }
     fn check(&mut self, alert: &mut Option<String>) -> Result<()> {
+        let restoring = !self.dir.is_dir() || !self.dir.join(CONFIG).is_file() || !self.dir.join(COUNTERS).is_file();
+        if let Err(error)=fs::create_dir_all(&self.dir) { self.storage_failure("Create guard directory",error.into()); }
+        if !self.dir.join(COUNTERS).is_file() { self.save_incidents(); }
         let mut confirmed=Vec::new();
         self.pending.retain(|identity,handle|unsafe{if WaitForSingleObject(handle.0,0)==WAIT_OBJECT_0 {confirmed.push(*identity);false}else{true}});
         for (pid,created_ticks) in confirmed {
             self.status.terminated+=1;
-            self.event(json!({"time":chrono::Local::now().to_rfc3339(),"type":"termination_confirmed","pid":pid,"created_ticks":created_ticks}))?;
+            self.event(json!({"time":chrono::Local::now().to_rfc3339(),"type":"termination_confirmed","pid":pid,"created_ticks":created_ticks}));
         }
-        if self.incidents.terminated!=self.status.terminated {self.incidents.terminated=self.status.terminated;self.incidents.save(&self.dir)?;}
-        let cfg = read_config(&self.dir)?;
+        if self.incidents.terminated!=self.status.terminated {self.incidents.terminated=self.status.terminated;self.save_incidents();}
+        let cfg = self.config();
+        if restoring && self.storage_error.is_empty() {
+            self.event(json!({"time":chrono::Local::now().to_rfc3339(),"type":"storage_restored","storm_count":self.incidents.storms,"terminated":self.status.terminated}));
+        }
         self.normal_interval=cfg.interval_seconds;
         self.status.enabled = cfg.enabled;
         self.status.max_processes = cfg.max_processes;
@@ -749,7 +798,7 @@ impl Guard {
             .last_popup
             .is_none_or(|at| at.elapsed() > Duration::from_secs(60));
         if popup_due {
-            self.event(json!({"time":chrono::Local::now().to_rfc3339(),"type":"limit_exceeded","reason":reason,"count":self.status.count,"private_bytes":self.status.private_bytes,"limits":cfg,"eligible":victims.len()}))?;
+            self.event(json!({"time":chrono::Local::now().to_rfc3339(),"type":"limit_exceeded","reason":reason,"count":self.status.count,"private_bytes":self.status.private_bytes,"limits":cfg,"eligible":victims.len()}));
         }
         if self.sources.is_empty() || popup_due {
             let mut examples:Vec<_>=fresh_items.iter().collect();
@@ -757,7 +806,7 @@ impl Guard {
             self.sources=examples.into_iter().take(4).map(source).collect();
             self.event(json!({"time":chrono::Local::now().to_rfc3339(),"type":"storm_context",
                 "episode":self.incidents.storms,"observation_window_seconds":60,"observed_new_git":self.status.observed_new_git_60s,
-                "sources":self.sources}))?;
+                "sources":self.sources}));
         }
         let mut ended = 0;
         let mut pending = 0;
@@ -768,7 +817,7 @@ impl Guard {
             if Instant::now()>=deadline {break;}
             if self.pending.contains_key(&(victim.process.pid,victim.process.created_ticks)){continue;}
             // Check cancellation/config between small batches, not once per PID.
-            if (ended+pending+failed)%32==0 && !read_config(&self.dir)?.enabled {break;}
+            if (ended+pending+failed)%32==0 && !self.config().enabled {break;}
             let result = unsafe {
                 (|| -> Result<bool> {
                     let h = Handle(OpenProcess(
@@ -790,7 +839,7 @@ impl Guard {
                         read_verb(&command(h.0)?).is_some(),
                         "Write operation or unknown Git command protected"
                     );
-                    self.event(json!({"time":chrono::Local::now().to_rfc3339(),"type":"termination_requested","reason":reason,"pid":victim.process.pid,"created_ticks":victim.process.created_ticks,"codex_pid":victim.origin.0,"codex_created_ticks":victim.origin.1,"image":victim.path,"verb":victim.verb,"private_bytes":victim.process.private}))?;
+                    self.event(json!({"time":chrono::Local::now().to_rfc3339(),"type":"termination_requested","reason":reason,"pid":victim.process.pid,"created_ticks":victim.process.created_ticks,"codex_pid":victim.origin.0,"codex_created_ticks":victim.origin.1,"image":victim.path,"verb":victim.verb,"private_bytes":victim.process.private}));
                     TerminateProcess(h.0, 0xe0000001)?;
                     if WaitForSingleObject(h.0,0)==WAIT_OBJECT_0 {Ok(true)}else{
                         if self.pending.len()<4096 {self.pending.insert((victim.process.pid,victim.process.created_ticks),h);}
@@ -812,11 +861,11 @@ impl Guard {
                     format!("skipped: {e:#}")
                 }
             };
-            self.event(json!({"time":chrono::Local::now().to_rfc3339(),"type":"termination_result","pid":victim.process.pid,"created_ticks":victim.process.created_ticks,"result":outcome}))?;
+            self.event(json!({"time":chrono::Local::now().to_rfc3339(),"type":"termination_result","pid":victim.process.pid,"created_ticks":victim.process.created_ticks,"result":outcome}));
         }
         self.status.terminated += ended;
         self.incidents.terminated = self.status.terminated;
-        self.incidents.save(&self.dir)?;
+        self.save_incidents();
         self.skipped+=failed;
         if popup_due {
             *alert = Some(String::new());
@@ -870,6 +919,49 @@ impl Drop for Runner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn storage_fixture(name:&str)->PathBuf {
+        let root=crate::guard::test_workspace().join("tmp").canonicalize().unwrap();
+        let dir=root.join(format!("guard-storage-{}-{name}",std::process::id()));
+        assert!(dir.starts_with(&root));fs::create_dir_all(&dir).unwrap();dir
+    }
+    #[test]
+    fn deleted_directory_recovers_settings_and_counters_without_resetting_them() {
+        let dir=storage_fixture("deleted");
+        let cfg=Config{enabled:false,max_processes:24,max_private_mib:2048,interval_seconds:9};
+        atomic(&dir,CONFIG,&cfg).unwrap();
+        let mut g=Guard::new(dir.clone()).unwrap();
+        g.incidents.storms=17;g.incidents.terminated=91;g.status.terminated=91;
+        g.poll();
+        fs::remove_dir_all(&dir).unwrap();
+        g.next=Instant::now();let (alert,_)=g.poll();
+        assert!(alert.is_none());assert!(g.status.healthy,"{}",g.status.error);
+        let restored=read_config(&dir).unwrap();
+        assert_eq!((restored.enabled,restored.max_processes,restored.max_private_mib,restored.interval_seconds),(false,24,2048,9));
+        let counts=Incidents::load(&dir).unwrap();assert_eq!((counts.storms,counts.terminated),(17,91));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn unavailable_storage_does_not_abort_checks_and_alerts_are_rate_limited() {
+        let dir=storage_fixture("blocked");
+        let mut g=Guard::new(dir.clone()).unwrap();g.scope=Some(HashSet::new());
+        let blocked=dir.join("blocked");fs::write(&blocked,b"file instead of directory").unwrap();g.dir=blocked.clone();
+        let (alert,_)=g.poll();assert!(alert.is_some());
+        assert!(!g.status.healthy);assert!(g.status.enabled);assert_eq!(g.status.interval_seconds,1);
+        assert!(g.status.error.contains("blocked"));
+        g.next=Instant::now();assert!(g.poll().0.is_none(),"No popup every second");
+        fs::remove_file(&blocked).unwrap();g.next=Instant::now();g.poll();
+        assert!(g.status.healthy,"{}",g.status.error);assert!(blocked.join(STATUS).is_file());
+        assert!(g.status.last_alert.contains("recovered")||g.status.last_alert.contains("恢复正常"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn missing_counter_file_uses_known_totals_from_status() {
+        let dir=storage_fixture("status-totals");
+        atomic(&dir,STATUS,&json!({"version":1,"terminated":51013,"storm_count":20,"storm_active":true,"episode_terminated":13,"tracking_since":"2026-10-20T00:00:00+08:00"})).unwrap();
+        let saved=Incidents::load(&dir).unwrap();
+        assert_eq!((saved.storms,saved.terminated,saved.terminated_at_start),(20,51013,51000));assert!(saved.active);
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn warning_distinguishes_confirmed_exits_window_and_session_evidence(){
         let status=Status{episode_terminated:12,pending_terminations:4,observed_new_git_60s:82,count:20,peak_count:64,max_processes:16,max_private_mib:1024,interval_seconds:1,storm_active:true,..Status::default()};

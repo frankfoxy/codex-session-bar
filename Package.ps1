@@ -1,4 +1,4 @@
-param([switch]$SkipBuild)
+param([switch]$SkipBuild, [string]$Executable)
 $ErrorActionPreference = 'Stop'
 $workspace = if ($env:CODEX_SESSION_BAR_WORKSPACE) {
     (Resolve-Path -LiteralPath $env:CODEX_SESSION_BAR_WORKSPACE).Path
@@ -18,7 +18,7 @@ $manifest = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'Cargo.toml'))
 $version = [regex]::Match($manifest, '(?m)^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"').Groups[1].Value
 if (-not $version) { throw 'Package version is unavailable' }
 if (-not $SkipBuild) { & (Join-Path $PSScriptRoot 'Build.ps1') -Check -NoInstall }
-$executable = Join-Path $tmpRoot 'session-bar-rust-build/target/release/codex-session-bar.exe'
+$executable = if ($Executable) { (Resolve-Path -LiteralPath $Executable).Path } else { Join-Path $tmpRoot 'session-bar-rust-build/target/release/codex-session-bar.exe' }
 if (-not (Test-Path -LiteralPath $executable)) { throw 'Build the release executable first' }
 $versionOutput = Join-Path $releaseRoot 'version.txt'
 $process = Start-Process -FilePath $executable -ArgumentList '--version' -WindowStyle Hidden -PassThru -Wait -RedirectStandardOutput $versionOutput -RedirectStandardError (Join-Path $releaseRoot 'version.err.txt')

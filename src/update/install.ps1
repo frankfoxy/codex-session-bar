@@ -5,6 +5,9 @@ $ErrorActionPreference = 'Stop'
 # Do not inherit PowerShell 7's module paths when running Windows PowerShell.
 $env:PSModulePath = Join-Path $PSHOME 'Modules'
 $plan = [IO.File]::ReadAllText($PlanPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+$launchTemp = if ($plan.system_tmp) { [IO.Path]::GetFullPath([string]$plan.system_tmp) } else { $env:TEMP }
+$launchTmp = $launchTemp
+$launchTmpDir = $launchTemp
 function FileHash([string]$path) {
     $stream = [IO.File]::OpenRead($path)
     $algorithm = [Security.Cryptography.SHA256]::Create()
@@ -16,6 +19,11 @@ function StartHidden([string]$executable,[string]$arguments,[string]$directory,[
     $info.FileName=$executable; $info.Arguments=$arguments; $info.WorkingDirectory=$directory
     $info.UseShellExecute=$false; $info.CreateNoWindow=$true; $info.WindowStyle=[Diagnostics.ProcessWindowStyle]::Hidden
     $info.RedirectStandardOutput=$capture; $info.RedirectStandardError=$capture
+    if (-not $capture) {
+        $info.EnvironmentVariables['TEMP']=$launchTemp
+        $info.EnvironmentVariables['TMP']=$launchTmp
+        $info.EnvironmentVariables['TMPDIR']=$launchTmpDir
+    }
     [Diagnostics.Process]::Start($info)
 }
 function Full([string]$path) { [IO.Path]::GetFullPath($path).TrimEnd('\') }
@@ -46,7 +54,7 @@ function Allowed([string]$path) {
 }
 $tempRoot = (Resolve-Path -LiteralPath $plan.tmp_root).Path
 $folder = Within $plan.folder $tempRoot
-if ((Full (Split-Path -Parent $folder)) -ne (Full $tempRoot)) { throw 'Update work directory must be a direct child of workspace/tmp' }
+if ((Full (Split-Path -Parent $folder)) -ne (Full $tempRoot)) { throw 'Update work directory must be a direct child of its temporary root' }
 NoLinks $folder $tempRoot
 $env:TEMP=$folder; $env:TMP=$folder; $env:TMPDIR=$folder
 $app = (Resolve-Path -LiteralPath $plan.app).Path
@@ -163,6 +171,7 @@ try {
     WriteJson (Join-Path $folder 'result.json') @{phase='failed';error=$failure;rollback_errors=@($rollbackErrors.ToArray())}
     if ($Mode -eq 'Install') {
         if ($modified.Count -gt 0 -and $rollbackErrors.Count -eq 0) {
+            $env:TEMP=$launchTemp; $env:TMP=$launchTmp; $env:TMPDIR=$launchTmpDir
             Start-Process -FilePath (Join-Path $app 'bin/codex-session-bar.exe') -WorkingDirectory $app -WindowStyle Hidden | Out-Null
         }
         if ($Notify) {

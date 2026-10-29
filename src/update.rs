@@ -697,21 +697,9 @@ fn install(
     quit_message: u32,
 ) -> Result<()> {
     ensure!(!stop.load(Ordering::Relaxed), "Update cancelled");
-    let temp = paths
-        .runtime
-        .parent()
-        .context("Workspace tmp is unavailable")?
-        .canonicalize()?;
-    let workspace = paths
-        .runtime
-        .parent()
-        .and_then(Path::parent)
-        .context("Workspace is unavailable")?
-        .canonicalize()?;
-    ensure!(
-        temp.parent() == Some(workspace.as_path()) && temp.file_name().is_some_and(|n| n == "tmp"),
-        "Updates require the workspace's direct tmp directory"
-    );
+    let temp = paths.runtime.join("updates");
+    fs::create_dir_all(&temp)?;
+    let temp = temp.canonicalize()?;
     let folder = temp.join(format!(
         "session-bar-update-{}-{}-{}",
         release.version.label(),
@@ -720,7 +708,7 @@ fn install(
     ));
     ensure!(
         folder.parent() == Some(temp.as_path()),
-        "Update must stay within workspace/tmp"
+        "Update must stay within the runtime update directory"
     );
     fs::create_dir(&folder)?;
     let archive = folder.join(&release.archive.name);
@@ -747,7 +735,7 @@ fn install(
     fs::write(
         &plan,
         serde_json::to_vec(&json!({"version":release.version.label(),"app":plain(&app),
-        "tmp_root":plain(&temp),"folder":plain(&folder),"archive":plain(&archive),"sha256":expected,
+        "tmp_root":plain(&temp),"system_tmp":plain(&std::env::temp_dir()),"folder":plain(&folder),"archive":plain(&archive),"sha256":expected,
         "parent_pid":std::process::id(),"parent_created":creation_ticks()?,"chinese":locale::chinese()}))?,
     )?;
     let mut prepare = powershell(&script, &plan, "Prepare", &folder)?;

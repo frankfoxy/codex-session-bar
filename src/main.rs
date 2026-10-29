@@ -4,6 +4,7 @@ mod body;
 mod data;
 mod prompts;
 mod visibility;
+mod runtime;
 mod desktop;
 mod host;
 mod guard;
@@ -71,16 +72,15 @@ impl Paths {
                 }
             })
             .canonicalize()?;
-        let temp = workspace.join("tmp");
+        let temp = crate::runtime::temporary_root();
         let runtime = temp.join("codex-session-bar");
         anyhow::ensure!(
-            runtime.parent() == Some(temp.as_path()) && temp.parent() == Some(workspace.as_path()),
-            "Invalid workspace temp directory"
+            temp.is_absolute() && runtime.parent() == Some(temp.as_path()),
+            "Invalid system temporary directory"
         );
         fs::create_dir_all(&runtime)?;
-        for name in ["TEMP", "TMP", "TMPDIR"] {
-            env::set_var(name, &runtime);
-        }
+        crate::runtime::migrate(&workspace.join("tmp/codex-session-bar"), &runtime)?;
+        crate::guard::migrate_legacy(&workspace.join("tmp/memory-watch-rust"), &runtime.join("git-guard"))?;
         let home = env::var_os("CODEX_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| {

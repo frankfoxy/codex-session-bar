@@ -29,7 +29,7 @@ unsafe fn verify_guard_preferences(app:&mut App,paths:&Paths)->Result<()> {
     std::fs::create_dir_all(fixture.join("runtime"))?;
     app.paths.runtime=fixture.join("runtime");
     let mut config=serde_json::json!({"enabled":false,"max_processes":64,"max_private_mib":4096});
-    let folder=fixture.join("memory-watch-rust");std::fs::create_dir_all(&folder)?;
+    let folder=guard::log_dir(&app.paths);std::fs::create_dir_all(&folder)?;
     std::fs::write(folder.join("codex-git-guard-settings.json"),serde_json::to_vec(&config)?)?;
     app.popup(Popup::Preferences)?;
     let controls=capture(app,Some(Popup::Preferences),560,PREFERENCES_HEIGHT as u32,&paths.runtime.join("rust-guard-button-hit-verification.png"))?;
