@@ -3,6 +3,7 @@
 mod body;
 mod data;
 mod prompts;
+mod replies;
 mod visibility;
 mod runtime;
 mod desktop;
@@ -264,6 +265,7 @@ fn run() -> Result<()> {
     }
     if args.iter().any(|s|s=="--inspect-capacity-retry") {return desktop::inspect_capacity(&paths);}
     if args.iter().any(|s|s=="--inspect-prompts") {return desktop::inspect_prompts(&paths);}
+    if let Some(index)=args.iter().position(|s|s=="--inspect-reply") {return replies::inspect(&paths,args.get(index+1).context("Specify a chat ID after --inspect-reply")?);}
     if args.iter().any(|s| s == "--observe") {
         return host::inspect(&paths);
     }

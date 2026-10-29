@@ -227,3 +227,22 @@ so flags, skin tones, keycaps and ZWJ sequences remain intact during renames.
 - Recent panel: 560 × 436 logical pixels, compact icon switches and native Win32 tooltips. Tool rectangles and text are compared before updating, so the timer does not restart the hover delay on every paint.
 - Icon popovers prefer the left side of the list, then the right side, then a monitor-bounded position. Title suggestions run locally using deterministic keyword rules and share the captured target ID used by random/clear actions.
 - Native self-test verifies tooltip registration survives repeated refreshes and suggested icons remain bound to the selected list row.
+
+## Latest-reply hover previews
+
+Recent/fixed chat row tooltips retain status/model/effort/Fast and add the latest
+visible model output, without repeating the row prompt. A lazy local-only worker
+opens read-only SQLite connections only after a hover request. The latest user
+item selects the exact turn and ordinal floor; a new unanswered user message never
+falls back to an older turn's answer. Restored history aliases and projection
+bounds match recent-prompt identity handling. Analysis and tool output are excluded.
+
+Only the hovered chat is refreshed using existing UI ticks and file notifications,
+at most once per second with a five-second metadata fallback while hovering. No
+queries run while the mouse is away. At most 16 candidate metadata rows and 901 text
+characters per changed candidate are returned; unchanged revision keys skip JSON
+extraction. The excerpt is capped at 900 characters / 14 lines, caches retain eight
+chats, and idle database handles close after 30 seconds. No replies are written to
+runtime caches or sent over the network. `--inspect-reply <chat-id>` is a read-only
+source/performance diagnostic. Native self-test verifies registered tooltip text
+includes the model reply and excludes the user prompt.

@@ -269,7 +269,7 @@ fn uuid(value: &str) -> bool {
             }
         })
 }
-fn alias(id: &str, path: &str) -> Option<String> {
+pub(crate) fn alias(id: &str, path: &str) -> Option<String> {
     if !uuid(id) {
         return None;
     }

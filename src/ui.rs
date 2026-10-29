@@ -702,6 +702,8 @@ struct App {
     preferences_guard: bool,
     guard_limits: guard::Limits,
     update_control: Option<crate::update::Control>,
+    reply_service: Option<crate::replies::Service>,
+    reply_revision: u64,
     notice_control: Option<crate::reset_notice::Control>,
     notice_alert_due: Instant,
     guard_events: Vec<guard::LogEntry>,
@@ -978,6 +980,8 @@ impl App {
             preferences_guard: false,
             guard_limits: guard::Limits::default(),
             update_control: None,
+            reply_service: None,
+            reply_revision: 0,
             notice_control: None,
             notice_alert_due:Instant::now(),
             guard_events: Vec::new(),
@@ -2124,6 +2128,9 @@ impl App {
                         if let Some(row) = row {
                             tip.push_str(&format!("\n{}", crate::locale::text(&row.state)));
                             if !row.execution.model.is_empty() { tip.push_str(&format!("\n{}", row.execution.tooltip())); }
+                            let reply=self.reply_service.as_ref().and_then(|service|service.peek(id));
+                            tip.push_str("\n\n");
+                            tip.push_str(&reply.map(|reply|reply.text(crate::locale::chinese())).unwrap_or_else(||if crate::locale::chinese(){"正在读取最新回复…"}else{"Loading latest reply…"}.into()));
                         }
                         tip
                     } else if a.hit == Hit::GuardLogs {
@@ -2287,6 +2294,21 @@ impl App {
             let _ = DeleteObject(region);
         }
     }
+    unsafe fn refresh_reply_preview(&mut self, live:&crate::Shared) {
+        if self.testing {return;}
+        let id=if matches!(self.popup_kind,Some(Popup::Recent|Popup::Fixed)) {
+            match &self.hover {Some(Hit::Recent(id)|Hit::Fixed(id))=>Some(id.clone()),_=>None}
+        }else{None};
+        let Some(id)=id else {if let Some(service)=self.reply_service.as_mut(){service.inactive();}return;};
+        let service=self.reply_service.get_or_insert_with(||crate::replies::Service::new(self.paths.clone()));
+        service.request(&id,live.refresh_events.generation());
+        let revision=service.revision();
+        if revision!=self.reply_revision {
+            self.reply_revision=revision;
+            let scale=GetDpiForWindow(self.popup).max(96) as f32/96.;
+            self.sync_tips(self.popup,&self.popup_hits.clone(),scale);
+        }
+    }
     unsafe fn tick(&mut self) {
         self.finish_chat_copy();
         self.check_reset_reminders();
@@ -2317,6 +2339,7 @@ impl App {
             self.hidden = false;
         }
         let live = self.snapshot();
+        self.refresh_reply_preview(&live);
         if self.popup_kind == Some(Popup::Recent) && Instant::now() >= self.tag_catalog_due { self.refresh_tag_catalog(); }
         let identity = self.identity(&live);
         if identity != self.last_identity {
@@ -4517,6 +4540,14 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert_eq!(app.catalog.suggest("系统问题修复。"), "🛠️");
         assert_eq!(app.catalog.suggest("调研无人机 AI 模块"), "🚁");
         app.popup(Popup::Recent)?;
+        app.reply_service=Some(crate::replies::Service::fixture(&rows[0].id,"Latest visible model reply for this chat."));
+        let reply_area=vec![Area{hit:Hit::Recent(rows[0].id.clone()),r:rect(20.,60.,300.,40.)}];
+        app.sync_tips(app.popup,&reply_area,1.);
+        let reply_tip=app.tips.iter().find(|tip|tip.owner==app.popup).unwrap();
+        let text=String::from_utf16_lossy(&reply_tip.entries[0].1);
+        assert!(text.contains("Latest visible model reply for this chat."));
+        assert!(!text.contains(&rows[0].prompt));
+        app.reply_service=None;
         let tip_areas: Vec<_> = [Hit::Title, Hit::Body, Hit::Refresh, Hit::Auto]
             .into_iter()
             .enumerate()
