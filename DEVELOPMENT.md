@@ -142,7 +142,7 @@ UI and color emoji use Segoe UI Emoji. ClearType and per-monitor DPI awareness
 avoid bitmap-font and whole-window scaling artifacts. Search and category
 controls use native Windows widgets with a ClearType Chinese font.
 
-The bar follows the Codex window without activation. Only the center grip
+The bar follows the Codex window without activation. Its non-topmost z-order stays immediately above the host, so other foreground windows can cover it; owned menus follow the bar. No cross-process ownership is assigned, preserving recovery when Codex closes. Only the center grip
 starts dragging. Saved offsets are host-relative and cannot cover header menu
 controls. If the blank header is too narrow, docking falls below the menu.
 Closing hides to tray and sets an explicit hidden flag; host movement cannot

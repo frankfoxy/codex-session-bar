@@ -4,7 +4,7 @@
 
 一个 Rust 原生 Windows 会话悬浮条，支持标签筛选、快速切换与实时状态查看，默认停靠在 Codex 标题栏中央。
 
-**稳定版：[v0.3.9](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.3.9)** · 无需 Python 或 Qt
+**稳定版：[v0.3.10](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.3.10)** · 无需 Python 或 Qt
 
 ## 用 Tag 管理会话
 
@@ -49,7 +49,7 @@
 
 ## 快速开始
 
-1. 到 [v0.3.9 发布页](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.3.9) 下载 **codex-session-bar-0.3.9-windows-x64.zip**，解压到固定目录。
+1. 到 [v0.3.10 发布页](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.3.10) 下载 **codex-session-bar-0.3.10-windows-x64.zip**，解压到固定目录。
 2. 打开并登录 Codex Desktop，双击 **Launch.cmd**。
 3. 点击悬浮条的会话名称打开列表，点击标签按钮筛选，点击会话图标设置图标。
 

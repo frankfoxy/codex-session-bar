@@ -909,7 +909,7 @@ impl App {
         }
         let filters = catalog.filter("", "默认集合");
         let bar = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            WS_EX_TOOLWINDOW,
             CLASS,
             w!("Codex Session Bar"),
             WS_POPUP,
@@ -923,7 +923,7 @@ impl App {
             None,
         )?;
         let popup = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            WS_EX_TOOLWINDOW,
             CLASS,
             w!("Codex Session Bar Menu"),
             WS_POPUP | WS_CLIPCHILDREN,
@@ -2171,7 +2171,7 @@ impl App {
         }
         self.tips.retain(|t| t.owner != owner);
         let Ok(window) = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            WS_EX_NOACTIVATE,
             TOOLTIPS_CLASSW,
             PCWSTR::null(),
             WS_POPUP | WINDOW_STYLE(TTS_ALWAYSTIP | TTS_NOPREFIX),
@@ -2425,6 +2425,9 @@ impl App {
                 }
                 self.host_hidden = !self.hidden;
             } else if let Some(h) = host {
+                // Keep the bar immediately above Codex in the ordinary z-order.
+                // Do not assign an owner: closing Codex must not destroy the bar.
+                place_above_host(self.bar,HWND(live.host as *mut _));
                 self.dpi = GetDpiForWindow(HWND(live.host as *mut _)).max(96) as f32 / 96.;
                 let width = self.measure_bar();
                 let (w, ht) = (
@@ -2480,7 +2483,7 @@ impl App {
                 if self.drag.is_none()
                     && (current != Some([x, y, x + w, y + ht]) || self.width != width)
                 {
-                    let _ = SetWindowPos(self.bar, HWND_TOPMOST, x, y, w, ht, SWP_NOACTIVATE);
+                    let _ = SetWindowPos(self.bar, HWND_TOP, x, y, w, ht, SWP_NOACTIVATE | SWP_NOZORDER);
                     Self::round_window(self.bar, w, ht, (14. * self.dpi) as i32);
                 }
                 self.width = width;
@@ -2568,7 +2571,7 @@ impl App {
         let row_top = top + slot as f32 * row_height;
         let anchor = [if self.popup_kind == Some(Popup::Recent) { self.recent_left() + 42. } else { 62. }, row_top, row_top + row_height - 4.];
         let window = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            WS_EX_TOOLWINDOW,
             CLASS,
             w!("Codex Session Icon"),
             WS_POPUP | WS_CLIPCHILDREN,
@@ -2705,7 +2708,7 @@ impl App {
             return;
         }
         panel.layout = Some(layout);
-        let _ = SetWindowPos(panel.window, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+        let _ = SetWindowPos(panel.window, HWND_TOP, x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
         Self::round_window(panel.window, w, h, (10. * scale) as i32);
         for (child, x, y, cw, ch) in [
             (panel.edit, 21, 53, 146, 22),
@@ -3200,7 +3203,7 @@ impl App {
         }
         self.popup_layout = Some(layout);
         let flags = if self.popup_layout_batch { SWP_NOACTIVATE | SWP_NOREDRAW } else { SWP_NOACTIVATE };
-        let _ = SetWindowPos(self.popup, HWND_TOPMOST, x, y, w, h, flags);
+        let _ = SetWindowPos(self.popup, HWND_TOP, x, y, w, h, flags | SWP_NOZORDER);
         if self.popup_kind == Some(Popup::Recent) {
             self.apply_recent_region(Instant::now());
         } else {
@@ -3247,7 +3250,7 @@ impl App {
                 "cache_exists":self.paths.runtime.join("body-search.sqlite").exists(),"on_demand":false}));
         let live = self.snapshot();
         let (_, title, status, _, _) = unsafe { self.bar_text(&live) };
-        self.paths.write(if self.testing{"rust-test-status.json"}else{"live-status.json"},&json!({"pid":std::process::id(),"runtime":"rust","ui_language":{"culture":crate::locale::status().0,"source":if crate::locale::status().1{"codex-uia"}else{"windows-default"}},"refresh":{"file_events":live.refresh_events.watching.load(Ordering::Relaxed),"settings":live.refresh_options},"updated_at":now(),"thread":self.identity(&live),"overview":self.identity(&live).is_empty() && data::visible_chat_title(&live.view_label).is_none(),"display_title":title,"display_status":status,"tokens":self.bar_usage(&live).0,"auto_thread":live.auto_thread,"topmost":true,"user_hidden":self.hidden,"host_hidden":self.host_hidden,"host_window":live.host,"host_rect":self.last_host,"host_offset":self.settings.host_offset,"titlebar_slot":live.slot,"quota":live.quota,"quota_error":live.quota_error,"view_error":live.view_error,"snapshot_error":live.snapshot_error,"recent_cache":{"rows":live.recent.rows.len(),"busy_count":live.recent.busy_count,"stale":live.recent.stale,"error":live.recent.error},"active_view":{"thread":live.view,"label":live.view_label,"available":live.view.is_some() || data::visible_chat_title(&live.view_label).is_some(),"identity_pending":live.auto_thread && live.view.is_none() && data::visible_chat_title(&live.view_label).is_some(),"source":"uia-current-page"},"action_note":live.action_note,"capacity_retry":{"settings":live.capacity_options,"status":live.capacity_retry},"codex_git_guard":live.guard,"font":{"chinese":self.painter.chinese,"latin":"Segoe UI","emoji":"Segoe UI Emoji","renderer":"DirectWrite / software Direct2D","antialias":"ClearType","per_monitor_dpi":true}}));
+        self.paths.write(if self.testing{"rust-test-status.json"}else{"live-status.json"},&json!({"pid":std::process::id(),"runtime":"rust","ui_language":{"culture":crate::locale::status().0,"source":if crate::locale::status().1{"codex-uia"}else{"windows-default"}},"refresh":{"file_events":live.refresh_events.watching.load(Ordering::Relaxed),"settings":live.refresh_options},"updated_at":now(),"thread":self.identity(&live),"overview":self.identity(&live).is_empty() && data::visible_chat_title(&live.view_label).is_none(),"display_title":title,"display_status":status,"tokens":self.bar_usage(&live).0,"auto_thread":live.auto_thread,"topmost":false,"user_hidden":self.hidden,"host_hidden":self.host_hidden,"host_window":live.host,"host_rect":self.last_host,"host_offset":self.settings.host_offset,"titlebar_slot":live.slot,"quota":live.quota,"quota_error":live.quota_error,"view_error":live.view_error,"snapshot_error":live.snapshot_error,"recent_cache":{"rows":live.recent.rows.len(),"busy_count":live.recent.busy_count,"stale":live.recent.stale,"error":live.recent.error},"active_view":{"thread":live.view,"label":live.view_label,"available":live.view.is_some() || data::visible_chat_title(&live.view_label).is_some(),"identity_pending":live.auto_thread && live.view.is_none() && data::visible_chat_title(&live.view_label).is_some(),"source":"uia-current-page"},"action_note":live.action_note,"capacity_retry":{"settings":live.capacity_options,"status":live.capacity_retry},"codex_git_guard":live.guard,"font":{"chinese":self.painter.chinese,"latin":"Segoe UI","emoji":"Segoe UI Emoji","renderer":"DirectWrite / software Direct2D","antialias":"ClearType","per_monitor_dpi":true}}));
     }
     unsafe fn hit(&mut self, hit: Hit) -> Option<Action> {
         match hit {
@@ -3915,12 +3918,12 @@ unsafe extern "system" fn wndproc(
                     let _ = GetCursorPos(&mut point);
                     let _ = SetWindowPos(
                         app.bar,
-                        HWND_TOPMOST,
+                        HWND_TOP,
                         original[0] + point.x - start.x,
                         original[1] + point.y - start.y,
                         0,
                         0,
-                        SWP_NOSIZE | SWP_NOACTIVATE,
+                        SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER,
                     );
                 } else {
                     let areas = if is_bar { &app.hits } else { &app.popup_hits };
@@ -4420,6 +4423,13 @@ unsafe fn verify_native_search_cue(hwnd: HWND, kind: usize, path: &std::path::Pa
     let _ = DeleteDC(dc);
     Ok(())
 }
+unsafe fn place_above_host(bar:HWND,host:HWND) {
+    let previous=GetWindow(host,GW_HWNDPREV).ok();
+    if previous!=Some(bar) {
+        let after=previous.filter(|window| (GetWindowLongPtrW(*window,GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0)==0).unwrap_or(HWND_TOP);
+        let _=SetWindowPos(bar,after,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOOWNERZORDER);
+    }
+}
 pub fn self_test(paths: &Paths) -> Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -4440,6 +4450,19 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             stop,
             true,
         )?;
+        assert_eq!(GetWindowLongPtrW(app.bar,GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0,0);
+        assert_eq!(GetWindowLongPtrW(app.popup,GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0,0);
+        assert_eq!(GetWindow(app.popup,GW_OWNER).ok(),Some(app.bar));
+        let host=CreateWindowExW(WINDOW_EX_STYLE(0),w!("STATIC"),w!("test host"),WS_POPUP,0,0,10,10,None,None,None,None)?;
+        let bar=CreateWindowExW(WINDOW_EX_STYLE(0),w!("STATIC"),w!("test bar"),WS_POPUP,0,0,10,10,None,None,None,None)?;
+        let cover=CreateWindowExW(WINDOW_EX_STYLE(0),w!("STATIC"),w!("test covering window"),WS_POPUP,0,0,10,10,None,None,None,None)?;
+        let _=SetWindowPos(host,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        place_above_host(bar,host);
+        assert_eq!(GetWindow(host,GW_HWNDPREV).ok(),Some(bar));
+        let _=SetWindowPos(cover,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        place_above_host(bar,host);
+        assert_eq!(GetWindow(bar,GW_HWNDPREV).ok(),Some(cover));
+        let _=DestroyWindow(cover);let _=DestroyWindow(bar);let _=DestroyWindow(host);
         let mut icon_info = ICONINFO::default();
         GetIconInfo(app.tray_icon, &mut icon_info)?;
         assert!(!icon_info.hbmColor.is_invalid());
