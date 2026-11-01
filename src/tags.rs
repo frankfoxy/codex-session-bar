@@ -207,6 +207,8 @@ pub struct Sources {
     global: Value,
 }
 impl Sources {
+    pub fn has_project_assignment(&self,id:&str)->bool {local_assignment(&self.global["thread-project-assignments"][id]).is_some()}
+    pub fn global_known(&self,paths:&Paths)->bool {!paths.home.join(".codex-global-state.json").exists()||self.global.is_object()}
     pub fn enrich(&mut self, paths: &Paths, db: &Connection, payload: &Value, rows: &mut [Row]) {
         let file = paths.home.join(".codex-global-state.json");
         let stamp = fs::metadata(&file)
@@ -268,7 +270,7 @@ impl Sources {
         }
         let mut working_dirs = HashMap::<String, String>::new();
         if let Ok(mut q) =
-            db.prepare("SELECT id,cwd FROM threads WHERE archived=0 AND agent_path IS NULL")
+            db.prepare("SELECT id,cwd FROM threads WHERE agent_path IS NULL")
         {
             if let Ok(values) =
                 q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
@@ -324,7 +326,7 @@ impl Sources {
             }
         }
         let mut membership = HashMap::<String, (Option<String>, Option<String>)>::new();
-        if let Ok(mut q)=db.prepare("SELECT id,project_id,thread_section_id FROM threads WHERE archived=0 AND agent_path IS NULL"){
+        if let Ok(mut q)=db.prepare("SELECT id,project_id,thread_section_id FROM threads WHERE agent_path IS NULL"){
             if let Ok(values)=q.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<String>>(2)?))){for(id,p,s)in values.flatten(){membership.insert(id,(p,s));}}
         }
         for row in rows {

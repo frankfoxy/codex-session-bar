@@ -1,5 +1,6 @@
 settings.json
 tags.json
+repair-backups/
 bin/
 /releases/
 /memory-watch/

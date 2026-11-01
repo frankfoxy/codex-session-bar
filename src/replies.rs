@@ -12,7 +12,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const LIMIT: usize = 900;
+const LIMIT: usize = 32_768;
+const MAX_LINES: usize = 512;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Preview {
     Text(String),
@@ -67,7 +68,7 @@ impl Reader {
     pub fn read(&mut self, state: &Connection, history: &Connection, id: &str) -> Result<Preview> {
         let path = state
             .query_row(
-                "SELECT rollout_path FROM threads WHERE id=? AND archived=0 AND agent_path IS NULL",
+                "SELECT rollout_path FROM threads WHERE id=? AND agent_path IS NULL",
                 [id],
                 |r| r.get::<_, Option<String>>(0),
             )
@@ -113,9 +114,9 @@ impl Reader {
         }
         let mut result = Preview::Empty;
         if let Some((_, turn, _, _)) = &key.user {
-            // JSON extraction happens only after a revision changes. Even a long
-            // final response returns at most 901 characters to the Rust process.
-            let mut q=history.prepare("SELECT CASE WHEN length(CAST(item_json AS BLOB))<=4194304 AND json_valid(item_json) THEN json_extract(item_json,'$.phase') END,CASE WHEN length(CAST(item_json AS BLOB))<=4194304 AND json_valid(item_json) THEN CASE WHEN json_extract(item_json,'$.type')='agentMessage' AND coalesce(json_extract(item_json,'$.phase'),'')!='analysis' THEN substr(json_extract(item_json,'$.text'),1,901) END END FROM thread_items WHERE thread_id=? AND turn_id=? AND item_id=?")?;
+            // Only the hovered chat is queried; bound long replies to keep the
+            // background cache and native layout reasonably sized.
+            let mut q=history.prepare("SELECT CASE WHEN length(CAST(item_json AS BLOB))<=4194304 AND json_valid(item_json) THEN json_extract(item_json,'$.phase') END,CASE WHEN length(CAST(item_json AS BLOB))<=4194304 AND json_valid(item_json) THEN CASE WHEN json_extract(item_json,'$.type')='agentMessage' AND coalesce(json_extract(item_json,'$.phase'),'')!='analysis' THEN substr(json_extract(item_json,'$.text'),1,32769) END END FROM thread_items WHERE thread_id=? AND turn_id=? AND item_id=?")?;
             for (item, _, _) in &key.agents {
                 #[cfg(test)]
                 {
@@ -160,7 +161,7 @@ fn excerpt(raw: &str) -> String {
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
         .enumerate()
     {
-        if index >= LIMIT || (c == '\n' && lines >= 13) {
+        if index >= LIMIT || (c == '\n' && lines >= MAX_LINES - 1) {
             truncated = true;
             break;
         }
@@ -195,6 +196,7 @@ pub struct Service {
     handle: Option<thread::JoinHandle<()>>,
     values: Arc<Mutex<HashMap<String, Preview>>>,
     revision: Arc<AtomicU64>,
+    prompts: Arc<Mutex<HashMap<String,String>>>,
     last: Option<(String, u64, Instant)>,
 }
 impl Service {
@@ -202,6 +204,8 @@ impl Service {
         let (tx, rx) = mpsc::sync_channel::<String>(1);
         let values = Arc::new(Mutex::new(HashMap::new()));
         let revision = Arc::new(AtomicU64::new(0));
+        let prompts = Arc::new(Mutex::new(HashMap::new()));
+        let prompt_output = prompts.clone();
         let (output, changed) = (values.clone(), revision.clone());
         let handle = thread::Builder::new()
             .name("chat-reply-preview".into())
@@ -229,7 +233,16 @@ impl Service {
                             ));
                         }
                         let (state, history) = databases.as_ref().unwrap();
-                        reader.read(state, history, &id)
+                        let result=reader.read(state, history, &id)?;
+                        if let Some((_, key, _))=reader.cache.front() {
+                            if let Some((item,turn,_,_))=&key.user {
+                                let json:Option<String>=history.query_row("SELECT CASE WHEN length(CAST(item_json AS BLOB))<=4194304 THEN item_json END FROM thread_items WHERE thread_id=? AND turn_id=? AND item_id=?",params![key.source,turn,item],|r|r.get(0)).optional()?.flatten();
+                                let prompt=json.as_deref().and_then(crate::body::history_text).map(|v|excerpt(&v)).unwrap_or_default();
+                                let mut cache=prompt_output.lock().unwrap();
+                                if cache.get(&id)!=Some(&prompt) {if cache.len()>=8&&!cache.contains_key(&id){cache.clear();}cache.insert(id.clone(),prompt);changed.fetch_add(1,Ordering::Release);}
+                            }
+                        }
+                        Ok(result)
                     })()
                     .unwrap_or(Preview::Unavailable);
                     let mut published = output.lock().unwrap();
@@ -248,6 +261,7 @@ impl Service {
             handle,
             values,
             revision,
+            prompts,
             last: None,
         }
     }
@@ -274,6 +288,7 @@ impl Service {
             self.values.lock().unwrap().get(id).cloned()
         }
     }
+    pub fn prompt(&self,id:&str)->Option<String>{self.prompts.lock().unwrap().get(id).cloned()}
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
     }
@@ -290,6 +305,7 @@ impl Service {
                 Preview::Text(text.into()),
             )]))),
             revision: Arc::new(AtomicU64::new(1)),
+            prompts: Arc::new(Mutex::new(HashMap::new())),
             last: None,
         }
     }
@@ -529,10 +545,11 @@ mod tests {
         let Preview::Text(text) = Reader::default().read(&s, &h, ROOT).unwrap() else {
             panic!("Missing long reply")
         };
-        assert_eq!(text.chars().count(), 901);
+        assert_eq!(text.chars().count(), LIMIT + 1);
         assert!(text.ends_with('…'));
         let multiline = excerpt(&"line\n".repeat(100));
-        assert!(multiline.lines().count() <= 14);
+        assert_eq!(multiline.lines().count(), 100);
+        assert!(excerpt(&"line\n".repeat(MAX_LINES+1)).lines().count() <= MAX_LINES);
         assert!(!excerpt("safe\0content").contains('\0'));
     }
     #[test]

@@ -494,13 +494,15 @@ impl App {
         let width = self.popup_size[0] as f32;
         let left = self.recent_left();
         let content = (width - left - 18.).max(300.);
-        let tags_width = (content * 0.20).clamp(120., 210.);
+        let original_tags_width = (content * 0.20).clamp(120., 210.);
+        let tags_width = original_tags_width * 0.60;
+        let reclaimed = original_tags_width - tags_width;
         let tags_left = width - 54. - tags_width;
         let meta_width = (content * 0.16).clamp(130., 165.);
         let meta_right = tags_left - 6.;
         let meta_left = meta_right - meta_width;
         let title_left = left + 50.;
-        let title_width = (self.settings.recent_title_width.clamp(140, 280) as f32)
+        let title_width = (self.settings.recent_title_width.clamp(140, 280) as f32 + reclaimed)
             .min((meta_left - title_left - 16. - 100.).max(80.));
         let preview_left = title_left + title_width + 8.;
         RecentColumns {
@@ -525,8 +527,41 @@ impl App {
         .min(130.)
         .min(limit.max(30.))
     }
+    fn primary_project_tag(&self, row: &Row) -> Option<tags::Tag> {
+        self.custom_tags.for_row(row).into_iter().find(|tag| tag.kind == tags::Kind::Project)
+    }
+    unsafe fn title_project_tag(&self, row: &Row) -> Option<(tags::Tag, D2D_RECT_F)> {
+        let tag = self.primary_project_tag(row)?;
+        let c = self.recent_columns();
+        let (left, width) = if self.settings.compact_recent {
+            let model = row.execution.short();
+            let model_width = if model.is_empty() { 0. } else { (self.painter.width(&model, 10.) + 10.).min(170.) };
+            let metric_width = (if row.state == "Busy" { 225. } else { 165. }) + model_width;
+            let metric_x = self.popup_size[0] as f32 - 52. - metric_width;
+            (self.recent_left() + 50., (metric_x - self.recent_left() - 59.).max(40.))
+        } else { (c.title_left, c.title_width) };
+        let w = self.chip_width(&tag, (width - 52.).max(30.));
+        let top=if self.settings.compact_recent{9.}else if self.painter.width(self.catalog.strip(&row.label),13.)<=(width-w-4.).max(1.){12.}else{3.};
+        Some((tag, rect(left + width - w, top, w, 20.)))
+    }
+    unsafe fn paint_title_with_project(&self, title: &str, ranges: &[(usize,usize)], left:f32, y:f32, width:f32, tag_width:f32) {
+        let first_width=(width-tag_width-4.).max(1.);
+        let mut boundaries:Vec<usize>=title.char_indices().map(|(i,_)|i).collect();
+        boundaries.push(title.len());
+        let mut low=0usize;let mut high=boundaries.len();
+        while low+1<high {let mid=(low+high)/2;if self.painter.width(&title[..boundaries[mid]],13.)<=first_width{low=mid}else{high=mid}}
+        let split=boundaries[low];
+        let clipped=|start:usize,end:usize| -> Vec<(usize,usize)> {ranges.iter().filter_map(|&(a,b)| {let lo=a.max(start);let hi=b.min(end);(lo<hi).then(||(lo-start,hi-start))}).collect()};
+        if split==title.len() {
+            self.painter.highlighted_title(title,rect(left,y+12.,first_width,20.),ranges,false);
+        } else {
+            self.painter.highlighted_title(&title[..split],rect(left,y+3.,first_width,20.),&clipped(0,split),false);
+            self.painter.highlighted_title(&title[split..],rect(left,y+23.,width,20.),&clipped(split,title.len()),false);
+        }
+    }
     unsafe fn tag_layout(&self, row: &Row) -> RowTagLayout {
-        let tags = self.custom_tags.for_row(row);
+        let primary = self.primary_project_tag(row);
+        let tags: Vec<_> = self.custom_tags.for_row(row).into_iter().filter(|tag| primary.as_ref().is_none_or(|p| p.key != tag.key)).collect();
         let c = self.recent_columns();
         let tag_left = c.tags_left + 26.;
         let tag_width = c.tags_width - 26.;
@@ -595,7 +630,8 @@ impl App {
         let width = r.right - r.left - 32.;
         let (mut x, mut y) = (0., 0.);
         let mut chips = Vec::new();
-        for tag in self.custom_tags.for_row(row) {
+        let primary = self.primary_project_tag(row);
+        for tag in self.custom_tags.for_row(row).into_iter().filter(|tag| primary.as_ref().is_none_or(|p| p.key != tag.key)) {
             let w = self.chip_width(&tag, width);
             if x + w > width && x > 0. {
                 x = 0.;
@@ -781,6 +817,8 @@ impl App {
         area(Hit::Refresh, rect(toolbar + 454., 8., 32., 32.));
         p.fill(rect(toolbar + 454., 8., 32., 32.), 0x2b3a3c, 8.);
         p.action_icon(&Hit::Refresh, toolbar + 459., 13.);
+        area(Hit::RecentSort,rect(toolbar+491.,8.,32.,32.));
+        for (i,w) in [17.,12.,7.].iter().enumerate(){p.line(toolbar+498.,18.+i as f32*5.,toolbar+498.+w,18.+i as f32*5.,if self.recent_sort>0{GREEN}else{MUTED},1.4);}
         let fresh = self
             .chat_filters
             .iter()
@@ -802,11 +840,11 @@ impl App {
                 }
             ),
             rect(
-                toolbar + 499.,
+                toolbar + 532.,
                 9.,
                 width
                     - toolbar
-                    - if self.tag_filters.is_empty() {
+                    - 70. - if self.tag_filters.is_empty() {
                         512.
                     } else {
                         546.
@@ -818,10 +856,14 @@ impl App {
             false,
         );
         if !self.tag_filters.is_empty() {
-            let r = rect(width - 39., 13., 24., 24.);
+            let r = rect(width - 77., 13., 24., 24.);
             area(Hit::TagClear, r);
             p.search_clear(r, self.hover == Some(Hit::TagClear));
         }
+        let manager = rect(width - 43., 8., 32., 32.);
+        area(Hit::RepairPanel, manager);
+        if self.hover == Some(Hit::RepairPanel) { p.fill(manager, 0x35434a, 6.); }
+        p.action_icon(&Hit::Preferences, width - 38., 13.);
         let left = self.recent_left();
         if self.sidebar_open {
             p.line(TAG_SIDEBAR, 8., TAG_SIDEBAR, height - 40., 0x3a484f, 1.);
@@ -990,7 +1032,7 @@ impl App {
             let icon_y = y + if self.settings.compact_recent { 4. } else { 7. };
             let icon_r = rect(left + 12., icon_y, 30., 30.);
             area(Hit::ChatIcon(row.id.clone()), icon_r);
-            p.fill(icon_r, 0x303b43, 7.);
+            if !self.catalog.icon(&row.label).is_empty() || self.hover==Some(Hit::ChatIcon(row.id.clone())) {p.fill(icon_r, 0x303b43, 7.);}
             p.label(
                 &self.catalog.icon(&row.label),
                 rect(left + 16., icon_y - 2., 25., 34.),
@@ -1008,20 +1050,16 @@ impl App {
             } else {
                 24.
             };
-            if self.settings.compact_recent {
-                p.label(
-                    self.catalog.strip(&row.label),
-                    rect(left + 50., y + 2., (metric_x - left - 59.).max(40.), line_h),
-                    13.,
-                    TEXT,
-                    false,
-                );
-            } else {
-                p.centered_title(
-                    self.catalog.strip(&row.label),
-                    rect(columns.title_left, y + 6., columns.title_width, 32.),
-                );
-            }
+            let title=self.catalog.strip(&row.label);let highlight=if !self.search.trim().is_empty(){self.chat_search.highlight(&row.id,title,&self.search)}else{Vec::new()};
+            let project = self.title_project_tag(row);
+            let shift = if let Some((tag, r)) = project {
+                self.paint_tag(&tag, r.left, y + r.top, r.right-r.left, self.tag_filters.contains(&tag.key));
+                area(Hit::TagFilter(tag.key), rect(r.left, y+r.top, r.right-r.left, r.bottom-r.top));
+                r.right-r.left+4.
+            } else { 0. };
+            if self.settings.compact_recent {p.highlighted_title(title,rect(left + 50., y + 2., ((metric_x - left - 59.).max(40.) - shift).max(1.), line_h),&highlight,false);}
+            else if shift>0. {self.paint_title_with_project(title,&highlight,columns.title_left,y,columns.title_width,shift-4.);}
+            else {p.highlighted_title(title,rect(columns.title_left, y + 6., columns.title_width, 32.),&highlight,false);}
             let metrics = if busy {
                 format!(
                     "{} t/s · {} TOK · {}",
@@ -1073,7 +1111,7 @@ impl App {
                     p.model_label(&model, rect(columns.meta_right - rate_width - model_width, y + 1., model_width - 8., 20.), 10.);
                 }
                 p.right_label(
-                    &if busy || !model.is_empty() { format!("{} TOK · {elapsed}", data::compact(row.tokens)) } else { elapsed },
+                    &if self.recent_sort==1 {row.disk_bytes.map(|n|format!("{:.2} MiB · {elapsed}",n as f64/1048576.)).unwrap_or_else(||elapsed.clone())}else if busy || !model.is_empty() { format!("{} TOK · {elapsed}", data::compact(row.tokens)) } else { elapsed },
                     rect(columns.meta_left, y + 23., columns.meta_width, 20.),
                     10.,
                     MUTED,
@@ -1850,7 +1888,7 @@ unsafe fn verify_recent_tags(app: &mut App, paths: &Paths) -> Result<()> {
         .iter()
         .any(|a| matches!(a.hit, Hit::TagEdit(_))));
     assert_eq!(
-        app.fixed_hit_at(TAG_SIDEBAR + 80., RECENT_TOP as f32 + 43. + 10.),
+        app.fixed_hit_at(TAG_SIDEBAR + 57., RECENT_TOP as f32 + 43. + 10.),
         Some(Hit::Recent(app.rows[app.chat_filters[1]].id.clone()))
     );
     let _ = app.hit(Hit::Compact);
@@ -2173,6 +2211,8 @@ unsafe fn verify_two_columns(app: &mut App, paths: &Paths) -> Result<()> {
     app.settings.recent_title_width = 200;
     app.popup(Popup::Recent)?;
     let first = app.chat_filters[0];
+    let original_tags = app.rows[first].tags.clone();
+    app.rows[first].tags = vec![tags::Tag {key:"project:layout-test".into(),label:"demo".into(),kind:tags::Kind::Project,..Default::default()}, tags::Tag {key:"group:layout-test".into(),label:"group".into(),kind:tags::Kind::Group,..Default::default()}];
     app.rows[first].label = "🚧 条码智能相机纯 RTL：图像采集、数据链路与帧缓存验证".into();
     app.rows[first].prompt="继续完成图像采集链路，检查帧缓存与跨时钟域数据传输，保持四路并行，覆盖连续采集时的背压、丢帧和异常恢复。".into();
     let second = app.chat_filters[1];
@@ -2187,7 +2227,37 @@ unsafe fn verify_two_columns(app: &mut App, paths: &Paths) -> Result<()> {
         h,
         &paths.runtime.join("rust-two-column-verification.png"),
     )?;
+    capture_render(app,(1276.-TAG_SIDEBAR) as u32,h,&paths.runtime.join("rust-project-title-actual.png"),||{
+        let identity=windows::Foundation::Numerics::Matrix3x2{M11:1.,M22:1.,..Default::default()};
+        let translated=windows::Foundation::Numerics::Matrix3x2{M31:-TAG_SIDEBAR,..identity};
+        app.painter.target.SetTransform(&translated);
+        let hits=app.render(Some(Popup::Recent),1276.,h as f32);
+        app.painter.target.SetTransform(&identity);
+        hits
+    })?;
     assert_eq!(app.recent_row_height(), 48);
+    let (project, project_rect) = app.title_project_tag(&app.rows[first]).expect("project tag in title");
+    assert_eq!(project.key, "project:layout-test");
+    let columns=app.recent_columns();assert!((project_rect.right-(columns.title_left+columns.title_width)).abs()<0.01,"primary project tag must align to the title column right edge");
+    let content=(app.popup_size[0] as f32-app.recent_left()-18.).max(300.);let old_tag_width=(content*0.20).clamp(120.,210.);
+    assert!((columns.tags_width-old_tag_width*0.60).abs()<0.01,"tag column must shrink by 40%");
+    assert!((columns.title_width-(200.+old_tag_width*0.40)).abs()<0.01,"the released width belongs to the title column");
+    assert_eq!(project_rect.top,3.,"a wrapped title positions the project tag on its first line");
+    let long_title=app.rows[first].label.clone();app.rows[first].label="短标题".into();
+    assert_eq!(app.title_project_tag(&app.rows[first]).unwrap().1.top,12.,"a single-line title and tag are vertically centered");
+    app.rows[first].label=long_title;
+    assert_eq!(app.fixed_hit_at(project_rect.left+5.,RECENT_TOP as f32+project_rect.top+10.),Some(Hit::TagFilter(project.key.clone())));
+    assert!(!app.tag_layout(&app.rows[first]).chips.iter().any(|(tag,_)|tag.key==project.key));
+    assert!(app.tag_layout(&app.rows[first]).chips.iter().any(|(tag,_)|tag.key=="group:layout-test"));
+    let short_width=project_rect.right-project_rect.left;
+    app.rows[first].tags[0].label="much longer project".into();
+    let long_width=app.title_project_tag(&app.rows[first]).unwrap().1;
+    assert!(long_width.right-long_width.left>short_width,"project width should follow label length");
+    assert!((long_width.right-project_rect.right).abs()<0.01,"project tags of different widths share the same right edge");
+    app.rows[first].tags[0].label="demo".into();
+    let _=app.hit(Hit::TagFilter(project.key.clone()));assert!(app.tag_filters.contains(&project.key));assert!(app.chat_filters.iter().all(|&i|app.rows[i].tags.iter().any(|t|t.key==project.key)));
+    let _=app.hit(Hit::TagFilter(project.key));
+    app.rows[first].tags=original_tags;
     let unread_slot = app
         .chat_filters
         .iter()
@@ -2255,6 +2325,10 @@ unsafe fn verify_two_columns(app: &mut App, paths: &Paths) -> Result<()> {
             .runtime
             .join("rust-two-column-search-verification.png"),
     )?;
+    app.search_body=false;app.search=app.catalog.strip(&app.rows[first].label).chars().take(2).collect();app.filter_fixed();
+    capture(app,Some(Popup::Recent),1276,h,&paths.runtime.join("rust-title-highlight-verification.png"))?;
+    app.search_body=true;app.filter_fixed();
+    capture(app,Some(Popup::Recent),1276,h,&paths.runtime.join("rust-title-and-body-highlight-verification.png"))?;
     app.close_popup();
     app.popup(Popup::Preferences)?;
     let _ = app.hit(Hit::TitleWidth(20));
@@ -2305,10 +2379,11 @@ unsafe fn verify_tag_overflow(app: &mut App, paths: &Paths) -> Result<()> {
             .add(&id, &format!("会话标签{i:02}"), i % 6)?;
     }
     app.refresh_tag_catalog();
-    let all = app.custom_tags.for_row(&app.rows[row_index]);
+    let primary = app.primary_project_tag(&app.rows[row_index]);
+    let all:Vec<_> = app.custom_tags.for_row(&app.rows[row_index]).into_iter().filter(|tag|primary.as_ref().is_none_or(|p|p.key!=tag.key)).collect();
     let layout = app.tag_layout(&app.rows[row_index]);
     assert!(layout.hidden > 0);
-    assert!(layout.chips.len() > 3);
+    assert!(layout.chips.len() >= 2, "the narrowed tag column still uses both rows");
     assert!(layout.chips.iter().any(|(_, r)| r.top > 20.));
     assert_eq!(layout.chips.len() + layout.hidden, all.len());
     assert!(layout

@@ -55,6 +55,8 @@ impl Snapshot {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Row {
+    #[serde(default)]
+    pub disk_bytes: Option<u64>,
     pub id: String,
     #[serde(default)]
     pub label: String,
@@ -179,6 +181,21 @@ pub struct Recent {
     pub error: String,
 }
 impl Recent {
+    pub fn mark_opened(&mut self, id: &str) -> Option<f64> {
+        let timestamp = self.rows.iter().chain(&self.all_rows).find(|row| row.id == id).map(|row| row.updated_at);
+        for row in self.rows.iter_mut().chain(&mut self.all_rows).chain(&mut self.busy_metrics) {
+            if row.id == id { row.is_unread = Some(false); }
+        }
+        self.loaded_at = now();
+        timestamp
+    }
+    pub fn apply_opened(&mut self, opened: &mut HashMap<String, f64>) {
+        opened.retain(|id, at| !self.rows.iter().chain(&self.all_rows).any(|row|
+            row.id == *id && (row.state == "Busy" || row.updated_at > *at)));
+        for row in self.rows.iter_mut().chain(&mut self.all_rows).chain(&mut self.busy_metrics) {
+            if opened.contains_key(&row.id) { row.is_unread = Some(false); }
+        }
+    }
     pub fn new_result_count(&self) -> usize {
         self.rows.iter().filter(|row| row.newly_completed()).count()
     }
@@ -217,6 +234,31 @@ impl Recent {
             self.busy_count
                 .is_some_and(|c| c != sources.0 || c != sources.1),
         )
+    }
+}
+
+#[cfg(test)]
+mod opened_result_tests {
+    use super::*;
+    #[test]
+    fn successful_open_survives_stale_refresh_but_not_a_new_turn() {
+        let row=Row{id:"chat".into(),state:"Done".into(),is_unread:Some(true),updated_at:12.,..Default::default()};
+        let mut original=Recent{rows:vec![row.clone()],all_rows:vec![row.clone()],..Default::default()};
+        let mut opened=HashMap::new();
+        opened.insert(row.id.clone(),original.mark_opened(&row.id).unwrap());
+        assert_eq!(original.new_result_count(),0);
+        let mut stale=Recent{rows:vec![row.clone()],all_rows:vec![row.clone()],..Default::default()};
+        stale.apply_opened(&mut opened);
+        assert_eq!(stale.new_result_count(),0);
+        let mut newer=row.clone(); newer.updated_at=13.;
+        let mut refresh=Recent{rows:vec![newer],..Default::default()};
+        refresh.apply_opened(&mut opened);
+        assert_eq!(refresh.new_result_count(),1);
+        opened.insert(row.id.clone(),12.);
+        let mut busy=row; busy.state="Busy".into();
+        let mut refresh=Recent{rows:vec![busy],..Default::default()};
+        refresh.apply_opened(&mut opened);
+        assert!(opened.is_empty());
     }
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -392,7 +434,7 @@ impl Catalog {
         let stripped = self.strip(title);
         let prefix = title[..title.len() - stripped.len()].trim();
         if prefix.is_empty() {
-            "◈".into()
+            String::new()
         } else {
             prefix.into()
         }
@@ -499,12 +541,19 @@ impl Store {
     pub fn sessions(&self) -> Result<Vec<Row>> {
         let db = self.db("state_5.sqlite")?;
         let internal = crate::visibility::internal_reviews(&db)?;
-        let mut query=db.prepare("SELECT id,title,updated_at,tokens_used,name,model,reasoning_effort FROM threads WHERE archived=0 AND agent_path IS NULL ORDER BY updated_at DESC,id")
+        let mut query=db.prepare("SELECT id,title,updated_at,tokens_used,name,model,reasoning_effort,rollout_path FROM threads WHERE archived=0 AND agent_path IS NULL ORDER BY updated_at DESC,id")
+            .or_else(|_|db.prepare("SELECT id,title,updated_at,tokens_used,name,model,reasoning_effort,NULL FROM threads WHERE archived=0 AND agent_path IS NULL ORDER BY updated_at DESC,id"))
+            .or_else(|_|db.prepare("SELECT id,title,updated_at,tokens_used,name,NULL,NULL,rollout_path FROM threads WHERE archived=0 AND agent_path IS NULL ORDER BY updated_at DESC,id"))
             .or_else(|_|db.prepare("SELECT id,title,updated_at,tokens_used,name FROM threads WHERE archived=0 AND agent_path IS NULL ORDER BY updated_at DESC,id"))?;
         let has_execution = query.column_count() >= 7;
         let mut rows = query
             .query_map([], |r| {
                 Ok(Row {
+                    disk_bytes: if r.as_ref().column_count()>=8 {r.get::<_,Option<String>>(7)?.and_then(|path|{
+                        let first=fs::metadata(&path).ok().filter(|m|m.is_file()).map(|m|m.len());
+                        let second=fs::metadata(format!("{path}.zst")).ok().filter(|m|m.is_file()).map(|m|m.len());
+                        if first.is_some()||second.is_some(){Some(first.unwrap_or(0)+second.unwrap_or(0))}else{None}
+                    })}else{None},
                     id: r.get(0)?,
                     label: display_title(
                         r.get::<_, Option<String>>(4)?.as_deref(),

@@ -1,6 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod body;
+mod clean;
+mod repair;
+mod reduce;
 mod data;
 mod prompts;
 mod replies;
@@ -18,6 +21,8 @@ mod telemetry;
 mod update;
 mod reset_notice;
 mod capacity_retry;
+mod startup;
+mod manager;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -143,6 +148,10 @@ pub struct Settings {
     pub recent_rows: usize,
     #[serde(default)]
     pub recent_shortcut: Shortcut,
+    #[serde(default = "default_body_shortcut")]
+    pub body_shortcut: Shortcut,
+    #[serde(default = "default_compact_shortcut")]
+    pub compact_shortcut: Shortcut,
     #[serde(default)]
     pub compact_recent: bool,
     #[serde(default="default_title_width")]
@@ -153,20 +162,27 @@ pub struct Settings {
     pub reset_notice: reset_notice::Settings,
     #[serde(default)]
     pub capacity_retry: capacity_retry::Settings,
+    #[serde(default="default_reduce_threshold")]
+    pub reduce_threshold_mib: u64,
 }
+fn default_reduce_threshold()->u64{100}
 fn default_recent_rows() -> usize { 10 }
 fn default_title_width()->u32{200}
+fn default_body_shortcut()->Shortcut{Shortcut{enabled:true,key:b'F' as u16,ctrl:false,alt:true,shift:false}}
+fn default_compact_shortcut()->Shortcut{Shortcut{enabled:true,key:b'C' as u16,ctrl:false,alt:true,shift:false}}
 impl Default for Settings {
     fn default() -> Self {
         Self {
             thread: String::new(), auto_thread: true, host_offset: None,
             position_version: 0, recent_rows: default_recent_rows(),
             recent_shortcut: Shortcut::default(),
+            body_shortcut:default_body_shortcut(), compact_shortcut:default_compact_shortcut(),
             compact_recent: false,
             recent_title_width:default_title_width(),
             refresh:refresh::Settings::default(),
             reset_notice:reset_notice::Settings::default(),
             capacity_retry:capacity_retry::Settings::default(),
+            reduce_threshold_mib:default_reduce_threshold(),
         }
     }
 }
@@ -232,6 +248,8 @@ pub struct Shared {
     pub slot_host: isize,
     pub snapshot: Option<data::Snapshot>,
     pub recent: Arc<data::Recent>,
+    #[serde(skip)]
+    pub opened_results: std::collections::HashMap<String, f64>,
     pub quota: Vec<data::Quota>,
     pub quota_at: f64,
     pub quota_error: String,
@@ -250,6 +268,15 @@ fn run() -> Result<()> {
         return Ok(());
     }
     let paths = Paths::discover()?;
+    if let Some(index)=args.iter().position(|s|s=="--clean-commit") {
+        let folder=args.get(index+1).context("Specify the cleanup folder")?;let stop=Arc::new(AtomicBool::new(false));return clean::commit_from_cli(&paths,folder,&stop)
+    }
+    if let Some(index)=args.iter().position(|s|s=="--clean-worker") {
+        unsafe {use windows::Win32::System::Threading::*;let _=SetThreadPriority(GetCurrentThread(),THREAD_MODE_BACKGROUND_BEGIN);}
+        let id=args.get(index+1).context("Specify a chat ID after --clean-worker")?;let stop=Arc::new(AtomicBool::new(false));let executables=reduce::running_codex()?;
+        let mut codex:Vec<PathBuf>=executables.into_iter().map(PathBuf::from).collect();codex.sort();
+        let (before,after)=clean::clean_session(&paths,id,args.iter().any(|s|s=="--include-command-io"),&codex,&stop)?;println!("{}",serde_json::json!({"before":before,"after":after}));return Ok(())
+    }
     if args.iter().any(|s| s == "--self-test") {
         return ui::self_test(&paths);
     }
@@ -263,6 +290,14 @@ fn run() -> Result<()> {
     if args.iter().any(|s| s == "--inspect") {
         return desktop::inspect(&paths);
     }
+    if args.iter().any(|s|s=="--inspect-reduce-support") {
+        let stop=Arc::new(AtomicBool::new(false));
+        reduce::verify_runtime(&stop)?;println!("Running Codex supports compressed sessions");return Ok(());
+    }
+    if let Some(index)=args.iter().position(|s|s=="--inspect-diff") {
+        let id=args.get(index+1).context("Specify a chat ID after --inspect-diff")?;
+        let stop=Arc::new(AtomicBool::new(false));println!("{}",serde_json::to_string(&clean::analyze(&paths,id,&stop)?)?);return Ok(());
+    }
     if args.iter().any(|s|s=="--inspect-capacity-retry") {return desktop::inspect_capacity(&paths);}
     if args.iter().any(|s|s=="--inspect-prompts") {return desktop::inspect_prompts(&paths);}
     if let Some(index)=args.iter().position(|s|s=="--inspect-reply") {return replies::inspect(&paths,args.get(index+1).context("Specify a chat ID after --inspect-reply")?);}
@@ -275,6 +310,7 @@ fn run() -> Result<()> {
     if args.iter().any(|s| s == "--hide") {
         return ui::request_hide(&paths);
     }
+    let recovery_stop=Arc::new(AtomicBool::new(false));let recovery_error=clean::recover_all(&paths,&recovery_stop).err().map(|e|format!("{e:#}")).unwrap_or_default();paths.write("clean-recovery-status.json",&serde_json::json!({"error":recovery_error}));
     let mut settings: Settings =
         serde_json::from_value(read_json(&paths.app.join("settings.json"), 16384)).unwrap_or_else(
             |_| Settings {
@@ -284,6 +320,7 @@ fn run() -> Result<()> {
         );
     settings.reset_notice.clamp();
     settings.capacity_retry.clamp();
+    settings.reduce_threshold_mib=settings.reduce_threshold_mib.clamp(10,102400);
     if settings.thread.is_empty() {
         settings.thread = desktop::default_context(&paths);
     }

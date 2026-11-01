@@ -107,7 +107,7 @@ pub fn watch(paths: &Paths, events: Arc<Events>, stop: Stop) -> std::thread::Joi
                             && (name.starts_with("state_") || name.starts_with("thread_history_"))
                             && (name.ends_with(".sqlite") || name.ends_with(".sqlite-wal")))
                             || (path.starts_with(callback_home.join("sessions"))
-                                && path.extension().is_some_and(|e| e == "jsonl"))
+                                && path.extension().is_some_and(|e| e == "jsonl" || e == "zst"))
                     }) {
                         callback_events.notify();
                     }

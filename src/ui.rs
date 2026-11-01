@@ -35,9 +35,17 @@ use windows::{
     },
 };
 
+#[path = "hover_card.rs"]
+mod hover_card;
+#[path = "reset_hover.rs"]
+mod reset_hover;
+
 const CLASS: PCWSTR = w!("CodexSessionBarRust");
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const QUIT_MESSAGE: u32 = WM_APP + 2;
+#[derive(Debug,PartialEq,Eq)]
+enum HostPresentation{HiddenByUser,Standalone,HostHidden,Docked}
+fn host_presentation(hidden:bool,exists:bool,shown:bool)->HostPresentation{if hidden{HostPresentation::HiddenByUser}else if !exists{HostPresentation::Standalone}else if !shown{HostPresentation::HostHidden}else{HostPresentation::Docked}}
 const HIDE_MESSAGE: u32 = WM_APP + 3;
 const FOCUS_MESSAGE: u32 = WM_APP + 4;
 const RECENT_HOTKEY: i32 = 0x5342;
@@ -50,14 +58,17 @@ const MODEL: u32 = 0xffdc91;
 const GREEN: u32 = 0x65d69b;
 const NEW_RESULT: u32 = 0x70b7ff;
 const DETAILS_HEIGHT: i32 = 310;
-const PREFERENCES_HEIGHT: i32 = 676;
+const PREFERENCES_HEIGHT: i32 = 720;
 const RECENT_ROW: i32 = 48;
 const LAYOUT_CACHE_LIMIT: usize = 256;
 const RECENT_TOP: i32 = 48;
 const RECENT_FRAME: i32 = 92;
+const MANAGER_TOP: f32 = 164.;
+const MANAGER_ROW: f32 = 42.;
+const MANAGER_PAGE: usize = 11;
 const SEARCH_CUE_SUBCLASS: usize = 0x5343;
 fn search_cue(kind: usize) -> &'static str {
-    match (kind,crate::locale::chinese()) {(2,true)=>"搜索标签 / 拼音…",(2,false)=>"Search tags / pinyin…",(_,true)=>"搜索会话 / 拼音…",_=>"Search chats / pinyin…"}
+    match (kind,crate::locale::chinese()) {(2,true)=>"搜索标签 / 拼音…",(2,false)=>"Search tags / pinyin…",(3,true)=>"搜索会话名称 / 拼音…",(3,false)=>"Search chat names / pinyin…",(_,true)=>"搜索会话 / 拼音…",_=>"Search chats / pinyin…"}
 }
 unsafe fn paint_search_cue(hwnd: HWND, dc: HDC, kind: usize) {
     if GetWindowTextLengthW(hwnd) != 0 || dc.is_invalid() { return; }
@@ -120,32 +131,11 @@ fn color(rgb: u32) -> D2D1_COLOR_F {
         a: 1.,
     }
 }
-// The original tray pictogram: a rounded session bar with two short text strokes.
-// Rasterize at the tray's native size with supersampling, retaining transparent edges.
+// The tray and executable use the same source artwork. Premultiplied BGRA is
+// required by CreateIconIndirect for transparent pixels on Windows.
 fn tray_pixels(size: usize) -> Vec<u32> {
-    let mut pixels = vec![0; size * size];
-    for y in 0..size {
-        for x in 0..size {
-            let mut coverage = 0u32;
-            for sy in 0..4 {
-                for sx in 0..4 {
-                    let px = (x as f32 + (sx as f32 + 0.5) / 4.) * 24. / size as f32;
-                    let py = (y as f32 + (sy as f32 + 0.5) / 4.) * 24. / size as f32;
-                    let qx = (px - 12.).abs() - 7.;
-                    let qy = (py - 12.).abs() - 3.;
-                    let outline =
-                        (qx.max(0.).hypot(qy.max(0.)) + qx.max(qy).min(0.) - 3.).abs() <= 0.85;
-                    let text = (px - px.clamp(6., 9.)).hypot(py - 12.) <= 0.85
-                        || (px - px.clamp(12., 18.)).hypot(py - 12.) <= 0.85;
-                    coverage += u32::from(outline || text);
-                }
-            }
-            let a = coverage * 255 / 16;
-            pixels[y * size + x] =
-                (a << 24) | ((0xb7 * a / 255) << 16) | ((0xc2 * a / 255) << 8) | (0xcf * a / 255);
-        }
-    }
-    pixels
+    let image=image::load_from_memory(include_bytes!("../assets/session-bar-icon.png")).expect("bundled tray artwork").resize_exact(size as u32,size as u32,image::imageops::FilterType::Lanczos3).to_rgba8();
+    image.pixels().map(|p|{let a=p[3] as u32;let r=p[0] as u32*a/255;let g=p[1] as u32*a/255;let b=p[2] as u32*a/255;(a<<24)|(r<<16)|(g<<8)|b}).collect()
 }
 unsafe fn create_tray_icon() -> Result<HICON> {
     let size = GetSystemMetrics(SM_CXSMICON).max(16) as usize;
@@ -182,6 +172,33 @@ unsafe fn create_tray_icon() -> Result<HICON> {
 }
 #[derive(Clone, Debug, PartialEq)]
 enum Hit {
+    Numeric(NumericTarget),
+    RecentSort,
+    RepairPanel,
+    RepairScan,
+    RepairFilter(usize),
+    ManagerClearSearch,
+    ManagerSelectAll,
+    ManagerSelect(String),
+    ManagerRow(String),
+    ManagerBatch(usize),
+    ManagerCleanMenu,
+    ManagerCleanMode(bool),
+    ManagerForceToggle,
+    ManagerDeleteCancel,
+    ManagerDeleteConfirm,
+    RepairSort(usize),
+    RepairOne(String),
+    RepairAll,
+    AnalyzeOne(String),
+    CleanOne(String),
+    CleanMenu(String),
+    CleanMode(String, bool),
+    ReduceOne(String),
+    DecompressOne(String),
+    ReduceAll,
+    ReduceThreshold(i32),
+    Breakdown(String),
     Info(String),
     Icon,
     Title,
@@ -203,6 +220,8 @@ enum Hit {
     Rows(i32),
     TitleWidth(i32),
     ShortcutEnabled,
+    LocalShortcut(usize),
+    AutoStart,
     ApplyPreferences,
     GuardSettings,
     GuardLimit(usize,i32),
@@ -250,6 +269,8 @@ enum Hit {
     TagBackground,
     Quit,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumericTarget { Rows, TitleWidth, Guard(usize), Refresh(usize), ResetInterval, RetryInterval, ReduceThreshold }
 #[derive(Clone)]
 struct Area {
     r: D2D_RECT_F,
@@ -262,6 +283,7 @@ impl Area {
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Popup {
+    Repair,
     Recent,
     Icons,
     Details,
@@ -433,9 +455,15 @@ impl Painter {
             if let Ok(brush)=self.brush(rgb){self.target.DrawTextLayout(D2D_POINT_2F{x:r.left,y:r.top},&layout,&brush,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT|D2D1_DRAW_TEXT_OPTIONS_CLIP);}
         }
     }
-    unsafe fn centered_title(&self,text:&str,r:D2D_RECT_F){
-        if let Ok(layout)=self.layout(text,13.,false,(r.right-r.left).max(1.),(r.bottom-r.top).max(1.),true,1){
-            if let Ok(brush)=self.brush(TEXT){self.target.DrawTextLayout(D2D_POINT_2F{x:r.left,y:r.top},&layout,&brush,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT|D2D1_DRAW_TEXT_OPTIONS_CLIP);}
+    unsafe fn highlighted_title(&self,text:&str,r:D2D_RECT_F,ranges:&[(usize,usize)],center:bool){self.highlighted_title_sized(text,r,ranges,center,13.);}
+    unsafe fn highlighted_title_sized(&self,text:&str,r:D2D_RECT_F,ranges:&[(usize,usize)],center:bool,size:f32){
+        if let Ok(layout)=self.layout(text,size,false,(r.right-r.left).max(1.),(r.bottom-r.top).max(1.),center,if center{1}else{0}){
+            if let (Ok(normal),Ok(highlight))=(self.brush(TEXT),self.brush(0xffd27f)){
+                let whole=DWRITE_TEXT_RANGE{startPosition:0,length:text.encode_utf16().count() as u32};let _=layout.SetDrawingEffect(&normal,whole);let _=layout.SetFontWeight(DWRITE_FONT_WEIGHT_NORMAL,whole);
+                for &(a,b) in ranges {if a<=b && b<=text.len() && text.is_char_boundary(a)&&text.is_char_boundary(b){let range=DWRITE_TEXT_RANGE{startPosition:text[..a].encode_utf16().count() as u32,length:text[a..b].encode_utf16().count() as u32};let _=layout.SetDrawingEffect(&highlight,range);let _=layout.SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD,range);}}
+                self.target.DrawTextLayout(D2D_POINT_2F{x:r.left,y:r.top},&layout,&normal,D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT|D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                let _=layout.SetDrawingEffect(&normal,whole);let _=layout.SetFontWeight(DWRITE_FONT_WEIGHT_NORMAL,whole);
+            }
         }
     }
     unsafe fn right_label(&self,text:&str,r:D2D_RECT_F,size:f32,rgb:u32){
@@ -534,17 +562,57 @@ impl Painter {
         );
         self.circle(x + if on { 20. } else { 8. }, y + 8., 6., 0xffffff);
     }
-    unsafe fn banked_icon(&self,x:f32,y:f32,rgb:u32) {
-        self.line(x+1.,y+4.,x+8.,y,rgb,1.1);self.line(x+8.,y,x+15.,y+4.,rgb,1.1);
-        self.line(x+1.,y+5.,x+15.,y+5.,rgb,1.1);
-        for column in [4.,8.,12.] {self.line(x+column,y+7.,x+column,y+12.,rgb,1.1);}
-        self.line(x+2.,y+14.,x+14.,y+14.,rgb,1.1);self.line(x,y+16.,x+16.,y+16.,rgb,1.1);
+    unsafe fn banked_icon(&self,x:f32,center:f32,rgb:u32,count:u64) {
+        let n=count.clamp(1,3) as usize;
+        if let Ok(brush)=self.brush(rgb) {
+            for i in 0..n {
+                let y=center+(n-1) as f32*1.9-i as f32*3.8;
+                self.target.DrawEllipse(&D2D1_ELLIPSE { point:D2D_POINT_2F{x:x+8.,y},radiusX:7.,radiusY:2.2 },&brush,1.1,None);
+            }
+        }
+    }
+    unsafe fn compression_icon(&self,x:f32,y:f32,color:u32){
+        self.border(rect(x+2.,y+1.,12.,15.),color,2.);
+        for dy in [4.,7.,10.] {self.line(x+8.,y+dy,x+10.,y+dy,color,1.3);}
+    }
+    unsafe fn decompression_icon(&self,x:f32,y:f32,color:u32){
+        self.line(x+2.,y+10.,x+2.,y+15.,color,1.3);self.line(x+2.,y+15.,x+15.,y+15.,color,1.3);self.line(x+15.,y+15.,x+15.,y+10.,color,1.3);
+        self.line(x+8.5,y+1.,x+8.5,y+10.,color,1.3);self.line(x+5.,y+7.,x+8.5,y+10.,color,1.3);self.line(x+8.5,y+10.,x+12.,y+7.,color,1.3);
+    }
+    unsafe fn repair_toolbar_icon(&self,hit:&Hit,x:f32,y:f32,color:u32)->bool{
+        match hit {
+            Hit::RepairScan=>{for start in [-150_f32,30.] {for i in 0..15{let a=(start+i as f32*9.).to_radians();let b=(start+(i+1) as f32*9.).to_radians();self.line(x+7.+5.*a.cos(),y+7.+5.*a.sin(),x+7.+5.*b.cos(),y+7.+5.*b.sin(),color,1.3);}}self.line(x+12.,y+1.,x+12.,y+5.,color,1.3);self.line(x+12.,y+5.,x+8.,y+5.,color,1.3);}
+            Hit::RepairAll=>{self.line(x+2.,y+13.,x+10.,y+5.,color,1.5);self.line(x+2.,y+13.,x+4.,y+15.,color,1.5);self.line(x+4.,y+15.,x+12.,y+7.,color,1.5);self.line(x+10.,y+5.,x+9.,y+1.,color,1.3);self.line(x+9.,y+1.,x+13.,y+2.,color,1.3);self.line(x+13.,y+2.,x+14.,y+6.,color,1.3);}
+            Hit::RepairFilter(0)=>{for (dx,dy) in [(0.,0.),(7.,0.),(0.,7.),(7.,7.)]{self.border(rect(x+dx,y+dy,5.,5.),color,1.);}}
+            Hit::RepairFilter(1)=>{self.border(rect(x,y,14.,14.),color,7.);self.line(x+3.,y+7.,x+6.,y+10.,color,1.3);self.line(x+6.,y+10.,x+11.,y+4.,color,1.3);}
+            Hit::RepairFilter(2)=>{self.border(rect(x+1.,y+4.,12.,10.),color,1.);self.line(x,y+3.,x+14.,y+3.,color,1.4);self.line(x+5.,y+7.,x+9.,y+7.,color,1.2);}
+            Hit::RepairFilter(4)=>{self.border(rect(x+2.,y+2.,10.,10.),color,3.);self.line(x+7.,y+4.,x+7.,y+10.,color,1.);},
+            Hit::RepairFilter(3)=>{self.line(x+7.,y+1.,x+14.,y+13.,color,1.3);self.line(x+14.,y+13.,x,y+13.,color,1.3);self.line(x,y+13.,x+7.,y+1.,color,1.3);self.line(x+7.,y+5.,x+7.,y+9.,color,1.3);self.circle(x+7.,y+11.,0.7,color);}
+            _=>return false,
+        }true
+    }
+    unsafe fn busy_spinner(&self,x:f32,y:f32){
+        let step=(now()*5.) as usize%8;
+        for i in 0..8 {let a=i as f32*std::f32::consts::TAU/8.;let color=if i==step{GREEN}else if (i+1)%8==step{0x4c9d77}else{0x53656a};self.circle(x+8.+a.cos()*5.5,y+8.+a.sin()*5.5,1.3,color);}
     }
     unsafe fn notice_bell(&self,x:f32,y:f32,color:u32) {
+        self.notice_bell_scaled(x,y,color,1.);
+    }
+    unsafe fn notice_bell_scaled(&self,x:f32,y:f32,color:u32,scale:f32) {
         let points=[(3.,16.),(5.,13.),(5.,8.),(6.,5.),(8.,3.),(11.,2.),(14.,3.),(16.,5.),(17.,8.),(17.,13.),(19.,16.),(3.,16.)];
-        for pair in points.windows(2){self.line(x+pair[0].0,y+pair[0].1,x+pair[1].0,y+pair[1].1,color,1.25);}
-        self.line(x+11.,y,x+11.,y+2.,color,1.25);
-        self.line(x+9.,y+19.,x+10.,y+20.,color,1.25);self.line(x+10.,y+20.,x+12.,y+20.,color,1.25);self.line(x+12.,y+20.,x+13.,y+19.,color,1.25);
+        for pair in points.windows(2){self.line(x+pair[0].0*scale,y+pair[0].1*scale,x+pair[1].0*scale,y+pair[1].1*scale,color,1.25);}
+        self.line(x+11.*scale,y,x+11.*scale,y+2.*scale,color,1.25);
+        self.line(x+9.*scale,y+19.*scale,x+10.*scale,y+20.*scale,color,1.25);self.line(x+10.*scale,y+20.*scale,x+12.*scale,y+20.*scale,color,1.25);self.line(x+12.*scale,y+20.*scale,x+13.*scale,y+19.*scale,color,1.25);
+    }
+    unsafe fn settings_gear(&self,x:f32,y:f32,scale:f32,color:u32) {
+        for i in 0..24 {
+            let a = i as f32 * std::f32::consts::TAU / 24.;
+            let b = (i + 1) as f32 * std::f32::consts::TAU / 24.;
+            let radius = |n: i32| if n % 3 == 0 { 9. * scale } else { 7. * scale };
+            self.line(x + 11.*scale + a.cos() * radius(i), y + 11.*scale + a.sin() * radius(i),
+                x + 11.*scale + b.cos() * radius(i + 1), y + 11.*scale + b.sin() * radius(i + 1), color, 1.5);
+        }
+        self.border(rect(x + 8.*scale, y + 8.*scale, 6.*scale, 6.*scale), color, 3.*scale);
     }
     unsafe fn action_icon(&self, hit: &Hit, x: f32, y: f32) {
         let c = if *hit == Hit::Refresh {
@@ -573,14 +641,7 @@ impl Painter {
                 self.line(x + 10., y + 3., x + 14., y + 7., c, 1.4);
             }
             Hit::Preferences => {
-                for i in 0..24 {
-                    let a = i as f32 * std::f32::consts::TAU / 24.;
-                    let b = (i + 1) as f32 * std::f32::consts::TAU / 24.;
-                    let radius = |n: i32| if n % 3 == 0 { 9. } else { 7. };
-                    self.line(x + 11. + a.cos() * radius(i), y + 11. + a.sin() * radius(i),
-                        x + 11. + b.cos() * radius(i + 1), y + 11. + b.sin() * radius(i + 1), c, 1.5);
-                }
-                self.border(rect(x + 8., y + 8., 6., 6.), c, 3.);
+                self.settings_gear(x,y,1.,c);
             }
             Hit::ApplyPreferences => {
                 self.line(x + 4., y + 11., x + 9., y + 16., GREEN, 1.8);
@@ -670,6 +731,29 @@ impl Painter {
 }
 
 struct App {
+    numeric_edit: HWND,
+    numeric_target: Option<NumericTarget>,
+    numeric_original: Option<u64>,
+    recent_sort: usize,
+    repair_service: crate::repair::Service,
+    clean_modes: HashMap<String, bool>,
+    clean_menu: Option<String>,
+    manager_query: String,
+    manager_matcher: RefCell<crate::search::LabelSearch>,
+    manager_selected: HashSet<String>,
+    manager_batch_io: bool,
+    manager_batch_menu: bool,
+    manager_delete_ids: Vec<String>,
+    manager_delete_scroll: usize,
+    manager_delete_force: bool,
+    manager_delete_edit: HWND,
+    repair_filter: usize,
+    repair_return_recent: bool,
+    repair_sort: usize,
+    repair_ascending: bool,
+    repair_revision: u64,
+    repair_spinner_due: Instant,
+    repair_activity: HashSet<String>,
     paths: Paths,
     settings: Settings,
     state: State,
@@ -696,6 +780,8 @@ struct App {
     shortcut_id: i32,
     shortcut_foreground: HWND,
     shortcut_context: bool,
+    local_shortcut_capture: Option<usize>,
+    startup_service: crate::startup::Service,
     preferences_draft: Option<Settings>,
     preferences_note: String,
     preferences_advanced: bool,
@@ -704,6 +790,8 @@ struct App {
     update_control: Option<crate::update::Control>,
     reply_service: Option<crate::replies::Service>,
     reply_revision: u64,
+    hover_card: hover_card::HoverCard,
+    reset_hover: reset_hover::ResetHover,
     notice_control: Option<crate::reset_notice::Control>,
     notice_alert_due: Instant,
     guard_events: Vec<guard::LogEntry>,
@@ -756,6 +844,7 @@ struct App {
     scroll: usize,
     hidden: bool,
     host_hidden: bool,
+    standalone: bool,
     drag: Option<(POINT, [i32; 4])>,
     hover: Option<Hit>,
     list_pointer: Option<(f32,f32)>,
@@ -776,6 +865,13 @@ struct App {
     testing: bool,
     quit: bool,
 }
+fn batch_reduce_ids(rows:&[crate::repair::Entry],threshold_mib:u64)->HashSet<String>{
+    rows.iter().filter(|r|!r.compressed&&!r.repairable&&r.bytes>threshold_mib.saturating_mul(1048576)).map(|r|r.id.clone()).collect()
+}
+fn active_repair_ids(live:&crate::Shared)->HashSet<String>{
+    live.recent.rows.iter().chain(&live.recent.busy_metrics).filter(|r|r.state=="Busy").map(|r|r.id.clone()).collect()
+}
+fn parse_numeric(text:&str,min:u64,max:u64)->Result<u64>{let value:u64=text.trim().parse().context("Invalid number")?;anyhow::ensure!((min..=max).contains(&value),"Value must be between {min} and {max}");Ok(value)}
 // The list retains its window, controls, filters and scroll under the popover.
 struct IconPanel {
     window: HWND,
@@ -804,6 +900,7 @@ impl Drop for Tips {
 }
 fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
     match hit {
+        Hit::Breakdown(_) => "",
         Hit::Info(text) | Hit::ResetNotice(text) | Hit::UpdateAvailable(text) => return text.clone(),
         Hit::Icon | Hit::ChatIcon(_) => "Change chat icon",
         Hit::ChatCopy(0) => "Copy a link to this chat",
@@ -818,6 +915,33 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::Grip => "Drag session bar",
         Hit::Hide => "Hide to tray · restore from the tray icon or recent-chats shortcut",
         Hit::Preferences => "Settings · list size, shortcut and extensions",
+        Hit::Numeric(_)=>"Click to enter a value · Enter applies · Escape cancels",
+        Hit::RecentSort=>"Sort: recent use, disk space, total duration · click to change",
+        Hit::RepairPanel=>"Session Manager · filter, clean and repair",
+        Hit::RepairScan=>"Scan local session records without modifying conversations",
+        Hit::RepairFilter(4)=>"Orphan: unarchived chats with no project or tags",
+        Hit::RepairFilter(_)=>"Filter session diagnostic results",
+        Hit::ManagerClearSearch=>"Clear search",
+        Hit::ManagerSelectAll=>"Select all chats in the current filter",
+        Hit::ManagerSelect(_)=>"Select this chat",
+        Hit::ManagerRow(_)=>"Chat details",
+        Hit::ManagerBatch(_)=>"Apply to selected chats · unsupported or active chats are skipped",
+        Hit::ManagerCleanMenu=>"Choose cleanup scope for selected chats",
+        Hit::ManagerCleanMode(_)=>"Set cleanup scope",
+        Hit::ManagerForceToggle=>"Force delete checked issue chats; Codex can still reject active writers",
+        Hit::ManagerDeleteCancel=>"Cancel deletion",
+        Hit::ManagerDeleteConfirm=>"Delete selected chats after entering yes",
+        Hit::RepairSort(_)=>"Sort diagnostic results · click again to reverse order",
+        Hit::RepairOne(_)=>"Back up this session and apply the verified history-mode repair",
+        Hit::RepairAll=>"Back up and repair all eligible sessions; skip unsupported problems",
+        Hit::AnalyzeOne(_)=>"Analyze generated-file diffs in this chat without modifying it",
+        Hit::CleanOne(_)=>"Clean this inactive chat after verified backup and preflight",
+        Hit::CleanMenu(_)=>"Choose cleanup scope",
+        Hit::CleanMode(_,_)=>"Select cleanup scope without starting cleanup",
+        Hit::ReduceOne(_)=>"Losslessly compress this idle session · verify before replacing the original",
+        Hit::DecompressOne(_)=>"Decompress this inactive session · verify the restored content before removing the compressed copy",
+        Hit::ReduceAll=>"Losslessly compress all eligible sessions above the size threshold",
+        Hit::ReduceThreshold(_)=>"Adjust the minimum size for batch compression",
         Hit::CheckUpdate => "Check GitHub for updates now · show an icon when an update is available",
         Hit::ProjectHome=>"Open Codex Session Bar on GitHub",
         Hit::ResetNoticeEnabled => "Follow published Codex reset announcements · selected source only",
@@ -829,6 +953,8 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::CapacityRetryFolder=>"Open retry log folder · includes compressed history",
         Hit::Rows(n) => if *n < 0 { "Show fewer rows" } else { "Show more rows" },
         Hit::ShortcutEnabled => "Enable shortcut · only while Codex or Session Bar has focus",
+        Hit::LocalShortcut(_) => "Click and press Ctrl or Alt plus a key · works only while the chat list is open",
+        Hit::AutoStart => "Start Session Bar at sign-in · follows Codex when it opens",
         Hit::GuardSettings => "Protection limits and check interval",
         Hit::GuardLimit(_,_) => "Adjust protection limit · apply to save",
         Hit::RefreshPreferences => "Refresh settings · source events, rate limits, fallback and diagnostics",
@@ -895,6 +1021,8 @@ impl App {
         settings.recent_rows = settings.recent_rows.clamp(4, 20);
         settings.recent_title_width=settings.recent_title_width.clamp(140,280);
         if !settings.recent_shortcut.valid() { settings.recent_shortcut = Shortcut::default(); }
+        if !settings.body_shortcut.valid() {settings.body_shortcut=crate::default_body_shortcut();}
+        if !settings.compact_shortcut.valid() {settings.compact_shortcut=crate::default_compact_shortcut();}
         let _ = InitCommonControlsEx(&INITCOMMONCONTROLSEX {
             dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_WIN95_CLASSES,
@@ -936,6 +1064,8 @@ impl App {
             GetModuleHandleW(None)?,
             None,
         )?;
+        let hover_card = hover_card::HoverCard::new(popup)?;
+        let reset_hover = reset_hover::ResetHover::new(bar)?;
         let event = if testing {
             HANDLE::default()
         } else {
@@ -948,6 +1078,12 @@ impl App {
         };
         let custom_tags = tags::Custom::load(&paths);
         let mut app = Self {
+            numeric_edit: HWND::default(), numeric_target: None, numeric_original: None,
+            recent_sort: 0,
+            repair_service: crate::repair::Service::new(paths.clone(),stop.clone()),
+            clean_modes: HashMap::new(), clean_menu: None,
+            manager_query:String::new(),manager_matcher:RefCell::new(crate::search::LabelSearch::default()),manager_selected:HashSet::new(),manager_batch_io:false,manager_batch_menu:false,manager_delete_ids:Vec::new(),manager_delete_scroll:0,manager_delete_force:false,manager_delete_edit:HWND::default(),
+            repair_filter: 0, repair_return_recent: false, repair_sort: 0, repair_ascending: false, repair_revision: 0, repair_spinner_due:Instant::now(), repair_activity: HashSet::new(),
             paths,
             settings,
             state,
@@ -974,6 +1110,8 @@ impl App {
             shortcut_id: RECENT_HOTKEY,
             shortcut_foreground: HWND::default(),
             shortcut_context: false,
+            local_shortcut_capture: None,
+            startup_service: crate::startup::Service::default(),
             preferences_draft: None,
             preferences_note: String::new(),
             preferences_advanced: false,
@@ -982,6 +1120,8 @@ impl App {
             update_control: None,
             reply_service: None,
             reply_revision: 0,
+            hover_card,
+            reset_hover,
             notice_control: None,
             notice_alert_due:Instant::now(),
             guard_events: Vec::new(),
@@ -1034,6 +1174,7 @@ impl App {
             scroll: 0,
             hidden: false,
             host_hidden: false,
+            standalone: false,
             drag: None,
             hover: None,
             list_pointer: None,
@@ -1162,6 +1303,8 @@ impl App {
         let word = SendMessageW(self.edit, HKM_GETHOTKEY, WPARAM(0), LPARAM(0)).0 as u16;
         next.recent_shortcut = Shortcut::from_control_word(word, next.recent_shortcut.enabled);
         anyhow::ensure!(next.recent_shortcut.valid(), "Use Ctrl or Alt with a letter, number or F1–F24");
+        anyhow::ensure!(next.body_shortcut.valid() && next.compact_shortcut.valid(), "Use Ctrl or Alt with a letter, number or F1–F24");
+        anyhow::ensure!(next.body_shortcut!=next.compact_shortcut && (!next.recent_shortcut.enabled || (next.recent_shortcut!=next.body_shortcut && next.recent_shortcut!=next.compact_shortcut)), "Shortcuts must be different");
         next.refresh.clamp();
         next.recent_rows = next.recent_rows.clamp(4, 20);
         next.recent_title_width=next.recent_title_width.clamp(140,280);
@@ -1241,7 +1384,7 @@ impl App {
         let icon = current
             .map(|s| self.catalog.icon(&s.label))
             .or_else(|| visible.as_ref().map(|s| self.catalog.icon(s)))
-            .unwrap_or("◈".into());
+            .unwrap_or_default();
         let stale = live.recent.stale || now() - live.recent.loaded_at > self.settings.refresh.fallback_secs as f64 + 10.;
         let busy = live
             .recent
@@ -1278,14 +1421,17 @@ impl App {
             if kind.is_none() { 8. } else { 10. },
         );
         let mut area = |hit: Hit, r: D2D_RECT_F| {
-            // Informational regions are registered after their foreground is
-            // painted. They must never paint an opaque hover background.
+            // Hit regions can be registered before or after their foreground.
+            // An opaque fill here may cover text and icons painted earlier.
+            // Use an outline, and paint any desired background in the control
+            // itself before drawing its foreground.
             if !matches!(hit, Hit::Info(_) | Hit::ResetNotice(_)) && self.hover.as_ref() == Some(&hit) {
-                p.fill(r, 0x35434a, 5.);
+                p.border(r, 0x59727e, 5.);
             }
             hits.push(Area { hit, r });
         };
         match kind {
+            Some(Popup::Repair) => return self.draw_repair(width,height),
             None => {
                 let (icon, title, busy, tok, speed) = self.bar_text(&live);
                 let current = self.current(&live);
@@ -1305,7 +1451,7 @@ impl App {
                 }
                 x += 6.;
                 let sw = p.width(&busy, 12.) + 2.;
-                area(Hit::Info(format!("{}: {}{}", crate::locale::text("Busy"), live.recent.busy_count.map(|n|n.to_string()).unwrap_or_else(||"—".into()), if live.recent.stale { if crate::locale::chinese(){" · 数据可能已过期"}else{" · Stale data"} } else {""})), rect(x, 2., sw, 30.));
+                area(Hit::Info(format!("{}: {}{}{}", crate::locale::text("Busy"), live.recent.busy_count.map(|n|n.to_string()).unwrap_or_else(||"—".into()), if live.recent.stale { if crate::locale::chinese(){" · 数据可能已过期"}else{" · Stale data"} } else {""},if !live.recent.stale&&!live.recent.error.is_empty(){if crate::locale::chinese(){" · 部分会话状态暂不可用"}else{" · Some chat statuses are unavailable"}}else{""})), rect(x, 2., sw, 30.));
                 p.label(
                     &busy,
                     rect(x, 2., sw, 30.),
@@ -1428,11 +1574,12 @@ impl App {
                         if !live.quota_error.is_empty() || now()-live.quota_at>180. { if zh { "\n数据可能已过期 · 正在等待更新" } else { "\nStale data · waiting for update" } } else { "" }))
                         .unwrap_or_else(|| if zh { "额度数据暂不可用".into() } else { "Quota data unavailable".into() });
                     area(Hit::Info(tooltip), rect(quota_left, 2., x - quota_left, 30.));
-                    if let Some(reset) = quota.and_then(|q| q.banked_reset).filter(|r| *r > now()) {
-                        let text = crate::telemetry::countdown(reset, now());
+                    if let Some(q) = quota.filter(|q| q.banked_available.unwrap_or(q.banked_expiries.len() as u64)>0) {
+                        let reset=q.banked_reset.filter(|r| *r > now());
+                        let text = reset.map(|r|crate::telemetry::countdown(r, now())).unwrap_or_default();
                         let w = p.width(&text, 11.) + 19.;
-                        let color = if reset-now() <= 86400. { ORANGE } else { MUTED };
-                        p.banked_icon(x,9.,color);
+                        let color = if reset.is_some_and(|r|r-now() <= 86400.) { ORANGE } else { 0xe8c574 };
+                        p.banked_icon(x,17.,color,q.banked_available.unwrap_or(q.banked_expiries.len() as u64));
                         p.label(&text, rect(x+18., 2., w-18., 30.), 11., color, false);
                         area(Hit::Info(quota.map(|q| q.banked_tooltip(now())).unwrap_or_default()), rect(x, 2., w, 30.));
                         x += w + 8.;
@@ -1444,7 +1591,7 @@ impl App {
                     let w=if !text.is_empty(){p.width(&text,11.)+30.}else{24.};
                     if bell!=crate::reset_notice::Bell::Neutral {p.fill(rect(x-3.,5.,w+4.,24.),if bell==crate::reset_notice::Bell::Reset {0x254136}else{0x44321f},5.);}
                     area(Hit::ResetNotice(live.reset_notice.tooltip(now(),crate::locale::chinese())),rect(x-3.,2.,w+4.,30.));
-                    p.notice_bell(x,6.,color);
+                    p.notice_bell_scaled(x+2.,8.,color,0.8);
                     if !text.is_empty(){p.label(&text,rect(x+25.,2.,w-25.,30.),11.,color,false);}
                     x+=w+9.;
                 }
@@ -1455,12 +1602,8 @@ impl App {
                     p.action_icon(&hit,x+1.,6.);
                     x+=29.;
                 }
-                area(Hit::Details, rect(x, 3., 25., 28.));
-                p.line(x + 8., 15., x + 12., 19., MUTED, 1.4);
-                p.line(x + 12., 19., x + 16., 15., MUTED, 1.4);
-                x += 29.;
                 area(Hit::Preferences, rect(x, 3., 25., 28.));
-                p.action_icon(&Hit::Preferences, x + 2., 6.);
+                p.settings_gear(x + 4., 8., 0.8, MUTED);
             }
             Some(Popup::Recent) => return self.draw_recent(width, height),
             Some(Popup::Icons) => {
@@ -1597,15 +1740,9 @@ impl App {
                     if hovered || selected || self.chat_cursor == self.scroll + slot {
                         p.border(r, if hovered {0x78aac4} else if selected { 0x5ca985 } else { 0x59849c }, 7.);
                     }
-                    p.fill(
-                        rect(29., y + 5., 30., 30.),
-                        if self.hover == Some(icon_hit) {
-                            0x496173
-                        } else {
-                            0x333c43
-                        },
-                        7.,
-                    );
+                    if !self.catalog.icon(&row.label).is_empty() || self.hover == Some(icon_hit.clone()) {
+                        p.fill(rect(29., y + 5., 30., 30.),if self.hover == Some(icon_hit) {0x496173}else{0x333c43},7.);
+                    }
                     p.label(
                         &self.catalog.icon(&row.label),
                         rect(32., y + 4., 28., 32.),
@@ -1909,7 +2046,7 @@ impl App {
                             area(Hit::RefreshInterval(field,delta),rect(x,y,30.,30.));p.line(x+10.,y+15.,x+20.,y+15.,MUTED,1.5);
                             if delta>0{p.line(x+15.,y+10.,x+15.,y+20.,MUTED,1.5);}
                         }
-                        p.ui_label(&draft.refresh.value(field),rect(width-116.,y,62.,30.),11.,TEXT,false);
+                        area(Hit::Numeric(NumericTarget::Refresh(field)),rect(width-116.,y+3.,62.,24.));p.ui_label(&draft.refresh.value(field),rect(width-116.,y,62.,30.),11.,TEXT,false);
                     }
                     p.ui_label("Minimums coalesce events; unchanged chats wait for fallback.",rect(20.,338.,width-40.,24.),11.,MUTED,false);
                     p.ui_label("Window following and typing stay responsive.",rect(20.,361.,width-40.,24.),11.,MUTED,false);
@@ -1945,7 +2082,7 @@ impl App {
                     p.line(x + 10., 93., x + 20., 93., MUTED, 1.5);
                     if delta > 0 { p.line(x + 15., 88., x + 15., 98., MUTED, 1.5); }
                 }
-                p.label(&draft.recent_rows.to_string(), rect(width - 108., 78., 50., 30.), 13., TEXT, false);
+                area(Hit::Numeric(NumericTarget::Rows),rect(width-108.,81.,50.,24.));p.label(&draft.recent_rows.to_string(), rect(width - 108., 78., 50., 30.), 13., TEXT, false);
                 p.ui_label("Title column width",rect(20.,113.,260.,26.),12.,MUTED,false);
                 p.fill(rect(width-150.,113.,130.,26.),0x1c2125,6.);
                 for(delta,x)in[(-20,width-146.),(20,width-54.)]{
@@ -1953,7 +2090,7 @@ impl App {
                     p.line(x+10.,126.,x+20.,126.,MUTED,1.5);
                     if delta>0{p.line(x+15.,121.,x+15.,131.,MUTED,1.5);}
                 }
-                p.ui_label(&format!("{} px",draft.recent_title_width),rect(width-111.,113.,57.,26.),11.,TEXT,false);
+                area(Hit::Numeric(NumericTarget::TitleWidth),rect(width-111.,114.,57.,24.));p.ui_label(&format!("{} px",draft.recent_title_width),rect(width-111.,113.,57.,26.),11.,TEXT,false);
                 p.line(20., 145., width - 20., 145., 0x354148, 1.);
                 p.ui_label("Global shortcut", rect(20., 156., width - 95., 28.), 13., TEXT, false);
                 area(Hit::ShortcutEnabled, rect(width - 72., 155., 52., 30.));
@@ -1963,8 +2100,13 @@ impl App {
                 if self.testing {
                     p.label(&draft.recent_shortcut.label(), rect(258., 194., width - 289., 32.), 12., TEXT, false);
                 }
-                p.ui_label("Click the field, then press Ctrl / Alt + a letter, number or F-key", rect(20., 231., width - 40., 24.), 11., MUTED, false);
-                p.ui_label(&self.preferences_note, rect(20., 260., width - 40., 30.), 11.,
+                for (index,label,shortcut,y) in [(0,if crate::locale::chinese(){"搜索会话正文"}else{"Search message body"},&draft.body_shortcut,229.),(1,if crate::locale::chinese(){"紧凑模式"}else{"Compact mode"},&draft.compact_shortcut,261.)] {
+                    p.label(label,rect(20.,y,220.,28.),12.,MUTED,false);
+                    let r=rect(247.,y,width-267.,28.);p.fill(r,if self.hover==Some(Hit::LocalShortcut(index)){0x35434a}else{0x1c2428},5.);p.border(r,if self.local_shortcut_capture==Some(index){GREEN}else{0x475b66},5.);
+                    let value=if self.local_shortcut_capture==Some(index){if crate::locale::chinese(){"按下快捷键…".into()}else{"Press shortcut…".into()}}else{shortcut.label()};
+                    p.label(&value,rect(258.,y,width-289.,28.),12.,TEXT,false);area(Hit::LocalShortcut(index),r);
+                }
+                p.ui_label(&self.preferences_note, rect(20., 330., width - 40., 22.), 10.,
                     if self.preferences_note.starts_with("Saved") { GREEN } else { ORANGE }, false);
                 for (hit, x) in [(Hit::Hide, 16.), (Hit::ResetPreferences, 58.), (Hit::Quit, 100.), (Hit::ApplyPreferences, width - 52.)] {
                     p.fill(rect(x, 300., 36., 32.), if hit == Hit::ApplyPreferences { 0x293f37 } else { 0x293238 }, 5.);
@@ -1974,6 +2116,8 @@ impl App {
                 }
                 let timing=rect(150.,300.,36.,32.);area(Hit::RefreshPreferences,timing);p.fill(timing,0x293238,5.);p.border(timing,0x47535b,5.);
                 p.border(rect(158.,307.,20.,20.),MUTED,10.);p.line(168.,310.,168.,317.,MUTED,1.5);p.line(168.,317.,173.,320.,MUTED,1.5);
+                let startup=self.startup_service.view.lock().unwrap().clone();p.label(if crate::locale::chinese(){"登录时启动"}else{"Start at sign-in"},rect(208.,300.,220.,32.),11.,if startup.busy{MUTED}else{TEXT},false);p.toggle(width-98.,308.,startup.enabled);if !startup.busy{area(Hit::AutoStart,rect(205.,300.,width-258.,32.));}
+                if !startup.error.is_empty(){p.label(&startup.error,rect(20.,330.,width-40.,22.),10.,ORANGE,false);}
                 p.line(16., 352., width - 16., 352., 0x3b484f, 1.);
                 p.ui_label(
                     "Extensions",
@@ -1986,9 +2130,10 @@ impl App {
                 p.fill(guard_row, 0x293238, 6.);
                 area(Hit::Guard, rect(16., 391., width - 226., 31.));
                 area(Hit::Guard, rect(width - 73., 391., 57., 31.));
+                for (x1,y1,x2,y2) in [(35.,399.,41.,401.),(41.,401.,41.,405.),(41.,405.,39.,409.),(39.,409.,35.,412.),(35.,412.,31.,409.),(31.,409.,29.,405.),(29.,405.,29.,401.),(29.,401.,35.,399.),(32.,405.,34.,407.),(34.,407.,38.,403.)] {p.line(x1,y1,x2,y2,NEW_RESULT,1.4);}
                 p.ui_label(
                     "Codex Git memory protection",
-                    rect(27., 391., width - 250., 31.),
+                    rect(51., 391., width - 274., 31.),
                     12.,
                     TEXT,
                     false,
@@ -2019,7 +2164,8 @@ impl App {
                 );
                 p.line(16.,456.,width-16.,456.,0x3b484f,1.);
                 p.fill(rect(16.,463.,width-32.,31.),0x293238,6.);
-                p.ui_label("Reset announcements",rect(27.,463.,157.,31.),12.,TEXT,false);
+                for (x1,y1,x2,y2) in [(35.,470.,35.,472.),(35.,472.,32.,473.),(32.,473.,30.,476.),(30.,476.,30.,480.),(30.,480.,28.,482.),(28.,482.,42.,482.),(42.,482.,40.,480.),(40.,480.,40.,476.),(40.,476.,38.,473.),(38.,473.,35.,472.),(33.,484.,37.,484.)] {p.line(x1,y1,x2,y2,ORANGE,1.4);}
+                p.ui_label("Reset announcements",rect(51.,463.,133.,31.),12.,TEXT,false);
                 if self.testing {
                     p.fill(rect(190.,465.,288.,27.),0x1c2125,4.);p.border(rect(190.,465.,288.,27.),0x47535b,4.);
                     p.label(self.settings.reset_notice.source.label(),rect(200.,465.,254.,27.),11.,TEXT,false);
@@ -2029,23 +2175,25 @@ impl App {
                 p.toggle(width-60.,471.,self.settings.reset_notice.enabled);
                 let api=self.settings.reset_notice.source.api();
                 p.label(api,rect(20.,500.,width-180.,27.),10.,MUTED,false);
-                area(Hit::Info(format!("{}\n{}\n{}",self.settings.reset_notice.source.label(),api,live.reset_notice.tooltip(now(),crate::locale::chinese()))),rect(20.,498.,width-185.,29.));
+                area(Hit::Info(format!("{}\n{}",self.settings.reset_notice.source.label(),api)),rect(20.,498.,width-185.,29.));
                 p.fill(rect(width-151.,500.,131.,27.),0x1c2125,5.);
                 for(delta,left)in[(-1,width-148.),(1,width-49.)] {
                     area(Hit::ResetNoticeInterval(delta),rect(left,500.,27.,27.));
                     p.line(left+9.,513.,left+18.,513.,MUTED,1.3);
                     if delta>0 {p.line(left+13.5,508.5,left+13.5,517.5,MUTED,1.3);}
                 }
-                p.label(&format!("{} min",self.settings.reset_notice.check_minutes),rect(width-117.,500.,67.,27.),11.,TEXT,false);
+                area(Hit::Numeric(NumericTarget::ResetInterval),rect(width-117.,502.,67.,23.));p.label(&format!("{} min",self.settings.reset_notice.check_minutes),rect(width-117.,500.,67.,27.),11.,TEXT,false);
                 let check=if self.settings.reset_notice.enabled {live.reset_notice.check_status(crate::locale::chinese())}
                     else {crate::locale::text("Reset announcement checks are disabled").into_owned()};
                 p.label(&check,rect(20.,534.,width-40.,23.),10.,if live.reset_notice.error.is_empty(){MUTED}else{ORANGE},false);
-                area(Hit::Info(format!("{}\n{}",live.reset_notice.tooltip(now(),crate::locale::chinese()),self.paths.runtime.join("reset-notice-checks.jsonl").display())),rect(18.,532.,width-36.,27.));
+                area(Hit::Info(format!("{}\n{}: {}",check,if crate::locale::chinese(){"扫描日志"}else{"Scan log"},self.paths.runtime.join("reset-notice-checks.jsonl").display())),rect(18.,532.,width-36.,27.));
                 p.line(16.,566.,width-16.,566.,0x3b484f,1.);
                 p.fill(rect(16.,575.,width-32.,31.),0x293238,6.);
                 area(Hit::CapacityRetryEnabled,rect(16.,575.,width-226.,31.));
                 area(Hit::CapacityRetryEnabled,rect(width-73.,575.,57.,31.));
-                p.ui_label("Capacity auto-retry",rect(27.,575.,width-250.,31.),12.,TEXT,false);
+                for start in [-165_f32,15.] {for i in 0..20 {let a=(start+i as f32*7.5).to_radians();let b=(start+(i+1) as f32*7.5).to_radians();p.line(35.+6.*a.cos(),590.+6.*a.sin(),35.+6.*b.cos(),590.+6.*b.sin(),GREEN,1.4);}}
+                for (x1,y1,x2,y2) in [(41.,585.,41.,589.),(41.,589.,37.,589.),(29.,595.,29.,591.),(29.,591.,33.,591.)] {p.line(x1,y1,x2,y2,GREEN,1.4);}
+                p.ui_label("Capacity auto-retry",rect(51.,575.,width-274.,31.),12.,TEXT,false);
                 let badge=rect(width-162.,579.,40.,23.);
                 p.fill(badge,if live.capacity_retry.in_flight{0x62411d}else{0x314759},10.);
                 area(Hit::CapacityRetryLogs,badge);
@@ -2062,12 +2210,18 @@ impl App {
                     p.line(left+9.,625.,left+18.,625.,MUTED,1.3);
                     if delta>0 {p.line(left+13.5,620.5,left+13.5,629.5,MUTED,1.3);}
                 }
-                p.label(&format!("{} s",self.settings.capacity_retry.delay_secs),rect(width-117.,612.,67.,27.),11.,TEXT,false);
+                area(Hit::Numeric(NumericTarget::RetryInterval),rect(width-117.,614.,67.,23.));p.label(&format!("{} s",self.settings.capacity_retry.delay_secs),rect(width-117.,612.,67.,27.),11.,TEXT,false);
                 p.label(&live.capacity_retry.text(self.settings.capacity_retry.enabled,crate::locale::chinese()),rect(20.,646.,width-40.,23.),10.,if live.capacity_retry.last_error.is_empty(){MUTED}else{ORANGE},false);
-                let help=if crate::locale::chinese(){format!("仅限最新回合的模型容量不足错误。等待 {} 秒后追加“继续上次任务”，不指定新的模型、推理强度或 Fast。\n已恢复、已停止和非活跃历史错误会跳过；相同失败回合只发送一次。\n日志：{}\n{}",self.settings.capacity_retry.delay_secs,self.paths.runtime.join("capacity-retry-events.jsonl").display(),live.capacity_retry.last_error)}
-                    else{format!("Append a continuation after {}s only for the latest capacity failure. Keep the chat's model, effort and Fast settings.\nSkip recovered, stopped and inactive historical turns; send once per failed turn.\nLog: {}\n{}",self.settings.capacity_retry.delay_secs,self.paths.runtime.join("capacity-retry-events.jsonl").display(),live.capacity_retry.last_error)};
+                let help=if crate::locale::chinese(){format!("容量不足 · {} 秒后继续\n同一失败回合只重试一次\n{}",self.settings.capacity_retry.delay_secs,live.capacity_retry.last_error)}
+                    else{format!("Capacity error · continue after {}s\nOnce per failed turn\n{}",self.settings.capacity_retry.delay_secs,live.capacity_retry.last_error)};
                 let help=if live.capacity_retry.probe_error.is_empty(){help}else{format!("{help}\n{}",live.capacity_retry.probe_error)};
                 area(Hit::Info(help),rect(18.,644.,width-36.,27.));
+                p.fill(rect(16.,681.,width-32.,30.),0x293238,6.);
+                area(Hit::RepairPanel,rect(16.,681.,width-32.,30.));
+                for (x1,y1,x2,y2) in [(29.,700.,38.,691.),(29.,700.,31.,702.),(31.,702.,40.,693.),(38.,691.,38.,688.),(38.,688.,41.,688.),(41.,688.,43.,690.),(43.,690.,43.,693.),(43.,693.,40.,693.)] {p.line(x1,y1,x2,y2,0xc4a8f0,1.4);}
+                p.label(if crate::locale::chinese(){"会话管理 · 筛选、清理和修复"}else{"Session Manager · filter, clean and repair"},rect(51.,681.,width-114.,30.),12.,TEXT,false);
+                p.line(width-43.,691.,width-38.,696.,MUTED,1.6);
+                p.line(width-38.,696.,width-43.,701.,MUTED,1.6);
             }
         }
         if kind==Some(Popup::Fixed){self.draw_chat_menu(&mut hits);}
@@ -2112,6 +2266,7 @@ impl App {
     unsafe fn sync_tips(&mut self, owner: HWND, hits: &[Area], scale: f32) {
         let entries: Vec<_> = hits
             .iter()
+            .filter(|a| !matches!(a.hit,Hit::Breakdown(_) | Hit::ResetNotice(_) | Hit::Recent(_) | Hit::Fixed(_) | Hit::ManagerRow(_) | Hit::CleanMenu(_) | Hit::CleanMode(_,_)))
             .map(|a| {
                 (
                     RECT {
@@ -2122,25 +2277,22 @@ impl App {
                     },
                     wide_ui(&if a.hit == Hit::Title {
                         format!("Recent chats · {}", self.settings.recent_shortcut.label())
-                    } else if let Hit::Recent(id) | Hit::Fixed(id) = &a.hit {
-                        let row = self.rows.iter().find(|r| &r.id == id);
-                        let mut tip = tip_text(&a.hit, &self.catalog);
-                        if let Some(row) = row {
-                            tip.push_str(&format!("\n{}", crate::locale::text(&row.state)));
-                            if !row.execution.model.is_empty() { tip.push_str(&format!("\n{}", row.execution.tooltip())); }
-                            let reply=self.reply_service.as_ref().and_then(|service|service.peek(id));
-                            tip.push_str("\n\n");
-                            tip.push_str(&reply.map(|reply|reply.text(crate::locale::chinese())).unwrap_or_else(||if crate::locale::chinese(){"正在读取最新回复…"}else{"Loading latest reply…"}.into()));
-                        }
-                        tip
+                    } else if a.hit==Hit::RepairFilter(4) {
+                        if crate::locale::chinese(){"孤立：未归档、未归属任何项目且没有任何标签的会话".into()}else{"Orphan: unarchived chats with no project or tags".into()}
+                    } else if a.hit==Hit::Body {
+                        format!("{} · {}",crate::locale::text("Search message text · off by default"),self.settings.body_shortcut.label())
+                    } else if a.hit==Hit::Compact {
+                        format!("{} · {}",crate::locale::text("Compact view · one line per chat, hide tags and prompt preview"),self.settings.compact_shortcut.label())
+                    } else if a.hit==Hit::RecentSort {
+                        let labels=if crate::locale::chinese(){["最近使用","磁盘占用","总时长"]}else{["Recent use","Disk space","Total duration"]};
+                        format!("{}: {}\n{}",if crate::locale::chinese(){"当前排序"}else{"Current order"},labels[self.recent_sort],crate::locale::text("Sort: recent use, disk space, total duration · click to change"))
                     } else if a.hit == Hit::GuardLogs {
                         let guard = self.snapshot().guard;
-                        format!("{} recorded storm episodes · view log · continuous storms count once; recovered after 60 stable seconds",
-                            guard.storm_count.map(|v|v.to_string()).unwrap_or_else(|| "—".into()))
+                        if crate::locale::chinese(){format!("风暴 {} 次 · 点击查看日志",guard.storm_count.map(|v|v.to_string()).unwrap_or_else(|| "—".into()))}else{format!("{} storms · view log",guard.storm_count.map(|v|v.to_string()).unwrap_or_else(|| "—".into()))}
                     } else if a.hit==Hit::CapacityRetryLogs {
                         let view=self.snapshot().capacity_retry;
-                        if crate::locale::chinese(){format!("累计触发 {} 次 · 已提交 {} · 未确认 {}\n点击查看日志 · 同一失败回合只计一次，取消等待不计数 · 重启后保留",view.attempts,view.submitted,view.unconfirmed)}
-                        else{format!("{} retry attempts · {} submitted · {} unconfirmed\nView log · once per failed turn, cancelled waits excluded · retained after restart",view.attempts,view.submitted,view.unconfirmed)}
+                        if crate::locale::chinese(){format!("重试 {} · 已提交 {} · 未确认 {}\n点击查看日志",view.attempts,view.submitted,view.unconfirmed)}
+                        else{format!("Retries {} · Submitted {} · Unconfirmed {}\nView log",view.attempts,view.submitted,view.unconfirmed)}
                     } else if let Hit::TagFilter(key)=&a.hit {
                         self.tag_catalog.iter().find(|(tag,_)|&tag.key==key).map(|(tag,count)|format!("{} · {} chats · {} · click to toggle filter",tag.label,count,if tag.kind==tags::Kind::Custom{"custom tag"}else{"synced, read-only"})).unwrap_or_else(||tip_text(&a.hit,&self.catalog))
                     } else { tip_text(&a.hit, &self.catalog) }),
@@ -2257,7 +2409,7 @@ impl App {
             + 10.
             + p.width(&speed, 11.)
             + 10.
-            + 58.;
+            + 29.;
         if live.quota.is_empty() {
             width += p.width("Limit", 11.) + 5. + 42. + p.width("—", 11.) + 9.;
         } else {
@@ -2272,8 +2424,9 @@ impl App {
                     }
                 );
                 width += p.width(&q.label, 11.) + 5. + 42. + p.width(&percent, 11.) + 9.;
-                if let Some(reset) = q.banked_reset.filter(|r| *r > now()) {
-                    width += p.width(&crate::telemetry::countdown(reset, now()), 11.) + 27.;
+                if q.banked_available.unwrap_or(q.banked_expiries.len() as u64)>0 {
+                    let text=q.banked_reset.filter(|r| *r > now()).map(|r|crate::telemetry::countdown(r,now())).unwrap_or_default();
+                    width += p.width(&text, 11.) + 27.;
                 }
             }
         }
@@ -2296,8 +2449,8 @@ impl App {
     }
     unsafe fn refresh_reply_preview(&mut self, live:&crate::Shared) {
         if self.testing {return;}
-        let id=if matches!(self.popup_kind,Some(Popup::Recent|Popup::Fixed)) {
-            match &self.hover {Some(Hit::Recent(id)|Hit::Fixed(id))=>Some(id.clone()),_=>None}
+        let id=if matches!(self.popup_kind,Some(Popup::Recent|Popup::Fixed|Popup::Repair)) {
+            match &self.hover {Some(Hit::Recent(id)|Hit::Fixed(id)|Hit::ManagerRow(id))=>Some(id.clone()),_=>self.hover_card.active_id()}
         }else{None};
         let Some(id)=id else {if let Some(service)=self.reply_service.as_mut(){service.inactive();}return;};
         let service=self.reply_service.get_or_insert_with(||crate::replies::Service::new(self.paths.clone()));
@@ -2305,11 +2458,147 @@ impl App {
         let revision=service.revision();
         if revision!=self.reply_revision {
             self.reply_revision=revision;
-            let scale=GetDpiForWindow(self.popup).max(96) as f32/96.;
-            self.sync_tips(self.popup,&self.popup_hits.clone(),scale);
+            if self.hover_card.visible {let _=InvalidateRect(self.hover_card.window,None,false);}
         }
     }
+    fn numeric_spec(&self,target:NumericTarget)->(u64,u64,u64){
+        let draft=self.preferences_draft.as_ref().unwrap_or(&self.settings);
+        match target {
+            NumericTarget::Rows=>(draft.recent_rows as u64,4,20),NumericTarget::TitleWidth=>(draft.recent_title_width as u64,140,280),
+            NumericTarget::Guard(0)=>(self.guard_limits.max_processes,8,4096),NumericTarget::Guard(1)=>(self.guard_limits.max_private_mib,256,65536),NumericTarget::Guard(_)=>(self.guard_limits.interval_seconds,1,60),
+            NumericTarget::Refresh(i)=>{let r=&draft.refresh;match i{0=>(r.current_secs,1,10),1=>(r.list_secs,2,60),2=>(r.fallback_secs,15,300),3=>(r.cache_secs,15,600),4=>(r.diagnostic_secs,5,120),_=>(r.host_ms,250,2000)}},
+            NumericTarget::ResetInterval=>(self.settings.reset_notice.check_minutes,1,60),NumericTarget::RetryInterval=>(self.settings.capacity_retry.delay_secs,1,300),NumericTarget::ReduceThreshold=>(self.settings.reduce_threshold_mib,10,102400),
+        }
+    }
+    fn apply_numeric(&mut self,target:NumericTarget,text:&str)->Result<()> {
+        let (_,low,high)=self.numeric_spec(target);let value=parse_numeric(text,low,high)?;
+        match target {
+            NumericTarget::Rows=>self.preferences_draft.as_mut().context("Settings are not open")?.recent_rows=value as usize,
+            NumericTarget::TitleWidth=>self.preferences_draft.as_mut().context("Settings are not open")?.recent_title_width=value as u32,
+            NumericTarget::Guard(0)=>self.guard_limits.max_processes=value,NumericTarget::Guard(1)=>self.guard_limits.max_private_mib=value,NumericTarget::Guard(_)=>self.guard_limits.interval_seconds=value,
+            NumericTarget::Refresh(i)=>{let r=&mut self.preferences_draft.as_mut().context("Settings are not open")?.refresh;match i{0=>r.current_secs=value,1=>r.list_secs=value,2=>r.fallback_secs=value,3=>r.cache_secs=value,4=>r.diagnostic_secs=value,_=>r.host_ms=value}},
+            NumericTarget::ResetInterval=>{let mut config=self.settings.reset_notice.clone();config.check_minutes=value;self.set_reset_notice(config)?;return Ok(())},
+            NumericTarget::RetryInterval=>{let mut config=self.settings.capacity_retry.clone();config.delay_secs=value;self.set_capacity_retry(config)?;return Ok(())},
+            NumericTarget::ReduceThreshold=>{let mut next=self.settings.clone();next.reduce_threshold_mib=value;self.write_settings(&next)?;self.settings=next;if let Some(draft)=self.preferences_draft.as_mut(){draft.reduce_threshold_mib=value;}return Ok(())},
+        }
+        self.preferences_note="Apply to save changes".into();Ok(())
+    }
+    unsafe fn begin_numeric(&mut self,target:NumericTarget)->Result<()> {
+        self.finish_numeric(true);
+        let r=self.popup_hits.iter().find(|a|a.hit==Hit::Numeric(target)).context("Numeric field is unavailable")?.r;
+        let scale=self.dpi;let hwnd=CreateWindowExW(WINDOW_EX_STYLE(0),w!("EDIT"),w!(""),WS_CHILD|WS_VISIBLE|WS_TABSTOP|WINDOW_STYLE(ES_NUMBER as u32|ES_AUTOHSCROLL as u32|ES_CENTER as u32),
+            (r.left*scale).round() as i32,(r.top*scale).round() as i32,((r.right-r.left)*scale).round() as i32,((r.bottom-r.top)*scale).round() as i32,self.popup,HMENU(109isize as *mut _),GetModuleHandleW(None)?,None)?;
+        self.numeric_edit=hwnd;self.numeric_target=Some(target);self.numeric_original=Some(self.numeric_spec(target).0);
+        let _=SendMessageW(hwnd,WM_SETFONT,WPARAM(self.edit_font.0 as usize),LPARAM(1));let _=SetWindowTheme(hwnd,w!("DarkMode_CFD"),PCWSTR::null());
+        let _=SetWindowTextW(hwnd,PCWSTR(wide(&self.numeric_spec(target).0.to_string()).as_ptr()));let _=SendMessageW(hwnd,EM_SETSEL,WPARAM(0),LPARAM(-1));let _=SetFocus(hwnd);Ok(())
+    }
+    unsafe fn finish_numeric(&mut self,accept:bool){
+        let hwnd=self.numeric_edit;let target=self.numeric_target.take();let original=self.numeric_original.take();self.numeric_edit=HWND::default();if hwnd.is_invalid(){return}
+        let mut text=[0u16;32];let n=GetWindowTextW(hwnd,&mut text);let value=String::from_utf16_lossy(&text[..n as usize]);let _=DestroyWindow(hwnd);
+        if let Some(target)=target {
+            let result=if accept{self.apply_numeric(target,&value)}else{Ok(())};
+            if target==NumericTarget::ReduceThreshold && (!accept||result.is_err()){if let Some(value)=original{self.settings.reduce_threshold_mib=value;if let Some(draft)=self.preferences_draft.as_mut(){draft.reduce_threshold_mib=value;}}}
+            if let Err(error)=result{let (_,low,high)=self.numeric_spec(target);let message=if error.to_string().contains("Invalid number")||error.to_string().contains("Value must be") {if crate::locale::chinese(){format!("请输入 {low}–{high} 之间的整数")}else{format!("Enter an integer from {low} to {high}")}}else{format!("{error:#}")};if self.popup_kind==Some(Popup::Repair){self.repair_service.view.lock().unwrap().note=message;}else{self.preferences_note=message;}}
+        }
+        let _=InvalidateRect(self.popup,None,false);
+    }
+    unsafe fn preview_numeric(&mut self){
+        if self.numeric_target!=Some(NumericTarget::ReduceThreshold)||self.numeric_edit.is_invalid(){return}
+        let mut text=[0u16;32];let n=GetWindowTextW(self.numeric_edit,&mut text);let value=String::from_utf16_lossy(&text[..n as usize]);
+        if let Ok(value)=parse_numeric(&value,10,102400){self.settings.reduce_threshold_mib=value;if let Some(draft)=self.preferences_draft.as_mut(){draft.reduce_threshold_mib=value;}self.repair_service.view.lock().unwrap().note.clear();let _=InvalidateRect(self.popup,None,false);}
+    }
+    fn repair_rows(&self)->Vec<crate::repair::Entry>{
+        let rows=self.repair_service.view.lock().unwrap().rows.clone();
+        self.prepare_repair_rows(rows)
+    }
+    fn prepare_repair_rows(&self,mut rows:Vec<crate::repair::Entry>)->Vec<crate::repair::Entry>{
+        let completed:HashSet<String>=self.state.lock().unwrap().recent.rows.iter().filter(|r|matches!(r.state.as_str(),"Done"|"Stopped")).map(|r|r.id.clone()).collect();
+        for row in &mut rows {
+            if self.repair_activity.contains(&row.id){row.note="running".into();row.repairable=false;}
+            else if row.note=="running"&&completed.contains(&row.id){row.note=if row.compressed{"compressed"}else{"local"}.into();}
+        }
+        if !self.manager_query.trim().is_empty(){let mut matcher=self.manager_matcher.borrow_mut();matcher.sync(rows.iter().map(|r|(r.id.as_str(),self.catalog.strip(&r.title))));rows.retain(|r|matcher.matches(&r.id,&self.manager_query));}
+        rows.retain(|r|match self.repair_filter{1=>!r.archived&&!r.issue,2=>r.archived,3=>r.issue,4=>crate::manager::orphan(r,&self.custom_tags),_=>true});
+        rows.sort_by(|a,b|{
+            let order=match self.repair_sort{1=>a.bytes.cmp(&b.bytes),2=>a.seconds.total_cmp(&b.seconds),_=>a.updated.total_cmp(&b.updated)};
+            (if self.repair_ascending{order}else{order.reverse()}).then_with(||a.id.cmp(&b.id))
+        });
+        rows
+    }
+    unsafe fn draw_repair(&self,width:f32,height:f32)->Vec<Area>{
+        let p=&self.painter;let zh=crate::locale::chinese();let mut hits=Vec::new();let view=self.repair_service.view.lock().unwrap().clone();let locked=view.busy||view.batch_running;
+        p.label(if zh{"会话管理"}else{"Session Manager"},rect(18.,9.,350.,29.),14.,TEXT,false);
+        p.fill(rect(width-82.,10.,64.,28.),0x293238,5.);p.label(if zh{"返回"}else{"Back"},rect(width-70.,10.,52.,28.),11.,TEXT,false);hits.push(Area{hit:Hit::BackPreferences,r:rect(width-82.,10.,64.,28.)});
+        p.fill(rect(18.,47.,290.,31.),0x1c2428,5.);p.border(rect(18.,47.,290.,31.),0x475b66,5.);p.search_icon(31.,60.,MUTED);
+        if !self.manager_query.is_empty(){let r=rect(284.,49.,22.,27.);p.line(291.,57.,299.,65.,MUTED,1.2);p.line(299.,57.,291.,65.,MUTED,1.2);hits.push(Area{hit:Hit::ManagerClearSearch,r});}
+        let scan=rect(318.,48.,72.,30.);p.fill(scan,0x29383e,5.);p.repair_toolbar_icon(&Hit::RepairScan,325.,56.,MUTED);p.label(if zh{"扫描"}else{"Scan"},rect(345.,48.,43.,30.),11.,TEXT,false);if !locked{hits.push(Area{hit:Hit::RepairScan,r:scan});}
+        let labels=if zh{["全部","正常","已归档","问题","孤立"]}else{["All","Normal","Archived","Issues","Orphan"]};
+        for (i,label) in labels.iter().enumerate(){let x=398.+i as f32*83.;let r=rect(x,48.,77.,30.);p.fill(r,if self.repair_filter==i{0x304b48}else{0x29383e},5.);let color=if self.repair_filter==i{GREEN}else{MUTED};p.repair_toolbar_icon(&Hit::RepairFilter(i),x+7.,56.,color);p.label(label,rect(x+25.,48.,51.,30.),10.,TEXT,false);hits.push(Area{hit:Hit::RepairFilter(i),r});}
+        let all_compress=rect(824.,48.,130.,30.);p.fill(all_compress,if locked{0x293238}else{0x304b48},5.);p.compression_icon(832.,55.,if locked{MUTED}else{GREEN});p.label(if zh{"按阈值批量压缩"}else{"Compress all"},rect(853.,48.,100.,30.),10.,if locked{MUTED}else{TEXT},false);if !locked{hits.push(Area{hit:Hit::ReduceAll,r:all_compress});}
+        let rows=self.prepare_repair_rows(view.rows.clone());let total=rows.len();let top=self.scroll.min(total.saturating_sub(MANAGER_PAGE));
+        p.label(&format!("{} {}",if zh{"已选择"}else{"Selected"},self.manager_selected.len()),rect(18.,86.,165.,31.),11.,GREEN,false);
+        let batch_labels=if zh{["分析选中","清理选中","压缩选中","解压选中","修复选中","归档选中","删除选中"]}else{["Analyze","Clean","Compress","Decompress","Repair","Archive","Delete"]};
+        for (i,label) in batch_labels.iter().enumerate(){let x=190.+i as f32*112.;let w=106.;let r=rect(x,86.,w,31.);let enabled=!locked&&!self.manager_selected.is_empty();let color=if !enabled{0x293238}else if i==6{0x803a3d}else if i==1{0x304f46}else{0x30434b};p.fill(r,color,5.);
+            let ink=if enabled{if i==6{0xffd0c9}else{TEXT}}else{MUTED};match i{0=>p.search_icon(x+13.,101.,ink),1=>{p.line(x+8.,101.,x+11.,104.,ink,1.2);p.line(x+11.,104.,x+17.,97.,ink,1.2);},2=>p.compression_icon(x+6.,93.,ink),3=>p.decompression_icon(x+6.,93.,ink),4=>{p.repair_toolbar_icon(&Hit::RepairAll,x+6.,94.,ink);},5=>{p.repair_toolbar_icon(&Hit::RepairFilter(2),x+7.,95.,ink);},_=>{p.border(rect(x+8.,96.,10.,12.),ink,1.);p.line(x+7.,94.,x+19.,94.,ink,1.);}}
+            let shown=if i==1&&self.manager_batch_io{if zh{"清理+I/O"}else{"Clean + I/O"}}else{label};p.label(shown,rect(x+27.,86.,if i==1{57.}else{78.},31.),10.,ink,false);
+            if enabled{let main=if i==1{rect(x,86.,85.,31.)}else{r};hits.push(Area{hit:Hit::ManagerBatch(i),r:main});if i==1{p.line(x+85.,92.,x+85.,110.,0x71978b,1.);p.line(x+90.,99.,x+94.,103.,ink,1.);p.line(x+94.,103.,x+98.,99.,ink,1.);hits.push(Area{hit:Hit::ManagerCleanMenu,r:rect(x+85.,86.,21.,31.)});}}
+        }
+        let threshold=rect(width-182.,87.,116.,29.);p.fill(threshold,0x1c2428,5.);p.label(&format!(">{} MiB",self.settings.reduce_threshold_mib),rect(width-156.,87.,63.,29.),10.,MUTED,false);
+        for (delta,x) in [(-10,width-180.),(10,width-91.)]{p.line(x+7.,101.,x+17.,101.,MUTED,1.2);if delta>0{p.line(x+12.,96.,x+12.,106.,MUTED,1.2);}if !locked{hits.push(Area{hit:Hit::ReduceThreshold(delta),r:rect(x,87.,24.,29.)});}}
+        if !locked{hits.push(Area{hit:Hit::Numeric(NumericTarget::ReduceThreshold),r:rect(width-156.,89.,63.,25.)});}
+        p.fill(rect(14.,126.,width-28.,30.),0x304149,4.);let all=!rows.is_empty()&&rows.iter().all(|r|self.manager_selected.contains(&r.id));self.manager_checkbox(p,22.,133.,all);if !locked{hits.push(Area{hit:Hit::ManagerSelectAll,r:rect(19.,128.,23.,27.)});}
+        p.label(if zh{"会话 / 状态"}else{"Chat / status"},rect(48.,126.,390.,30.),11.,TEXT,false);
+        for (i,label,x,w) in [(0,if zh{"最近使用"}else{"Last used"},460.,105.),(1,if zh{"磁盘占用"}else{"Disk size"},570.,100.),(2,if zh{"时长"}else{"Duration"},680.,80.)] {let active=self.repair_sort==i;let r=rect(x,126.,w,30.);if active{p.fill(rect(x,129.,w-4.,24.),0x31584e,4.);}let color=if active{GREEN}else{TEXT};if i==1{p.border(rect(x+5.,135.,10.,11.),color,1.);}else{p.border(rect(x+5.,135.,11.,11.),color,6.);p.line(x+10.,137.,x+10.,141.,color,1.);p.line(x+10.,141.,x+13.,143.,color,1.);}let text=if active{format!("{label} {}",if self.repair_ascending{"↑"}else{"↓"})}else{label.into()};p.label(&text,rect(x+20.,126.,w-20.,30.),10.,color,false);hits.push(Area{hit:Hit::RepairSort(i),r});}
+        for (x,h) in [(773.,5.),(777.,8.),(781.,11.)]{p.fill(rect(x,146.-h,2.,h),TEXT,0.);}p.label(if zh{"记录构成"}else{"Record breakdown"},rect(788.,126.,125.,30.),10.,TEXT,false);
+        let live=self.snapshot();
+        for (slot,row) in rows.iter().skip(top).take(MANAGER_PAGE).enumerate(){let y=MANAGER_TOP+slot as f32*MANAGER_ROW;let selected=self.manager_selected.contains(&row.id);let active=row.note=="running"||self.repair_activity.contains(&row.id);let r=rect(14.,y,width-28.,39.);p.fill(r,if selected{0x293f39}else if row.issue{0x382f23}else{0x252f33},5.);if selected{p.border(r,0x457460,5.);}
+            self.manager_checkbox(p,22.,y+12.,selected);if !locked{hits.push(Area{hit:Hit::ManagerSelect(row.id.clone()),r:rect(19.,y+5.,24.,30.)});}
+            let icon=self.catalog.icon(&row.title);if !icon.is_empty(){p.label(&icon,rect(48.,y+3.,24.,32.),16.,TEXT,true);}let title=self.catalog.strip(&row.title);let ranges=if self.manager_query.trim().is_empty(){Vec::new()}else{self.manager_matcher.borrow().highlight(&row.id,title,&self.manager_query)};p.highlighted_title_sized(title,rect(76.,y+3.,if row.compressed{156.}else{232.},32.),&ranges,false,11.);
+            if row.compressed {let badge=rect(235.,y+9.,75.,22.);p.fill(badge,0x304e49,5.);p.label(if zh{"已压缩"}else{"Compressed"},rect(241.,y+9.,65.,22.),9.,GREEN,false);hits.push(Area{hit:Hit::Info(if zh{"会话文件已压缩"}else{"Session file is compressed"}.into()),r:badge});}
+            let ar=rect(315.,y+9.,56.,22.);p.fill(ar,0x33464d,5.);p.border(rect(321.,y+15.,8.,7.),MUTED,1.);p.label(if row.archived{if zh{"归档"}else{"Archived"}}else if zh{"未归档"}else{"Local"},rect(332.,y+9.,39.,22.),9.,MUTED,false);
+            let state=live.recent.rows.iter().find(|r|r.id==row.id).map(|r|r.state.as_str()).unwrap_or("");let is_done=state=="Done"||matches!(row.last_status.as_str(),"completed"|"failed"|"interrupted"|"cancelled"|"canceled");let status=if active{if zh{"活动"}else{"Busy"}}else if is_done{if zh{"完成"}else{"Done"}}else if zh{"未知"}else{"Unknown"};p.circle(381.,y+20.,2.8,if active{ORANGE}else if is_done{GREEN}else{MUTED});p.label(status,rect(387.,y+5.,66.,30.),10.,if active{ORANGE}else if is_done{GREEN}else{MUTED},false);
+            let used=chrono::DateTime::from_timestamp(row.updated as i64,0).filter(|_|row.updated>0.).map(|t|t.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string()).unwrap_or_else(||"—".into());p.label(&used,rect(460.,y+4.,105.,31.),10.,MUTED,false);p.label(&format!("{:.2} MiB",row.bytes as f64/1048576.),rect(570.,y+4.,100.,31.),10.,TEXT,false);p.label(&format!("{:.1} h",row.seconds/3600.),rect(680.,y+4.,80.,31.),10.,MUTED,false);
+            if let Some(a)=&row.analysis{let values=a.record_breakdown();let sum:u64=values.iter().sum();p.fill(rect(772.,y+15.,85.,10.),0x344149,4.);if sum>0{let mut x=772.;for(size,color)in values.iter().zip([0xe5a35d,0x5da9d7,0x5277aa,0xa88cd3,0x55bd98,0x72818a,0xca7483]){let w=85.*(*size as f32)/(sum as f32);if w>0.{p.fill(rect(x,y+15.,w,10.),color,0.);x+=w;}}}hits.push(Area{hit:Hit::Breakdown(row.id.clone()),r:rect(770.,y+3.,90.,33.)});}else{p.label("—",rect(772.,y+4.,80.,31.),10.,MUTED,false);}
+            let ax=width-280.;let ar=rect(ax,y+5.,76.,29.);p.fill(ar,0x30444e,5.);if view.analyzing&&view.current_id==row.id{p.busy_spinner(ax+7.,y+12.);p.label(if zh{"分析中"}else{"Working"},rect(ax+25.,y+5.,49.,29.),10.,TEXT,false);}else{p.search_icon(ax+12.,y+19.,NEW_RESULT);p.label(if zh{"分析"}else{"Analyze"},rect(ax+23.,y+5.,51.,29.),10.,TEXT,false);if !locked&&row.bytes>0{hits.push(Area{hit:Hit::AnalyzeOne(row.id.clone()),r:ar});}}
+            if view.cleaning&&view.current_id==row.id{let x=width-198.;p.fill(rect(x,y+5.,76.,29.),0x30444e,5.);p.busy_spinner(x+7.,y+12.);p.label(if zh{"清理中"}else{"Cleaning"},rect(x+25.,y+5.,50.,29.),10.,TEXT,false);}
+            else if row.analysis.is_some(){let x=width-198.;let r=rect(x,y+5.,76.,29.);let enabled=!locked&&!active&&!row.compressed&&!row.repairable;p.fill(r,if enabled{0x304f46}else{0x293238},5.);let c=if enabled{TEXT}else{MUTED};p.line(x+6.,y+19.,x+9.,y+22.,c,1.3);p.line(x+9.,y+22.,x+14.,y+17.,c,1.3);p.label(if *self.clean_modes.get(&row.id).unwrap_or(&false){"I/O+"}else if zh{"清理"}else{"Clean"},rect(x+17.,y+5.,37.,29.),10.,c,false);p.line(x+55.,y+10.,x+55.,y+29.,MUTED,1.);p.line(x+60.,y+17.,x+64.,y+21.,c,1.);p.line(x+64.,y+21.,x+68.,y+17.,c,1.);if enabled{hits.push(Area{hit:Hit::CleanOne(row.id.clone()),r:rect(x,y+5.,55.,29.)});hits.push(Area{hit:Hit::CleanMenu(row.id.clone()),r:rect(x+55.,y+5.,21.,29.)});}else if !locked{let reason=if row.compressed{if zh{"暂不支持清理压缩会话"}else{"Cleaning compressed sessions is not supported yet"}}else if active{if zh{"活动会话不可清理"}else{"Active chats cannot be cleaned"}}else if zh{"请先修复会话"}else{"Repair this chat first"};hits.push(Area{hit:Hit::Info(reason.into()),r});}}
+            let x=width-116.;let r=rect(x,y+5.,102.,29.);let show=row.repairable||row.compressed||row.bytes>self.settings.reduce_threshold_mib.saturating_mul(1048576);
+            if (view.compressing||view.decompressing)&&view.current_id==row.id{p.fill(r,0x30444e,5.);p.busy_spinner(x+7.,y+12.);p.label(if zh{"处理中"}else{"Working"},rect(x+27.,y+5.,74.,29.),10.,TEXT,false);}
+            else if show{let can=!locked&&!active;p.fill(r,if can{0x30444e}else{0x293238},5.);
+                if row.repairable{p.repair_toolbar_icon(&Hit::RepairAll,x+6.,y+12.,if can{NEW_RESULT}else{MUTED});}else if row.compressed{p.decompression_icon(x+6.,y+12.,if can{NEW_RESULT}else{MUTED});}else{p.compression_icon(x+6.,y+12.,if can{NEW_RESULT}else{MUTED});}
+                let label=if row.repairable{if zh{"修复"}else{"Repair"}}else if row.compressed{if zh{"解压"}else{"Decompress"}}else if zh{"压缩"}else{"Compress"};p.label(label,rect(x+25.,y+5.,75.,29.),10.,if can{TEXT}else{MUTED},false);
+                if can{hits.push(Area{hit:if row.repairable{Hit::RepairOne(row.id.clone())}else if row.compressed{Hit::DecompressOne(row.id.clone())}else{Hit::ReduceOne(row.id.clone())},r});}}
+
+            hits.push(Area{hit:Hit::ManagerRow(row.id.clone()),r:rect(48.,y,405.,39.)});
+        }
+        if self.clean_menu.is_none()&&!self.manager_batch_menu&&self.manager_delete_ids.is_empty(){if let Some(Hit::Breakdown(id))=&self.hover{if let Some((slot,row))=rows.iter().skip(top).take(MANAGER_PAGE).enumerate().find(|(_,r)|&r.id==id){if let Some(a)=&row.analysis{let x=690.;let row_y=MANAGER_TOP+slot as f32*MANAGER_ROW;let y=if row_y+205.<height-60.{row_y+31.}else{row_y-192.};p.fill(rect(x,y,260.,184.),0x26363d,7.);p.border(rect(x,y,260.,184.),0x526a72,7.);p.label(if zh{"记录构成"}else{"Record breakdown"},rect(x+10.,y+4.,240.,20.),11.,TEXT,false);let labels=if zh{["文件变更","工具输出","命令记录","推理","消息","其他","未分类"]}else{["File changes","Tool output","Command records","Reasoning","Messages","Other","Unclassified"]};for(i,((value,color),label))in a.record_breakdown().iter().zip([0xe5a35d,0x5da9d7,0x5277aa,0xa88cd3,0x55bd98,0x72818a,0xca7483]).zip(labels).enumerate(){let yy=y+27.+i as f32*20.;p.circle(x+13.,yy+9.,3.,color);p.label(label,rect(x+24.,yy,130.,19.),10.,TEXT,false);p.right_label(&crate::clean::display_bytes(*value),rect(x+158.,yy,90.,19.),10.,MUTED);}}}}}
+        if let Some(id)=&self.clean_menu{if let Some((slot,row))=rows.iter().skip(top).take(MANAGER_PAGE).enumerate().find(|(_,r)|&r.id==id){let yy=MANAGER_TOP+slot as f32*MANAGER_ROW;let x=width-335.;let y=if yy+128.<height-60.{yy+36.}else{yy-90.};p.fill(rect(x,y,315.,88.),0x283a40,7.);p.border(rect(x,y,315.,88.),0x59747d,7.);p.label(if zh{"清理范围 · 预计文件缩小"}else{"Cleanup scope · estimated file reduction"},rect(x+10.,y+3.,295.,22.),10.,MUTED,false);let selected=*self.clean_modes.get(id).unwrap_or(&false);for(index,io)in [false,true].into_iter().enumerate(){let r=rect(x+5.,y+25.+index as f32*28.,305.,26.);if selected==io{p.fill(r,0x345e51,4.);}p.label(if zh{if io{"清理 + 命令 I/O"}else{"清理（默认）"}}else if io{"Clean + command I/O"}else{"Clean (default)"},rect(x+14.,r.top,195.,26.),10.,TEXT,false);let estimate=row.analysis.as_ref().and_then(|a|a.file_reduction(io).map(|n|format!("{} {}",if a.oversized_rollout_records>0{"≥"}else{"≈"},crate::clean::display_bytes(n)))).unwrap_or_else(||"—".into());p.label(&estimate,rect(x+220.,r.top,88.,26.),10.,GREEN,false);hits.push(Area{hit:Hit::CleanMode(id.clone(),io),r});}}}
+        if self.manager_batch_menu{let x=320.;let y=119.;p.fill(rect(x,y,225.,62.),0x283a40,6.);for (i,io) in [false,true].into_iter().enumerate(){let r=rect(x+4.,y+3.+i as f32*28.,217.,26.);if self.manager_batch_io==io{p.fill(r,0x345e51,4.);}p.label(if zh{if io{"清理 + 命令 I/O"}else{"清理（默认）"}}else if io{"Clean + command I/O"}else{"Clean (default)"},rect(x+12.,r.top,205.,26.),10.,TEXT,false);hits.push(Area{hit:Hit::ManagerCleanMode(io),r});}}
+        p.line(18.,height-58.,width-18.,height-58.,0x35484d,2.);
+        let fraction=if view.batch_running&&view.batch_total>0{Some((view.batch_done as f64+view.current_fraction().unwrap_or(0.))/view.batch_total as f64)}else{view.current_fraction()};
+        if view.busy||view.batch_running{p.line(18.,height-58.,width-18.,height-58.,0x40535a,3.);if let Some(f)=fraction{p.line(18.,height-58.,18.+(width-36.)*f.clamp(0.,1.) as f32,height-58.,GREEN,3.);}else{let span=(width-36.)*0.18;let x=18.+((now()*70.) as f32%((width-36.-span).max(1.)));p.line(x,height-58.,x+span,height-58.,GREEN,3.);}}if view.batch_running||view.busy{p.busy_spinner(width-35.,height-51.);}
+        let status=if view.batch_running{format!("{} {}/{} · {}",if zh{"正在处理"}else{"Processing"},view.batch_done,view.batch_total,view.current_title)}else if view.busy{let action=if view.analyzing{if zh{"正在分析"}else{"Analyzing"}}else if view.cleaning{if zh{"正在清理"}else{"Cleaning"}}else{view.phase.map(|phase|phase.label(zh)).unwrap_or(if zh{"正在处理"}else{"Processing"})};format!("{} · {}{}",action,view.current_title,if view.analyzing&&view.phase_total>0{format!(" · {}%",(view.phase_done.saturating_mul(100)/view.phase_total).min(99))}else{String::new()})}else{format!("{} {} · {} {} · {} {}",if zh{"会话"}else{"Chats"},view.rows.len(),if zh{"筛选"}else{"Shown"},total,if zh{"选中"}else{"Selected"},self.manager_selected.len())};p.label(&status,rect(18.,height-54.,width-36.,22.),10.,MUTED,false);let offline=host::bounds(live.host).is_none();let note=if offline&&view.note.is_empty(){if zh{"Codex 未连接：可扫描和分析本机会话；部分修改操作需要 Codex。"}else{"Codex disconnected: local scanning and analysis available; some changes require Codex."}}else{view.note.as_str()};p.label(note,rect(18.,height-29.,width-36.,21.),10.,ORANGE,false);if !note.is_empty(){hits.push(Area{hit:Hit::Info(note.into()),r:rect(18.,height-29.,width-36.,21.)});}
+        if !self.manager_delete_ids.is_empty(){hits.clear();let x=(width-590.)/2.;let y=(height-345.)/2.;p.fill(rect(x,y,590.,345.),0x2a3a3f,9.);p.border(rect(x,y,590.,345.),0x60777c,9.);p.fill(rect(x+17.,y+19.,34.,34.),0x63383c,7.);p.label("!",rect(x+29.,y+18.,20.,34.),20.,0xffc0b8,false);p.label(&format!("{} {} {}",if zh{"确认删除"}else{"Delete"},self.manager_delete_ids.len(),if zh{"个会话？"}else{"selected chats?"}),rect(x+64.,y+14.,500.,31.),14.,TEXT,false);
+            p.label(if zh{"仅删除勾选的会话；活动会话跳过。输入 yes 确认。"}else{"Only checked inactive chats will be deleted. Type yes to confirm."},rect(x+64.,y+51.,500.,26.),11.,MUTED,false);
+            p.fill(rect(x+64.,y+80.,500.,160.),0x1e2d32,5.);
+            for (i,id) in self.manager_delete_ids.iter().skip(self.manager_delete_scroll).take(7).enumerate(){let name=view.rows.iter().find(|r|&r.id==id).map(|r|self.catalog.strip(&r.title)).unwrap_or(id);let yy=y+83.+i as f32*22.;p.circle(x+75.,yy+10.,2.,0xd8a27c);p.label(name,rect(x+85.,yy,460.,21.),10.,TEXT,false);}
+            if self.manager_delete_ids.len()>7{let thumb=(160.*7./self.manager_delete_ids.len() as f32).max(20.);let max=self.manager_delete_ids.len().saturating_sub(7).max(1);let pos=(160.-thumb)*self.manager_delete_scroll as f32/max as f32;p.fill(rect(x+555.,y+80.,3.,160.),0x40535a,1.);p.fill(rect(x+555.,y+80.+pos,3.,thumb),0x8ba6af,1.);}
+
+            p.fill(rect(x+64.,y+250.,265.,31.),0x192327,5.);p.border(rect(x+64.,y+250.,265.,31.),0x596e75,5.);
+            let force=rect(x+343.,y+250.,218.,31.);self.manager_checkbox(p,x+346.,y+257.,self.manager_delete_force);p.label(if zh{"强制删除异常会话"}else{"Force delete issue chats"},rect(x+369.,y+250.,192.,31.),10.,TEXT,false);hits.push(Area{hit:Hit::ManagerForceToggle,r:force});
+            let cancel=rect(x+373.,y+296.,82.,32.);p.fill(cancel,0x35464b,5.);p.label(if zh{"取消"}else{"Cancel"},rect(x+388.,y+296.,67.,32.),11.,TEXT,false);hits.push(Area{hit:Hit::ManagerDeleteCancel,r:cancel});
+            let mut text=[0u16;16];let n=if self.manager_delete_edit.is_invalid(){0}else{GetWindowTextW(self.manager_delete_edit,&mut text)};let allowed=String::from_utf16_lossy(&text[..n as usize])=="yes";let delete=rect(x+466.,y+296.,106.,32.);p.fill(delete,if allowed{0xa33e43}else{0x603c3e},5.);p.label(if zh{"删除会话"}else{"Delete"},rect(x+480.,y+296.,90.,32.),11.,if allowed{TEXT}else{MUTED},false);if allowed{hits.push(Area{hit:Hit::ManagerDeleteConfirm,r:delete});}
+        }
+        hits
+    }
+    unsafe fn manager_checkbox(&self,p:&Painter,x:f32,y:f32,on:bool){p.fill(rect(x,y,15.,15.),if on{0x3b826c}else{0x26343a},3.);p.border(rect(x,y,15.,15.),if on{0x8ed5b8}else{0x718993},3.);if on{p.line(x+3.,y+8.,x+6.,y+11.,0xd2f8e8,1.2);p.line(x+6.,y+11.,x+12.,y+4.,0xd2f8e8,1.2);}}
     unsafe fn tick(&mut self) {
+        if self.popup_kind==Some(Popup::Repair) {
+            let (revision,spinning,retained)={let view=self.repair_service.view.lock().unwrap();(view.revision,(view.busy&&(view.compressing||view.decompressing||view.analyzing||view.cleaning))||view.batch_running,if !view.busy&&!view.batch_running{Some(view.rows.iter().map(|row|row.id.clone()).collect::<HashSet<_>>())}else{None})};
+            if let Some(ids)=retained{self.manager_selected.retain(|id|ids.contains(id));}
+            if revision!=self.repair_revision {self.repair_revision=revision;let _=InvalidateRect(self.popup,None,false);}
+            if spinning&&Instant::now()>=self.repair_spinner_due{self.repair_spinner_due=Instant::now()+std::time::Duration::from_millis(200);let _=InvalidateRect(self.popup,None,false);}
+        }
         self.finish_chat_copy();
         self.check_reset_reminders();
         let language=crate::locale::status().0;
@@ -2339,22 +2628,27 @@ impl App {
             self.hidden = false;
         }
         let live = self.snapshot();
+        if self.popup_kind==Some(Popup::Repair){let active=active_repair_ids(&live);if active!=self.repair_activity{self.repair_activity=active;let _=InvalidateRect(self.popup,None,false);}}
+        self.update_hover_card();
+        self.update_reset_hover();
         self.refresh_reply_preview(&live);
         if self.popup_kind == Some(Popup::Recent) && Instant::now() >= self.tag_catalog_due { self.refresh_tag_catalog(); }
         let identity = self.identity(&live);
         if identity != self.last_identity {
             self.last_identity = identity;
-            if self.popup_kind.is_some() && !matches!(self.popup_kind, Some(Popup::Preferences | Popup::GuardLogs)) {
+            if self.popup_kind.is_some() && !matches!(self.popup_kind, Some(Popup::Preferences | Popup::GuardLogs | Popup::Repair)) {
                 self.close_popup();
             }
         }
         if self.popup_kind == Some(Popup::Recent) && self.recent_rows_at!=live.recent.loaded_at {
             self.rows = data::stable_rows(&self.rows, &live.recent.rows);
             self.recent_rows_at=live.recent.loaded_at;
+            if self.hover_card.visible {let _=InvalidateRect(self.hover_card.window,None,false);}
         }
         if self.popup_kind == Some(Popup::Fixed) && !live.recent.all_rows.is_empty() && self.recent_rows_at!=live.recent.loaded_at {
             self.rows = data::stable_rows(&self.rows, &live.recent.all_rows);
             self.recent_rows_at=live.recent.loaded_at;
+            if self.hover_card.visible {let _=InvalidateRect(self.hover_card.window,None,false);}
         }
         if matches!(self.popup_kind, Some(Popup::Recent | Popup::Fixed))
             && self.chat_search.sync(&self.rows, &self.catalog)
@@ -2384,6 +2678,9 @@ impl App {
                 let result = service.status();
                 if result.generation == self.body_generation {
                     self.body_state = result;
+                    if self.body_pending && self.body_state.query_ready && (self.body_hits!=self.body_state.hits || self.body_previews!=self.body_state.previews) {
+                        self.body_hits=self.body_state.hits.clone();self.body_previews=self.body_state.previews.clone();self.update_body_only();self.chat_filters=self.filtered_chats();self.chat_cursor=0;self.scroll=0;let _=InvalidateRect(self.popup,None,false);
+                    }
                     if self.body_state.complete {
                         self.index_pending = false;
                         self.index_due = Instant::now() + std::time::Duration::from_secs(60);
@@ -2418,13 +2715,31 @@ impl App {
         }
         let host = host::bounds(live.host);
         if !self.testing {
-            if self.hidden || !host::shown(live.host) {
+            let presentation=host_presentation(self.hidden,host.is_some(),host::shown(live.host));
+            if presentation==HostPresentation::HiddenByUser {
                 let _ = ShowWindow(self.bar, SW_HIDE);
-                if self.popup_kind.is_some() {
-                    self.close_popup();
-                }
-                self.host_hidden = !self.hidden;
+                if self.popup_kind.is_some() { self.close_popup(); }
+                self.host_hidden=false;
+            } else if presentation==HostPresentation::Standalone {
+                // No owner window: keep an ordinary independent bar and its
+                // panels usable. A minimized but existing host is handled below.
+                let entering=!self.standalone;let had_host=self.last_host.is_some();
+                self.standalone=true;self.host_hidden=false;self.last_host=None;
+                self.dpi=GetDpiForWindow(self.bar).max(96) as f32/96.;
+                let width=self.measure_bar();let w=(width as f32*self.dpi).round() as i32;let ht=(self.height as f32*self.dpi).round() as i32;
+                let current=host::bounds(self.bar.0 as isize).unwrap_or([0,0,w,ht]);
+                let mut info=MONITORINFO{cbSize:size_of::<MONITORINFO>() as u32,..Default::default()};
+                let _=GetMonitorInfoW(MonitorFromWindow(self.bar,MONITOR_DEFAULTTONEAREST),&mut info);
+                let bounds=info.rcWork;
+                let (mut x,mut y)=if entering&&!had_host{((bounds.left+bounds.right-w)/2,bounds.top+(12.*self.dpi) as i32)}else{(current[0],current[1])};
+                x=x.clamp(bounds.left,(bounds.right-w).max(bounds.left));y=y.clamp(bounds.top,(bounds.bottom-ht).max(bounds.top));
+                if self.drag.is_none()&&(entering||current!=[x,y,x+w,y+ht]||self.width!=width){let _=SetWindowPos(self.bar,HWND_TOP,x,y,w,ht,SWP_NOACTIVATE|SWP_NOZORDER);Self::round_window(self.bar,w,ht,(14.*self.dpi) as i32);}
+                self.width=width;let _=ShowWindow(self.bar,SW_SHOWNOACTIVATE);
+                if self.popup_kind.is_some(){self.place_popup();self.place_icon_panel();}
+            } else if presentation==HostPresentation::HostHidden {
+                let _=ShowWindow(self.bar,SW_HIDE);if self.popup_kind.is_some(){self.close_popup();}self.host_hidden=true;
             } else if let Some(h) = host {
+                self.standalone=false;
                 // Keep the bar immediately above Codex in the ordinary z-order.
                 // Do not assign an owner: closing Codex must not destroy the bar.
                 place_above_host(self.bar,HWND(live.host as *mut _));
@@ -2543,7 +2858,7 @@ impl App {
             hIcon: self.tray_icon,
             ..Default::default()
         };
-        let tip = wide("Codex Session Bar · Rust");
+        let tip = wide("Codex Session Bar");
         data.szTip[..tip.len()].copy_from_slice(&tip);
         let _ = Shell_NotifyIconW(if add { NIM_ADD } else { NIM_DELETE }, &data);
     }
@@ -2859,6 +3174,11 @@ impl App {
         Some(LRESULT(0))
     }
     unsafe fn close_popup(&mut self) {
+        if !self.manager_delete_edit.is_invalid(){let _=DestroyWindow(self.manager_delete_edit);self.manager_delete_edit=HWND::default();}self.manager_delete_ids.clear();self.manager_batch_menu=false;
+        self.local_shortcut_capture=None;
+        self.clean_menu=None;
+        self.hover_card.hide();
+        self.finish_numeric(true);
         self.chat_menu=None;
         self.cancel_sidebar_animation();
         self.close_tag_editor();
@@ -2928,6 +3248,7 @@ impl App {
         true
     }
     unsafe fn popup(&mut self, kind: Popup) -> Result<()> {
+        self.finish_numeric(true);
         self.chat_menu=None;
         self.cancel_sidebar_animation();
         self.close_tag_editor();
@@ -2972,6 +3293,7 @@ impl App {
         self.list_pointer=None;
         let live = self.snapshot();
         self.popup_size = match kind {
+            Popup::Repair => [1190,700],
             Popup::Recent => {
                 self.rows = live.recent.rows.clone();
                 [self.recent_width(), self.recent_panel_height()]
@@ -2986,8 +3308,12 @@ impl App {
             self.scroll = 0;
             self.refresh_guard_events();
         }
+        if kind==Popup::Repair {self.scroll=0;self.manager_query.clear();self.manager_selected.clear();self.manager_batch_menu=false;self.manager_batch_io=false;self.repair_activity=active_repair_ids(&live);if !self.testing {self.repair_service.start(None,self.repair_activity.clone());}
+            self.edit=CreateWindowExW(WINDOW_EX_STYLE(0),w!("EDIT"),w!(""),WS_CHILD|WS_VISIBLE|WS_TABSTOP|WINDOW_STYLE(ES_AUTOHSCROLL as u32),52,51,230,24,self.popup,HMENU(110isize as *mut _),GetModuleHandleW(None)?,None)?;install_search_cue(self.edit,3)?;
+        }
         if kind == Popup::Preferences {
             self.preferences_advanced=false;self.preferences_guard=false;
+            if !self.testing {self.startup_service.refresh();}
             if !resume_preferences || self.preferences_draft.is_none() {
                 self.preferences_draft = Some(self.settings.clone());
                 self.preferences_note = self.shortcut_error.clone();
@@ -3217,6 +3543,8 @@ impl App {
                 (self.edit, self.recent_toolbar_left() as i32 + 83, 14, 184, 22)
             } else if self.popup_kind == Some(Popup::Preferences) {
                 (self.edit, 258, 198, 278, 24)
+            } else if self.popup_kind == Some(Popup::Repair) {
+                (self.edit, 46, 52, 230, 23)
             } else {
                 (self.edit, 21, 53, 146, 22)
             },
@@ -3250,10 +3578,69 @@ impl App {
                 "cache_exists":self.paths.runtime.join("body-search.sqlite").exists(),"on_demand":false}));
         let live = self.snapshot();
         let (_, title, status, _, _) = unsafe { self.bar_text(&live) };
-        self.paths.write(if self.testing{"rust-test-status.json"}else{"live-status.json"},&json!({"pid":std::process::id(),"runtime":"rust","ui_language":{"culture":crate::locale::status().0,"source":if crate::locale::status().1{"codex-uia"}else{"windows-default"}},"refresh":{"file_events":live.refresh_events.watching.load(Ordering::Relaxed),"settings":live.refresh_options},"updated_at":now(),"thread":self.identity(&live),"overview":self.identity(&live).is_empty() && data::visible_chat_title(&live.view_label).is_none(),"display_title":title,"display_status":status,"tokens":self.bar_usage(&live).0,"auto_thread":live.auto_thread,"topmost":false,"user_hidden":self.hidden,"host_hidden":self.host_hidden,"host_window":live.host,"host_rect":self.last_host,"host_offset":self.settings.host_offset,"titlebar_slot":live.slot,"quota":live.quota,"quota_error":live.quota_error,"view_error":live.view_error,"snapshot_error":live.snapshot_error,"recent_cache":{"rows":live.recent.rows.len(),"busy_count":live.recent.busy_count,"stale":live.recent.stale,"error":live.recent.error},"active_view":{"thread":live.view,"label":live.view_label,"available":live.view.is_some() || data::visible_chat_title(&live.view_label).is_some(),"identity_pending":live.auto_thread && live.view.is_none() && data::visible_chat_title(&live.view_label).is_some(),"source":"uia-current-page"},"action_note":live.action_note,"capacity_retry":{"settings":live.capacity_options,"status":live.capacity_retry},"codex_git_guard":live.guard,"font":{"chinese":self.painter.chinese,"latin":"Segoe UI","emoji":"Segoe UI Emoji","renderer":"DirectWrite / software Direct2D","antialias":"ClearType","per_monitor_dpi":true}}));
+        self.paths.write(if self.testing{"rust-test-status.json"}else{"live-status.json"},&json!({"pid":std::process::id(),"runtime":"rust","ui_language":{"culture":crate::locale::status().0,"source":if crate::locale::status().1{"codex-uia"}else{"windows-default"}},"refresh":{"file_events":live.refresh_events.watching.load(Ordering::Relaxed),"settings":live.refresh_options},"updated_at":now(),"thread":self.identity(&live),"overview":self.identity(&live).is_empty() && data::visible_chat_title(&live.view_label).is_none(),"display_title":title,"display_status":status,"tokens":self.bar_usage(&live).0,"auto_thread":live.auto_thread,"topmost":false,"user_hidden":self.hidden,"host_hidden":self.host_hidden,"standalone":self.standalone,"host_window":live.host,"host_rect":self.last_host,"host_offset":self.settings.host_offset,"titlebar_slot":live.slot,"quota":live.quota,"quota_error":live.quota_error,"view_error":live.view_error,"snapshot_error":live.snapshot_error,"recent_cache":{"rows":live.recent.rows.len(),"busy_count":live.recent.busy_count,"stale":live.recent.stale,"error":live.recent.error},"active_view":{"thread":live.view,"label":live.view_label,"available":live.view.is_some() || data::visible_chat_title(&live.view_label).is_some(),"identity_pending":live.auto_thread && live.view.is_none() && data::visible_chat_title(&live.view_label).is_some(),"source":"uia-current-page"},"action_note":live.action_note,"capacity_retry":{"settings":live.capacity_options,"status":live.capacity_retry},"codex_git_guard":live.guard,"font":{"chinese":self.painter.chinese,"latin":"Segoe UI","emoji":"Segoe UI Emoji","renderer":"DirectWrite / software Direct2D","antialias":"ClearType","per_monitor_dpi":true}}));
     }
     unsafe fn hit(&mut self, hit: Hit) -> Option<Action> {
+        if matches!(hit,Hit::AnalyzeOne(_)|Hit::CleanOne(_)|Hit::CleanMenu(_)|Hit::ReduceOne(_)|Hit::DecompressOne(_)|Hit::RepairOne(_)|Hit::RepairAll|Hit::RepairScan|Hit::ReduceAll|Hit::ManagerBatch(_)) && self.repair_service.view.lock().unwrap().batch_running {return None}
         match hit {
+            Hit::Numeric(target)=>{if let Err(error)=self.begin_numeric(target){self.preferences_note=format!("{error:#}");}}
+            Hit::RepairPanel => {self.repair_return_recent=self.popup_kind==Some(Popup::Recent);let _=self.popup(Popup::Repair);}
+            Hit::ManagerClearSearch=>{self.manager_query.clear();self.scroll=0;let _=SetWindowTextW(self.edit,w!(""));let _=SetFocus(self.edit);let _=InvalidateRect(self.popup,None,false);}
+            Hit::ManagerSelect(id)=>{if !self.manager_selected.insert(id.clone()){self.manager_selected.remove(&id);}let _=InvalidateRect(self.popup,None,false);}
+            Hit::ManagerSelectAll=>{let rows=self.repair_rows();crate::manager::toggle_filtered(&mut self.manager_selected,&rows);let _=InvalidateRect(self.popup,None,false);}
+            Hit::ManagerCleanMenu=>{self.clean_menu=None;self.manager_batch_menu=!self.manager_batch_menu;let _=InvalidateRect(self.popup,None,false);}
+            Hit::ManagerCleanMode(io)=>{self.manager_batch_io=io;self.manager_batch_menu=false;let _=InvalidateRect(self.popup,None,false);}
+            Hit::ManagerBatch(action)=>{
+                let v=self.repair_service.view.lock().unwrap();if v.busy||v.batch_running{return None}let ids:Vec<String>=v.rows.iter().filter(|row|self.manager_selected.contains(&row.id)).map(|row|row.id.clone()).collect();drop(v);if ids.is_empty(){return None}
+                self.manager_batch_menu=false;
+                if action==6 {
+                    self.manager_delete_ids=ids;self.manager_delete_scroll=0;self.manager_delete_force=false;let width=self.popup_size[0] as f32;let height=self.popup_size[1] as f32;let x=(width-590.)/2.+72.;let y=(height-345.)/2.+254.;
+                    let _=ShowWindow(self.edit,SW_HIDE);
+                    if let Ok(edit)=CreateWindowExW(WINDOW_EX_STYLE(0),w!("EDIT"),w!(""),WS_CHILD|WS_VISIBLE|WS_TABSTOP|WINDOW_STYLE(ES_AUTOHSCROLL as u32),(x*self.dpi) as i32,(y*self.dpi) as i32,(248.*self.dpi) as i32,(23.*self.dpi) as i32,self.popup,HMENU(111isize as *mut _),GetModuleHandleW(None).unwrap_or_default(),None){self.manager_delete_edit=edit;let _=SendMessageW(edit,EM_SETLIMITTEXT,WPARAM(3),LPARAM(0));let _=SendMessageW(edit,WM_SETFONT,WPARAM(self.edit_font.0 as usize),LPARAM(1));let _=SetFocus(edit);}else{self.manager_delete_ids.clear();let _=ShowWindow(self.edit,SW_SHOW);self.repair_service.view.lock().unwrap().note="Cannot open confirmation input".into();}
+                }else if !self.testing {let kind=match action{0=>crate::repair::BatchAction::Analyze,1=>crate::repair::BatchAction::Clean(self.manager_batch_io),2=>crate::repair::BatchAction::Compress,3=>crate::repair::BatchAction::Decompress,4=>crate::repair::BatchAction::Repair,_=>crate::repair::BatchAction::Archive};self.repair_service.start_batch(ids,kind,self.state.clone());}
+                let _=InvalidateRect(self.popup,None,false);
+            }
+            Hit::ManagerForceToggle=>{self.manager_delete_force=!self.manager_delete_force;let _=InvalidateRect(self.popup,None,false);}
+            Hit::ManagerDeleteCancel=>{if !self.manager_delete_edit.is_invalid(){let _=DestroyWindow(self.manager_delete_edit);self.manager_delete_edit=HWND::default();}self.manager_delete_ids.clear();let _=ShowWindow(self.edit,SW_SHOW);let _=SetFocus(self.popup);let _=InvalidateRect(self.popup,None,false);}
+            Hit::ManagerDeleteConfirm=>{let mut value=[0u16;16];let len=if self.manager_delete_edit.is_invalid(){0}else{GetWindowTextW(self.manager_delete_edit,&mut value)};if String::from_utf16_lossy(&value[..len as usize])=="yes"&&!self.manager_delete_ids.is_empty(){let ids=std::mem::take(&mut self.manager_delete_ids);let force=self.manager_delete_force;self.manager_delete_force=false;if !self.manager_delete_edit.is_invalid(){let _=DestroyWindow(self.manager_delete_edit);self.manager_delete_edit=HWND::default();}let _=ShowWindow(self.edit,SW_SHOW);if !self.testing{self.repair_service.start_batch(ids,if force{crate::repair::BatchAction::ForceDelete}else{crate::repair::BatchAction::Delete},self.state.clone());}let _=SetFocus(self.popup);let _=InvalidateRect(self.popup,None,false);}}
+            Hit::RepairFilter(filter)=>{self.clean_menu=None;self.repair_filter=filter;self.scroll=0;}
+            Hit::RepairSort(sort)=>{self.clean_menu=None;if self.repair_sort==sort{self.repair_ascending=!self.repair_ascending}else{self.repair_sort=sort;self.repair_ascending=false}self.scroll=0;}
+            Hit::ReduceThreshold(delta)=>{
+                let mut next=self.settings.clone();next.reduce_threshold_mib=(next.reduce_threshold_mib as i64+delta as i64).clamp(10,102400) as u64;
+                if self.testing || self.write_settings(&next).is_ok(){self.settings=next;if let Some(draft)=self.preferences_draft.as_mut(){draft.reduce_threshold_mib=self.settings.reduce_threshold_mib;}}
+                else{self.repair_service.view.lock().unwrap().note=if crate::locale::chinese(){"无法保存阈值"}else{"Could not save threshold"}.into();}
+            }
+            Hit::ReduceOne(_) | Hit::ReduceAll=>{
+                if !self.testing {
+                    let selected=match &hit{Hit::ReduceOne(id)=>std::collections::HashSet::from([id.clone()]),_=>batch_reduce_ids(&self.repair_service.view.lock().unwrap().rows,self.settings.reduce_threshold_mib)};
+                    let busy=active_repair_ids(&self.snapshot());self.repair_service.start_reduce(selected,busy,self.state.clone());
+                }
+            }
+            Hit::DecompressOne(id)=>{if !self.testing{let live=self.snapshot();let busy=active_repair_ids(&live);self.repair_service.start_decompress(id,busy,live.recent.stale,self.state.clone());}}
+            Hit::AnalyzeOne(id)=>{if !self.testing{self.repair_service.start_analysis(id);}}
+            Hit::CleanMenu(id)=>{
+                self.manager_batch_menu=false;
+                let valid={let mut view=self.repair_service.view.lock().unwrap();if let Some(row)=view.rows.iter_mut().find(|row|row.id==id){
+                    if row.analysis_fingerprint.is_some()&&crate::repair::analysis_fingerprint(row)!=row.analysis_fingerprint {row.analysis=None;row.analysis_fingerprint=None;false}else{true}
+                }else{false}};
+                if valid {self.clean_menu=if self.clean_menu.as_ref()==Some(&id){None}else{Some(id)};} else {self.clean_menu=None;self.repair_service.view.lock().unwrap().note=if crate::locale::chinese(){"会话文件已变化，请重新分析"}else{"Session file changed; analyze again"}.into();}
+                let _=InvalidateRect(self.popup,None,false);
+            }
+            Hit::CleanMode(id,with_io)=>{self.clean_modes.insert(id,with_io);self.clean_menu=None;self.repair_service.view.lock().unwrap().note=if crate::locale::chinese(){"已选择清理范围，请点击左侧清理按钮执行"}else{"Cleanup scope selected; click Clean to start"}.into();let _=InvalidateRect(self.popup,None,false);}
+            Hit::CleanOne(id)=>{self.clean_menu=None;if !self.testing {let live=self.snapshot();let busy=active_repair_ids(&live);let with_io=*self.clean_modes.get(&id).unwrap_or(&false);self.repair_service.start_clean(id,with_io,busy,live.recent.stale);}}
+
+            Hit::RepairScan|Hit::RepairAll|Hit::RepairOne(_)=>{
+                if !self.testing {
+                    let selected=match &hit {
+                        Hit::RepairOne(id)=>Some(std::collections::HashSet::from([id.clone()])),
+                        Hit::RepairAll=>Some(self.repair_service.view.lock().unwrap().rows.iter().filter(|r|r.repairable).map(|r|r.id.clone()).collect()),
+                        _=>None,
+                    };
+                    let busy=active_repair_ids(&self.snapshot());
+                    self.repair_service.start(selected,busy);
+                }
+            }
+            Hit::RecentSort=>{self.recent_sort=(self.recent_sort+1)%3;self.chat_filters=self.filtered_chats();self.scroll=0;}
             Hit::Info(_) => {}
             Hit::ChatCopy(slot) => {
                 if slot==1 {
@@ -3292,7 +3679,7 @@ impl App {
             Hit::GuardLogs => { self.capacity_log=false;let _ = self.popup(Popup::GuardLogs); }
             Hit::CapacityRetryLogs=>{self.capacity_log=true;let _=self.popup(Popup::GuardLogs);}
             Hit::GuardRefresh | Hit::CapacityRetryRefresh => { self.refresh_guard_events(); }
-            Hit::BackPreferences => { let _ = self.popup(Popup::Preferences); }
+            Hit::BackPreferences => { let destination=if self.popup_kind==Some(Popup::Repair)&&self.repair_return_recent{Popup::Recent}else{Popup::Preferences};self.repair_return_recent=false;let _ = self.popup(destination); }
             Hit::GuardFolder | Hit::CapacityRetryFolder => {
                 if !self.testing {
                     let path = if self.capacity_log{self.paths.runtime.clone()}else{guard::log_dir(&self.paths)};
@@ -3359,29 +3746,35 @@ impl App {
                     self.preferences_note = "Apply to save changes".into();
                 }
             }
+            Hit::LocalShortcut(index)=>{self.local_shortcut_capture=Some(index);self.preferences_note.clear();let _=SetFocus(self.popup);let _=InvalidateRect(self.popup,None,false);}
+            Hit::AutoStart=>{if !self.testing{self.startup_service.toggle();}let _=InvalidateRect(self.popup,None,false);}
             Hit::ResetPreferences => {
                 if let Some(draft) = self.preferences_draft.as_mut() {
                     draft.refresh=crate::refresh::Settings::default();
                     draft.recent_rows = 10;
                     draft.recent_title_width=200;
                     draft.recent_shortcut = Shortcut::default();
+                    draft.body_shortcut=crate::default_body_shortcut();draft.compact_shortcut=crate::default_compact_shortcut();self.local_shortcut_capture=None;
                     SendMessageW(self.edit, HKM_SETHOTKEY, WPARAM(draft.recent_shortcut.control_word() as usize), LPARAM(0));
                     let _ = EnableWindow(self.edit, true);
                     self.preferences_note = "Defaults restored · apply to save".into();
                 }
             }
             Hit::GuardSettings => {
+                self.local_shortcut_capture=None;
                 if let Some(draft)=self.preferences_draft.as_mut(){draft.recent_shortcut=Shortcut::from_control_word(SendMessageW(self.edit,HKM_GETHOTKEY,WPARAM(0),LPARAM(0)).0 as u16,draft.recent_shortcut.enabled);}
                 self.guard_limits=guard::Limits::load(&self.paths);self.preferences_guard=true;self.preferences_advanced=false;self.preferences_note.clear();if !self.testing{let _=SetFocus(self.popup);}let _=ShowWindow(self.edit,SW_HIDE);let _=ShowWindow(self.combo,SW_HIDE);
             }
             Hit::GuardLimit(field,delta) => {self.guard_limits.adjust(field,delta);self.preferences_note="Apply to save changes".into();}
             Hit::RefreshPreferences => {
+                self.local_shortcut_capture=None;
                 if let Some(draft)=self.preferences_draft.as_mut(){draft.recent_shortcut=Shortcut::from_control_word(SendMessageW(self.edit,HKM_GETHOTKEY,WPARAM(0),LPARAM(0)).0 as u16,draft.recent_shortcut.enabled);}
                 self.preferences_advanced=true;let _=ShowWindow(self.edit,SW_HIDE);let _=ShowWindow(self.combo,SW_HIDE);
             }
             Hit::RefreshBack => {self.preferences_guard=false;self.preferences_advanced=false;let _=ShowWindow(self.edit,SW_SHOW);let _=ShowWindow(self.combo,SW_SHOW);}
             Hit::RefreshInterval(field,delta) => {if let Some(draft)=self.preferences_draft.as_mut(){draft.refresh.adjust(field,delta);self.preferences_note="Apply to save changes".into();}}
             Hit::ApplyPreferences => {
+                self.local_shortcut_capture=None;
                 let result=if self.preferences_guard {self.guard_limits.save(&self.paths)}else{self.apply_preferences()};
                 self.preferences_note=match result{Ok(())=>"Saved · changes are active".into(),Err(error)=>format!("{error:#}")};
             }
@@ -3552,7 +3945,7 @@ impl App {
                 self.stop.store(true, Ordering::Relaxed);
                 PostQuitMessage(0);
             }
-            Hit::Grip => {}
+            Hit::Grip | Hit::Breakdown(_) | Hit::ManagerRow(_) => {}
         }
         None
     }
@@ -3565,8 +3958,8 @@ impl App {
                     let _ = ShowWindow(host, SW_RESTORE);
                 }
                 let _ = SetForegroundWindow(host);
-                self.tick();
             }
+            self.tick();
         }
         if self.popup_kind == Some(Popup::Recent) {
             self.close_popup();
@@ -3621,12 +4014,20 @@ impl App {
     }
     fn filtered_chats(&self) -> Vec<usize> {
         let titles = self.chat_search.filter(&self.rows, &self.search, false);
-        ranked_matches(
+        let title_ids:HashSet<_>=titles.iter().copied().collect();
+        let mut matched:Vec<_>=ranked_matches(
             &self.rows,
             &titles,
             &self.body_hits,
             !self.search.trim().is_empty(),
-        ).into_iter().filter(|&i| self.popup_kind != Some(Popup::Recent) || self.custom_tags.matches(&self.rows[i], &self.tag_filters)).collect()
+        ).into_iter().filter(|&i| self.popup_kind != Some(Popup::Recent) || self.custom_tags.matches(&self.rows[i], &self.tag_filters)).collect();
+        if self.recent_sort>0&&self.popup_kind==Some(Popup::Recent){
+            matched.sort_by(|&a,&b|{
+                let rank=|i:usize|(self.rows[i].state!="Busy",!self.search.trim().is_empty()&&!title_ids.contains(&i));
+                rank(a).cmp(&rank(b)).then_with(||if self.recent_sort==1{self.rows[b].disk_bytes.cmp(&self.rows[a].disk_bytes)}else{self.rows[b].total_seconds.unwrap_or(0.).total_cmp(&self.rows[a].total_seconds.unwrap_or(0.))}).then_with(||self.rows[b].updated_at.total_cmp(&self.rows[a].updated_at))
+            });
+        }
+        matched
     }
     fn update_body_only(&mut self) {
         let titles: HashSet<_> = self
@@ -3669,12 +4070,13 @@ impl App {
             if !self.search.is_empty() && Self::contains_rect(self.chat_clear_rect(),x,y){return Some(Hit::ClearChatSearch);}
             if self.sidebar_open && !self.tag_query.is_empty() && Self::contains_rect(Self::tag_clear_rect(),x,y){return Some(Hit::ClearTagSearch);}
             if y < RECENT_TOP as f32 {
+                if Self::contains_rect(rect(width-43.,8.,32.,32.),x,y){return Some(Hit::RepairPanel);}
                 let toolbar_x=x-self.recent_toolbar_left();
                 if (12. ..42.).contains(&toolbar_x)&&(9. ..39.).contains(&y){return Some(Hit::TagSidebar);}
                 if (310. ..370.).contains(&toolbar_x)&&(8. ..40.).contains(&y){return Some(Hit::Body);}
                 if (382. ..442.).contains(&toolbar_x)&&(8. ..40.).contains(&y){return Some(Hit::Compact);}
                 if (454. ..486.).contains(&toolbar_x)&&(8. ..40.).contains(&y){return Some(Hit::Refresh);}
-                return self.popup_hits.iter().rev().find(|a|a.contains(x,y)&&matches!(a.hit,Hit::TagFilter(_)|Hit::TagClear)).map(|a|a.hit.clone());
+                return self.popup_hits.iter().rev().find(|a|a.contains(x,y)&&matches!(a.hit,Hit::TagFilter(_)|Hit::TagClear|Hit::RepairPanel)).map(|a|a.hit.clone());
             }
             if self.sidebar_open && x<TAG_SIDEBAR {
                 if !self.tag_query.is_empty() && Self::contains_rect(Self::tag_clear_rect(),x,y){return Some(Hit::ClearTagSearch);}
@@ -3686,6 +4088,7 @@ impl App {
             let &i=self.chat_filters.get(slot)?;let row=&self.rows[i];
             let local_y=(y-top)%rh;let icon_top=if self.settings.compact_recent{4.}else{7.};
             if (left+12. ..left+42.).contains(&x)&&(icon_top..icon_top+30.).contains(&local_y){return Some(Hit::ChatIcon(row.id.clone()));}
+            if let Some((tag,r))=unsafe{self.title_project_tag(row)}{if Self::contains_rect(r,x,local_y){return Some(Hit::TagFilter(tag.key));}}
             if !self.settings.compact_recent{
                 let layout=unsafe{self.tag_layout(row)};
                 if Self::contains_rect(layout.add,x,local_y){return Some(Hit::TagEdit(row.id.clone()));}
@@ -3785,6 +4188,25 @@ impl App {
         let _ = InvalidateRect(self.popup, None, false);
         true
     }
+    unsafe fn local_shortcut_key(&mut self, hwnd:HWND, key:u16, ctrl:bool, alt:bool, shift:bool)->bool {
+        if !(hwnd==self.popup || IsChild(self.popup,hwnd).as_bool()) {return false}
+        if self.popup_kind==Some(Popup::Preferences) {
+            if let Some(index)=self.local_shortcut_capture {
+                if key==VK_ESCAPE.0 {self.local_shortcut_capture=None;let _=InvalidateRect(self.popup,None,false);return true}
+                let shortcut=Shortcut{enabled:true,key,ctrl,alt,shift};
+                if shortcut.valid() {
+                    if let Some(draft)=self.preferences_draft.as_mut(){if index==0{draft.body_shortcut=shortcut}else{draft.compact_shortcut=shortcut}}
+                    self.local_shortcut_capture=None;self.preferences_note="Apply to save changes".into();let _=InvalidateRect(self.popup,None,false);
+                }
+                return true;
+            }
+            return false
+        }
+        if self.popup_kind!=Some(Popup::Recent) || self.icon_panel.is_some() || self.tag_editor.is_some() || self.chat_menu.is_some() || self.tag_overflow.is_some(){return false}
+        let pressed=Shortcut{enabled:true,key,ctrl,alt,shift};
+        let hit=if pressed==self.settings.body_shortcut{Some(Hit::Body)}else if pressed==self.settings.compact_shortcut{Some(Hit::Compact)}else{None};
+        if let Some(hit)=hit {self.hit(hit);let _=InvalidateRect(self.popup,None,false);true}else{false}
+    }
     fn chat_scroll_geometry(&self) -> Option<(f32, f32, f32)> {
         let page_rows = self.list_page_rows();
         if self.chat_filters.len() <= page_rows {
@@ -3853,6 +4275,8 @@ unsafe extern "system" fn wndproc(
         let Some(app) = state.as_mut() else {
             return None;
         };
+        if hwnd==app.hover_card.window {return app.card_message(hwnd,message,wparam,lparam);}
+        if hwnd==app.reset_hover.window {return app.reset_hover_message(hwnd,message,wparam,lparam);}
         if app
             .icon_panel
             .as_ref()
@@ -3934,6 +4358,7 @@ unsafe extern "system" fn wndproc(
                     } else {
                         areas
                             .iter()
+                            .rev()
                             .find(|a| a.contains(x, y))
                             .map(|a| a.hit.clone())
                     };
@@ -3989,9 +4414,15 @@ unsafe extern "system" fn wndproc(
                     } else {
                         areas
                             .iter()
+                            .rev()
                             .find(|a| a.contains(x, y))
                             .map(|a| a.hit.clone())
                     };
+                    if !is_bar && app.popup_kind==Some(Popup::Repair) && app.clean_menu.is_some() && !matches!(hit,Some(Hit::CleanMenu(_)|Hit::CleanMode(_,_))) {
+                        app.clean_menu=None;
+                        let _=InvalidateRect(app.popup,None,false);
+                    }
+                    if !is_bar && app.popup_kind==Some(Popup::Repair) && app.manager_batch_menu && !matches!(hit,Some(Hit::ManagerCleanMenu|Hit::ManagerCleanMode(_))) {app.manager_batch_menu=false;let _=InvalidateRect(app.popup,None,false);}
                     if let Some(hit) = hit {
                         if let Some(action) = app.hit(hit) {
                             ACTIONS.with(|sender| {
@@ -4049,6 +4480,13 @@ unsafe extern "system" fn wndproc(
                 let _ = InvalidateRect(app.popup, None, false);
                 Some(LRESULT(0))
             }
+            WM_MOUSEWHEEL if !is_bar && app.popup_kind == Some(Popup::Repair) => {
+                app.clean_menu=None;
+                app.manager_batch_menu=false;
+                let delta=((wparam.0>>16) as i16) as i32;
+                if !app.manager_delete_ids.is_empty(){app.manager_delete_scroll=if delta<0{(app.manager_delete_scroll+3).min(app.manager_delete_ids.len().saturating_sub(7))}else{app.manager_delete_scroll.saturating_sub(3)};}else{app.scroll=if delta<0{(app.scroll+3).min(app.repair_rows().len().saturating_sub(MANAGER_PAGE))}else{app.scroll.saturating_sub(3)};}
+                let _=InvalidateRect(app.popup,None,false);Some(LRESULT(0))
+            }
             WM_MOUSEWHEEL if !is_bar && app.popup_kind == Some(Popup::GuardLogs) => {
                 let delta = ((wparam.0 >> 16) as i16) as i32;
                 app.scroll = if delta < 0 { (app.scroll + 3).min(app.guard_events.len().saturating_sub(8)) }
@@ -4065,6 +4503,8 @@ unsafe extern "system" fn wndproc(
             WM_COMMAND if !is_bar => {
                 let id = (wparam.0 & 0xffff) as u32;
                 let code = ((wparam.0 >> 16) & 0xffff) as u32;
+                if id==109 && code==EN_KILLFOCUS {app.finish_numeric(true);return Some(LRESULT(0));}
+                if id==109 && code==EN_CHANGE {app.preview_numeric();return Some(LRESULT(0));}
                 if id==108 && code==CBN_SELCHANGE && app.popup_kind==Some(Popup::Preferences) {
                     app.change_notice_source();
                     let _=InvalidateRect(app.popup,None,false);
@@ -4078,6 +4518,10 @@ unsafe extern "system" fn wndproc(
                     app.search = String::from_utf16_lossy(&text[..len as usize]);
                     app.filter_fixed();
                     let _ = InvalidateRect(app.popup, None, false);
+                } else if id==110 && code==EN_CHANGE {
+                    let mut text=[0u16;256];let len=GetWindowTextW(app.edit,&mut text);app.manager_query=String::from_utf16_lossy(&text[..len as usize]);app.scroll=0;let _=InvalidateRect(app.popup,None,false);
+                } else if id==111 && code==EN_CHANGE {
+                    let _=InvalidateRect(app.popup,None,false);
                 } else if id == 106 && code == EN_CHANGE {
                     let mut text=[0u16;256];let len=GetWindowTextW(app.tag_search_input,&mut text);
                     app.tag_query=String::from_utf16_lossy(&text[..len as usize]);
@@ -4228,14 +4672,29 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
         let focus_hook=SetWinEventHook(EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,None,Some(foreground_changed),0,0,WINEVENT_OUTOFCONTEXT);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if msg.message==WM_KEYDOWN && (msg.wParam.0==VK_RETURN.0 as usize||msg.wParam.0==VK_ESCAPE.0 as usize){
+                let handled=APP.with(|slot|slot.try_borrow_mut().ok().and_then(|mut value|value.as_mut().map(|app|{if app.manager_delete_edit.is_invalid()||msg.hwnd!=app.manager_delete_edit{return false}let hit=if msg.wParam.0==VK_ESCAPE.0 as usize{Hit::ManagerDeleteCancel}else{Hit::ManagerDeleteConfirm};app.hit(hit);true})).unwrap_or(false));if handled{continue}
+            }
+            if (msg.message==WM_KEYDOWN || msg.message==WM_SYSKEYDOWN) && (msg.lParam.0 as usize & (1<<30))==0 {
+                let ctrl=GetKeyState(VK_CONTROL.0 as i32)<0;let alt=GetKeyState(VK_MENU.0 as i32)<0 || (msg.lParam.0 as usize & (1<<29))!=0;let shift=GetKeyState(VK_SHIFT.0 as i32)<0;
+                let handled=APP.with(|slot|slot.try_borrow_mut().ok().and_then(|mut app|app.as_mut().map(|app|app.local_shortcut_key(msg.hwnd,msg.wParam.0 as u16,ctrl,alt,shift))).unwrap_or(false));
+                if handled{continue}
+            }
+            if msg.message==WM_KEYDOWN && (msg.wParam.0==VK_RETURN.0 as usize||msg.wParam.0==VK_ESCAPE.0 as usize) {
+                let handled=APP.with(|slot|{let Ok(mut value)=slot.try_borrow_mut() else{return false};value.as_mut().is_some_and(|app|{
+                    if app.numeric_edit.is_invalid()||msg.hwnd!=app.numeric_edit{return false}
+                    app.finish_numeric(msg.wParam.0==VK_RETURN.0 as usize);let _=SetFocus(app.popup);true
+                })});
+                if handled{continue}
+            }
             // The search edit owns focus; wheel scrolling still belongs to its list.
             if msg.message == WM_MOUSEWHEEL {
                 if let Some(popup) = APP.with(|slot| {
                     slot.try_borrow().ok().and_then(|a| {
                         a.as_ref()
-                            .filter(|app| app.owns_popup_window(msg.hwnd))
+                            .filter(|app| app.owns_popup_window(msg.hwnd) || app.hover_card.contains_cursor() || app.reset_hover.contains_cursor())
                             .map(|app| {
-                                if app.icon_owns(msg.hwnd) {
+                                if app.reset_hover.contains_cursor(){app.reset_hover.window}else if app.hover_card.contains_cursor() {app.hover_card.window} else if app.icon_owns(msg.hwnd) {
                                     app.icon_panel.as_ref().unwrap().window
                                 } else {
                                     app.popup
@@ -4545,6 +5004,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             live.view_label.clear();
         }
         assert_eq!(app.catalog.defaults.len(), 90);
+        assert_eq!(app.catalog.icon("Chat without custom icon"), "");
         assert!(app.catalog.entries.len() > 3900);
         let avocado = app
             .catalog
@@ -4563,15 +5023,23 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert_eq!(app.catalog.suggest("系统问题修复。"), "🛠️");
         assert_eq!(app.catalog.suggest("调研无人机 AI 模块"), "🚁");
         app.popup(Popup::Recent)?;
+        let body_before=app.search_body;let compact_before=app.settings.compact_recent;
+        assert!(!app.local_shortcut_key(app.bar,b'F' as u16,false,true,false));
+        assert!(app.local_shortcut_key(app.edit,b'F' as u16,false,true,false));assert_ne!(app.search_body,body_before);
+        assert!(app.local_shortcut_key(app.edit,b'F' as u16,false,true,false));assert_eq!(app.search_body,body_before);
+        assert!(app.local_shortcut_key(app.popup,b'C' as u16,false,true,false));assert_ne!(app.settings.compact_recent,compact_before);
+        assert!(app.local_shortcut_key(app.popup,b'C' as u16,false,true,false));assert_eq!(app.settings.compact_recent,compact_before);
         app.reply_service=Some(crate::replies::Service::fixture(&rows[0].id,"Latest visible model reply for this chat."));
         let reply_area=vec![Area{hit:Hit::Recent(rows[0].id.clone()),r:rect(20.,60.,300.,40.)}];
         app.sync_tips(app.popup,&reply_area,1.);
-        let reply_tip=app.tips.iter().find(|tip|tip.owner==app.popup).unwrap();
-        let text=String::from_utf16_lossy(&reply_tip.entries[0].1);
-        assert!(text.contains("Latest visible model reply for this chat."));
-        assert!(!text.contains(&rows[0].prompt));
+        assert!(app.tips.iter().find(|tip|tip.owner==app.popup).is_none_or(|tip|tip.entries.is_empty()));
+        capture_render(&app,620,260,&paths.runtime.join("rust-chat-hover-card-verification.png"),||{assert_eq!(app.draw_hover_card(&rows[0].id,0.),0.);Vec::new()})?;
+        app.reply_service=Some(crate::replies::Service::fixture(&rows[0].id,"**Resource comparison** for `TI60F256`:\n\n| Input | Mode | XLR | Reduction |\n| --- | --- | ---: | ---: |\n| 640x512 | SR only | 8,654 | 20.7% |\n| 384x288 | SR only | 6,737 | 34.6% |"));
+        capture_render(&app,620,260,&paths.runtime.join("rust-chat-hover-markdown-verification.png"),||{app.draw_hover_card(&rows[0].id,0.);Vec::new()})?;
+        app.reply_service=Some(crate::replies::Service::fixture(&rows[0].id,&"Long reply line with content.\n".repeat(50)));
+        capture_render(&app,620,260,&paths.runtime.join("rust-chat-hover-card-scroll-verification.png"),||{assert!(app.draw_hover_card(&rows[0].id,0.)>0.);Vec::new()})?;
         app.reply_service=None;
-        let tip_areas: Vec<_> = [Hit::Title, Hit::Body, Hit::Refresh, Hit::Auto]
+        let tip_areas: Vec<_> = [Hit::Title, Hit::Body, Hit::Compact, Hit::Refresh, Hit::Auto]
             .into_iter()
             .enumerate()
             .map(|(i, hit)| Area {
@@ -4580,6 +5048,7 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             })
             .collect();
         app.sync_tips(app.popup, &tip_areas, 1.);
+        let tip_entries=&app.tips.iter().find(|t|t.owner==app.popup).unwrap().entries;assert!(tip_entries.iter().any(|(_,text)|String::from_utf16_lossy(text).contains(&app.settings.body_shortcut.label())));assert!(tip_entries.iter().any(|(_,text)|String::from_utf16_lossy(text).contains(&app.settings.compact_shortcut.label())));
         let tip_window = app
             .tips
             .iter()
@@ -4693,7 +5162,8 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert_eq!(update_width,w+29,"An update adds only one compact icon slot");
         let update_hits=capture(&app,None,update_width,34,&paths.runtime.join("rust-update-available-verification.png"))?;
         let update_area=update_hits.iter().find(|area|matches!(&area.hit,Hit::UpdateAvailable(text) if text.contains("99.1.0"))).expect("A discovered update must have a clickable icon");
-        assert!(update_area.r.right<=update_hits.iter().find(|area|area.hit==Hit::Details).unwrap().r.left);
+        assert!(update_area.r.right<=update_hits.iter().find(|area|area.hit==Hit::Preferences).unwrap().r.left);
+        assert!(!update_hits.iter().any(|area|area.hit==Hit::Details), "the bar must not expose the removed details dropdown");
         app.hover=Some(update_area.hit.clone());
         capture(&app,None,update_width,34,&paths.runtime.join("rust-update-available-hover-verification.png"))?;
         app.hover=None;
@@ -4739,10 +5209,12 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         app.sync_tips(app.bar, &updated_hits, 1.);
         assert_eq!(app.tips.iter().find(|t| t.owner == app.bar).unwrap().window, tip_window, "Telemetry must not recreate tooltips");
         state.lock().unwrap().quota[0].banked_reset = None;
+        state.lock().unwrap().quota[0].banked_available = Some(0);
         assert!(app.measure_bar() < w as i32);
         let no_banked_hits = capture(&app, None, app.measure_bar() as u32, 34, &paths.runtime.join("rust-bar-no-banked-verification.png"))?;
         assert!(!no_banked_hits.iter().any(|area| matches!(&area.hit, Hit::Info(text) if text.contains("Banked reset"))));
         state.lock().unwrap().quota[0].banked_reset = Some(now() + 8300.);
+        state.lock().unwrap().quota[0].banked_available = Some(3);
         let saved_notice=state.lock().unwrap().reset_notice.clone();
         let fixture_notice=crate::reset_notice::View{
             checked_at:now(),source:crate::reset_notice::Source::Divin,
@@ -4751,6 +5223,10 @@ pub fn self_test(paths: &Paths) -> Result<()> {
                 posts:vec![crate::reset_notice::Post{author:"Tibo (example)".into(),original:"A reset is scheduled before the published deadline.".into(),
                     translation:"示例：额度将在公布的截止时间前重置。".into(),url:"https://x.com/thsottiaux/status/123456789".into(),..Default::default()}],..Default::default()}),
             history:vec![crate::reset_notice::Notice{id:"previous-fixture".into(),announced_at:now()-86400.,summary:"Previous reset example".into(),completed:true,..Default::default()}],..Default::default()};
+        state.lock().unwrap().reset_notice=Arc::new(fixture_notice.clone());
+        {let mut shared=state.lock().unwrap();let notice=Arc::make_mut(&mut shared.reset_notice);notice.events=(0..8).map(|i|crate::reset_notice::DynamicEvent{id:i.to_string(),kind:if i==0{"banked"}else{"regular"}.into(),at:now()-i as f64*3600.,author:"Tibo".into(),text:format!("Announcement {i}"),translation:format!("示例动态 {i}"),observed:false}).collect();}
+        capture_render(&app,560,470,&paths.runtime.join("rust-reset-card-verification.png"),||{assert!(app.draw_reset_hover(0.)>0.);Vec::new()})?;
+        capture_render(&app,560,470,&paths.runtime.join("rust-reset-card-scrolled-verification.png"),||{assert!(app.draw_reset_hover(108.)>0.);Vec::new()})?;
         state.lock().unwrap().reset_notice=Arc::new(fixture_notice.clone());
         let notice_width=app.measure_bar() as u32;
         let notice_hits=capture(&app,None,notice_width,34,&paths.runtime.join("rust-reset-notice-verification.png"))?;
@@ -5102,6 +5578,15 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         app.recent_shortcut();
         assert!(!app.hidden);
         assert_eq!(app.popup_kind, Some(Popup::Recent));
+        let list_hits = capture(&app, Some(Popup::Recent), 1276, (RECENT_FRAME + 10 * RECENT_ROW) as u32, &paths.runtime.join("rust-recent-manager-entry-verification.png"))?;
+        assert!(list_hits.iter().any(|a| a.hit == Hit::RepairPanel && a.contains(1250., 23.)), "manager entry must be in the top right");
+        app.popup_hits=list_hits;
+        assert_eq!(app.fixed_hit_at(1250.,23.),Some(Hit::RepairPanel),"manager entry must be clickable");
+        app.popup_size[0]=1276;assert_eq!(app.fixed_hit_at(1250.,23.),Some(Hit::RepairPanel));
+        let clicked=app.fixed_hit_at(1250.,23.).unwrap();app.hit(clicked);
+        assert_eq!(app.popup_kind, Some(Popup::Repair));
+        app.hit(Hit::BackPreferences);
+        assert_eq!(app.popup_kind, Some(Popup::Recent));
         app.recent_shortcut();
         assert!(app.popup_kind.is_none());
         assert!(app.hit(Hit::Preferences).is_none());
@@ -5144,6 +5629,27 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         assert_eq!(app.settings.recent_shortcut, Shortcut::default());
         let preferences_hits = capture(&app, Some(Popup::Preferences), 560, PREFERENCES_HEIGHT as u32,
             &paths.runtime.join("rust-preferences-verification.png"))?;
+        let normal_preferences = image::open(paths.runtime.join("rust-preferences-verification.png"))?.to_rgb8();
+        for index in 0..2 {
+            let hit = Hit::LocalShortcut(index);
+            let bounds = preferences_hits.iter().find(|a| a.hit == hit).expect("shortcut hit area").r;
+            app.hover = Some(hit);
+            let path = paths.runtime.join(format!("rust-local-shortcut-{index}-hover-verification.png"));
+            capture(&app, Some(Popup::Preferences), 560, PREFERENCES_HEIGHT as u32, &path)?;
+            let hovered = image::open(path)?.to_rgb8();
+            let mut foreground = 0; let mut preserved = 0;
+            for y in bounds.top as u32+3..bounds.bottom as u32-3 {
+                for x in bounds.left as u32+5..bounds.right as u32-5 {
+                    let before = normal_preferences.get_pixel(x,y).0;
+                    if before.iter().all(|channel| *channel > 180) {
+                        foreground += 1;
+                        if hovered.get_pixel(x,y).0.iter().all(|channel| *channel > 180) { preserved += 1; }
+                    }
+                }
+            }
+            assert!(foreground > 5 && preserved * 100 >= foreground * 90, "shortcut {index} hover obscured its text");
+        }
+        app.hover = None;
         assert!(preferences_hits.iter().any(|a| a.hit == Hit::Guard));
         assert!(preferences_hits.iter().any(|a|a.hit==Hit::ResetNoticeEnabled));
         assert!(preferences_hits.iter().any(|a|a.hit==Hit::CapacityRetryEnabled));
@@ -5288,6 +5794,88 @@ pub fn self_test(paths: &Paths) -> Result<()> {
         verify_refresh_preferences(&mut app,paths)?;
         verify_chat_menu_and_language(&mut app,paths)?;
         verify_guard_preferences(&mut app,paths)?;
+        {
+            let mut v=app.repair_service.view.lock().unwrap();
+            v.rows=vec![crate::repair::Entry{id:"fixture-healthy".into(),title:"本地压缩会话".into(),compressed:true,bytes:300*1048576,note:"compressed".into(),..Default::default()},crate::repair::Entry{id:"fixture-repair".into(),title:"读取模式兼容性修复".into(),bytes:150*1048576,issue:true,repairable:true,note:"legacy_index_ready".into(),..Default::default()},crate::repair::Entry{id:"fixture-reduce".into(),title:"可压缩会话".into(),bytes:120*1048576,note:"local".into(),..Default::default()}];v.done=3;v.total=3;
+        }
+        app.popup(Popup::Repair)?;
+        {let mut view=app.repair_service.view.lock().unwrap();for row in &mut view.rows{row.tags_known=true;row.project_assigned=row.id!="fixture-reduce";}}
+        app.repair_filter=4;assert_eq!(app.repair_rows().iter().map(|r|r.id.as_str()).collect::<Vec<_>>(),vec!["fixture-reduce"]);app.repair_filter=0;
+        let repair_hits=capture(&app,Some(Popup::Repair),1190,700,&paths.runtime.join("rust-session-repair-verification.png"))?;
+        let badge_hits:Vec<_>=repair_hits.iter().filter(|a|matches!(&a.hit,Hit::Info(text) if text=="Session file is compressed" || text=="会话文件已压缩")).collect();
+        assert_eq!(badge_hits.len(),1,"only compressed sessions should have the compressed badge");
+        let compressed_slot=app.repair_rows().iter().position(|r|r.id=="fixture-healthy").unwrap();
+        assert!(badge_hits[0].contains(250.,MANAGER_TOP+compressed_slot as f32*MANAGER_ROW+20.),"compressed badge must belong to the compressed row");
+        assert!(repair_hits.iter().any(|a|matches!(&a.hit,Hit::ManagerRow(id) if id=="fixture-reduce")));
+        app.reply_service=Some(crate::replies::Service::fixture("fixture-reduce","**Latest reply** with a table.\n\n| Item | Size |\n| --- | --- |\n| Output | 20 MiB |"));
+        capture_render(&app,620,260,&paths.runtime.join("rust-manager-hover-card-verification.png"),||{app.draw_hover_card("fixture-reduce",0.);Vec::new()})?;
+        app.reply_service=None;
+        assert!(repair_hits.iter().any(|a|a.hit==Hit::ManagerSelectAll));
+        assert!(repair_hits.iter().any(|a|matches!(&a.hit,Hit::RepairOne(id) if id=="fixture-repair")));
+        assert!(repair_hits.iter().any(|a|matches!(&a.hit,Hit::ManagerSelect(id) if id=="fixture-reduce")));
+        assert!(repair_hits.iter().any(|a|matches!(&a.hit,Hit::ReduceOne(id) if id=="fixture-reduce")));
+        assert!(repair_hits.iter().any(|a|matches!(&a.hit,Hit::DecompressOne(id) if id=="fixture-healthy")));
+        assert!(!repair_hits.iter().any(|a|matches!(&a.hit,Hit::ReduceOne(id) if id=="fixture-healthy")));
+        assert!(repair_hits.iter().any(|a|matches!(&a.hit,Hit::AnalyzeOne(id) if id=="fixture-reduce")));
+        app.manager_query="压缩".into();assert_eq!(app.repair_rows().len(),2);app.hit(Hit::ManagerSelectAll);assert_eq!(app.manager_selected.len(),2);app.scroll=2;app.hit(Hit::ManagerClearSearch);assert!(app.manager_query.is_empty());assert_eq!(app.scroll,0);assert_eq!(app.repair_rows().len(),3);assert_eq!(app.manager_selected.len(),2);
+        app.hit(Hit::ManagerBatch(6));assert_eq!(app.manager_delete_ids.len(),2);assert!(!app.manager_delete_edit.is_invalid());assert!(!app.manager_delete_force);app.hit(Hit::ManagerForceToggle);assert!(app.manager_delete_force);app.hit(Hit::ManagerForceToggle);let _=SetWindowTextW(app.manager_delete_edit,w!("no"));app.hit(Hit::ManagerDeleteConfirm);assert_eq!(app.manager_delete_ids.len(),2);
+        let _=SetWindowTextW(app.manager_delete_edit,w!("yes"));let delete_hits=capture(&app,Some(Popup::Repair),1190,700,&paths.runtime.join("rust-session-manager-delete-confirm-verification.png"))?;assert!(delete_hits.iter().any(|a|a.hit==Hit::ManagerDeleteConfirm));assert!(delete_hits.iter().any(|a|a.hit==Hit::ManagerForceToggle));app.hit(Hit::ManagerDeleteConfirm);assert!(app.manager_delete_ids.is_empty());assert_eq!(app.repair_service.view.lock().unwrap().rows.len(),3);app.manager_selected.clear();
+        {let mut view=app.repair_service.view.lock().unwrap();view.rows.iter_mut().find(|r|r.id=="fixture-reduce").unwrap().analysis=Some(crate::clean::Analysis{rollout_changes:3,rollout_diff_bytes:100,rollout_candidates:1,rollout_candidate_bytes:40,projection_changes:3,projection_diff_bytes:100,projection_candidates:1,projection_candidate_bytes:40,rollout_record_types:std::collections::BTreeMap::from([("event_msg/item_completed/FileChange".into(),(1,300)),("response_item/reasoning".into(),(1,400)),("response_item/message".into(),(1,200)),("response_item/function_call_output".into(),(1,300))]),..Default::default()});}
+        let analyzed=capture(&app,Some(Popup::Repair),1190,700,&paths.runtime.join("rust-session-diff-analysis-verification.png"))?;
+        assert!(analyzed.iter().any(|a|matches!(&a.hit,Hit::Breakdown(id) if id=="fixture-reduce")));
+        assert!(analyzed.iter().any(|a|matches!(&a.hit,Hit::CleanOne(id) if id=="fixture-reduce")));
+        {let mut view=app.repair_service.view.lock().unwrap();view.rows.iter_mut().find(|r|r.id=="fixture-healthy").unwrap().analysis=Some(crate::clean::Analysis::default());}
+        let compressed_hits=capture(&app,Some(Popup::Repair),1190,700,&paths.runtime.join("rust-session-compressed-clean-verification.png"))?;
+        assert!(!compressed_hits.iter().any(|a|matches!(&a.hit,Hit::CleanOne(id) if id=="fixture-healthy")));
+        assert!(compressed_hits.iter().any(|a|matches!(&a.hit,Hit::Info(reason) if reason.contains("压缩会话")||reason.contains("compressed sessions"))));
+        assert!(!app.clean_modes.contains_key("fixture-reduce"));app.hit(Hit::CleanMenu("fixture-reduce".into()));assert_eq!(app.clean_menu.as_deref(),Some("fixture-reduce"));
+        let options=capture(&app,Some(Popup::Repair),1190,700,&paths.runtime.join("rust-session-clean-options-verification.png"))?;
+        assert!(options.iter().any(|a|matches!(&a.hit,Hit::CleanMode(id,false) if id=="fixture-reduce")));
+        assert!(options.iter().any(|a|matches!(&a.hit,Hit::CleanMode(id,true) if id=="fixture-reduce")));
+        app.hit(Hit::CleanMode("fixture-reduce".into(),true));assert_eq!(app.clean_modes.get("fixture-reduce"),Some(&true));assert!(app.clean_menu.is_none());
+        app.hover=Some(Hit::Breakdown("fixture-reduce".into()));let _=capture(&app,Some(Popup::Repair),1190,700,&paths.runtime.join("rust-session-breakdown-hover-verification.png"))?;app.hover=None;
+        {let mut view=app.repair_service.view.lock().unwrap();view.rows.iter_mut().find(|r|r.id=="fixture-reduce").unwrap().analysis=None;}
+        // The typed threshold must update row actions before the edit is committed.
+        let saved_kind=app.popup_kind;let saved_hits=app.popup_hits.clone();let saved_settings=app.settings.clone();let saved_paths=app.paths.clone();
+        let numeric_fixture=paths.runtime.join(format!("numeric-native-{}",std::process::id()));
+        anyhow::ensure!(numeric_fixture.starts_with(&paths.runtime),"Invalid numeric fixture");std::fs::create_dir_all(&numeric_fixture)?;
+        app.paths.app=numeric_fixture.clone();app.paths.runtime=numeric_fixture.clone();app.popup_kind=Some(Popup::Repair);app.popup_hits=repair_hits.clone();
+        app.begin_numeric(NumericTarget::ReduceThreshold)?;
+        let _=SetWindowTextW(app.numeric_edit,w!("200"));app.preview_numeric();
+        assert_eq!(app.settings.reduce_threshold_mib,200);
+        let filtered=capture(&app,Some(Popup::Repair),1190,700,&paths.runtime.join("rust-numeric-threshold-verification.png"))?;
+        assert!(!filtered.iter().any(|a|matches!(&a.hit,Hit::ReduceOne(id) if id=="fixture-reduce")));
+        app.testing=false;app.finish_numeric(true);app.testing=true;
+        let saved:Settings=serde_json::from_value(crate::read_json(&numeric_fixture.join("settings.json"),16384))?;
+        assert_eq!(saved.reduce_threshold_mib,200);
+        assert!(parse_numeric("9",10,102400).is_err());assert!(parse_numeric("abc",10,102400).is_err());
+        app.settings=saved_settings;app.paths=saved_paths;app.popup_kind=saved_kind;app.popup_hits=saved_hits;
+        let threshold=app.settings.reduce_threshold_mib;app.hit(Hit::ReduceThreshold(10));assert_eq!(app.settings.reduce_threshold_mib,threshold+10);app.settings.reduce_threshold_mib=threshold;
+        let candidates=vec![crate::repair::Entry{id:"boundary".into(),bytes:100*1048576,..Default::default()},crate::repair::Entry{id:"large".into(),bytes:101*1048576,..Default::default()},crate::repair::Entry{id:"compressed".into(),bytes:200*1048576,compressed:true,..Default::default()}];
+        assert_eq!(batch_reduce_ids(&candidates,100),HashSet::from(["large".to_string()]));
+        {let mut v=app.repair_service.view.lock().unwrap();v.busy=true;v.compressing=true;v.current_id="fixture-reduce".into();v.current_title="可压缩会话".into();v.phase=Some(crate::reduce::Phase::Compressing);v.phase_done=64*1048576;v.phase_total=256*1048576;v.source_total=256*1048576;v.encoded_total=0;v.done=0;v.total=1;}
+        let processing=capture(&app,Some(Popup::Repair),1190,700,&paths.runtime.join("rust-session-compress-progress-verification.png"))?;
+        assert!(!processing.iter().any(|a|matches!(&a.hit,Hit::ReduceOne(_)|Hit::ReduceAll|Hit::ReduceThreshold(_)|Hit::RepairScan|Hit::RepairAll)));
+        {let mut v=app.repair_service.view.lock().unwrap();v.busy=false;v.compressing=false;v.current_id.clear();v.current_title.clear();v.phase=None;v.done=3;v.total=3;}
+        app.repair_filter=3;assert_eq!(app.repair_rows().len(),1);app.repair_filter=0;
+        app.repair_sort=1;app.repair_ascending=false;assert_eq!(app.repair_rows()[0].id,"fixture-healthy");
+        app.hit(Hit::RepairSort(1));assert!(app.repair_ascending);assert_eq!(app.repair_rows()[0].id,"fixture-reduce");
+        app.hit(Hit::RepairSort(0));assert!(!app.repair_ascending);app.repair_sort=0;
+        app.repair_activity.insert("fixture-repair".into());
+        app.repair_activity.insert("fixture-reduce".into());
+        let active_hits=capture(&app,Some(Popup::Repair),1190,700,&paths.runtime.join("rust-session-reduce-active-verification.png"))?;
+        assert!(app.repair_rows().iter().any(|r|r.id=="fixture-repair"&&r.note=="running"));
+        assert!(!active_hits.iter().any(|a|matches!(&a.hit,Hit::ReduceOne(id)|Hit::RepairOne(id) if id=="fixture-repair")));
+        assert!(!active_hits.iter().any(|a|matches!(&a.hit,Hit::ReduceOne(id) if id=="fixture-reduce")));
+        let active_live=crate::Shared{recent:std::sync::Arc::new(crate::data::Recent{busy_metrics:vec![crate::data::Row{id:"fixture-repair".into(),state:"Busy".into(),..Default::default()}],..Default::default()}),..Default::default()};
+        assert!(active_repair_ids(&active_live).contains("fixture-repair"));
+        app.repair_activity.clear();
+        let saved_recent=app.state.lock().unwrap().recent.clone();
+        app.state.lock().unwrap().recent=std::sync::Arc::new(crate::data::Recent{rows:vec![crate::data::Row{id:"fixture-reduce".into(),state:"Done".into(),..Default::default()}],..Default::default()});
+        app.repair_service.view.lock().unwrap().rows.iter_mut().find(|r|r.id=="fixture-reduce").unwrap().note="running".into();
+        assert!(app.repair_rows().iter().any(|r|r.id=="fixture-reduce"&&r.note=="local"));
+        app.repair_service.view.lock().unwrap().rows.iter_mut().find(|r|r.id=="fixture-reduce").unwrap().note="local".into();
+        app.state.lock().unwrap().recent=saved_recent;
         let _ = app.hit(Hit::Hide);
         assert!(app.hidden);
         app.hidden = false;
@@ -5311,3 +5899,15 @@ include!("recent.rs");
 include!("context_menu.rs");
 
 include!("guard_preferences.rs");
+
+#[cfg(test)]
+mod standalone_lifecycle_tests {
+ use super::{host_presentation,HostPresentation};
+ #[test] fn absent_host_stays_visible_and_minimized_host_stays_hidden(){
+  assert_eq!(host_presentation(false,false,false),HostPresentation::Standalone);
+  assert_eq!(host_presentation(false,true,false),HostPresentation::HostHidden);
+  assert_eq!(host_presentation(false,true,true),HostPresentation::Docked);
+  assert_eq!(host_presentation(true,false,false),HostPresentation::HiddenByUser);
+  assert_eq!(host_presentation(true,true,true),HostPresentation::HiddenByUser);
+ }
+}

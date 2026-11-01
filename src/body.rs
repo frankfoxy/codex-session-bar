@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{BufRead, BufReader, Seek, SeekFrom},
     os::windows::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
@@ -24,6 +24,7 @@ const MAX_MESSAGE: usize = 4 * 1024 * 1024;
 pub struct Status {
     pub generation: u64,
     pub complete: bool,
+    pub query_ready: bool,
     pub indexed: usize,
     pub available: usize,
     pub total: usize,
@@ -78,7 +79,7 @@ impl Service {
                 let mut request = match receiver.recv_timeout(Duration::from_millis(100)) {
                     Ok(v) => v,
                     Err(mpsc::RecvTimeoutError::Timeout)=>{
-                        if idle_since.elapsed()>=Duration::from_secs(30){index.take();sql_interrupt.lock().unwrap().clear();}
+                        if idle_since.elapsed()>=Duration::from_secs(30){if let Some(index)=index.take(){let _=index.db.execute_batch("PRAGMA wal_checkpoint(PASSIVE); PRAGMA shrink_memory");}sql_interrupt.lock().unwrap().clear();}
                         continue;
                     },
                     Err(_) => break,
@@ -107,6 +108,12 @@ impl Service {
                         index = Some(opened);
                     }
                     let index = index.as_mut().unwrap();
+                    // Return warm-index matches immediately while incremental
+                    // source checks continue in the same cancellable worker.
+                    if !request.query.trim().is_empty() {
+                        (state.hits,state.previews)=index.query(&request.query,request.exact,&request.ids,&control)?;
+                        state.query_ready=true;publish(&output,&state,&control);
+                    }
                     let history = History::open(&paths)?;
                     let mut interrupts = vec![index.db.get_interrupt_handle()];
                     if let Some(history) = &history {
@@ -138,20 +145,24 @@ impl Service {
                     }
                     for (id, path) in sources {
                         control.check()?;
-                        index.update(&id, &path, &control, &mut state, &output)?;
-                        state.indexed += 1;
+                        match index.update(&id, &path, &control, &mut state, &output) {
+                            Ok(()) => state.indexed += 1,
+                            Err(e) => {
+                                control.check()?;
+                                // Never return partial results from a failed stream.
+                                index.db.execute("DELETE FROM messages WHERE chat=?", [&id])?;
+                                index.db.execute("DELETE FROM sources WHERE id=?", [&id])?;
+                                if state.error.is_empty() { state.error = format!("Cannot index {id}: {e:#}"); }
+                            }
+                        }
                         publish(&output, &state, &control);
                     }
                     // An empty query prewarms the cache without matching every message.
                     if !request.query.trim().is_empty() {
-                        state.hits = index.search(&request.query, request.exact, &control)?;
+                        (state.hits,state.previews)=index.query(&request.query,request.exact,&request.ids,&control)?;
+                        state.query_ready=true;
                     }
                     state.hits.retain(|id| request.ids.contains(id));
-                    if !request.query.trim().is_empty() {
-                        state.previews =
-                            index.previews(&request.query, request.exact, &state.hits, &control)?;
-                    }
-                    index.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
                     Ok(())
                 })();
                 if control.cancelled() {
@@ -161,7 +172,6 @@ impl Service {
                 if let Err(e) = result {
                     state.error = format!("{e:#}");
                 }
-                if let Some(index)=index.as_ref(){let _=index.db.execute_batch("PRAGMA shrink_memory");}
                 idle_since=std::time::Instant::now();
                 publish(&output, &state, &control);
             }
@@ -268,8 +278,15 @@ fn sources(paths: &Paths, ids: &HashSet<String>) -> Result<Vec<(String, PathBuf)
     for row in rows {
         let (id, path) = row?;
         if ids.contains(&id) {
-            if let Some(path) = path.map(PathBuf::from).filter(|p| p.is_file()) {
-                result.push((id, path));
+            if let Some(path) = path.map(PathBuf::from) {
+                let mut compressed = path.as_os_str().to_os_string();
+                compressed.push(".zst");
+                let compressed = PathBuf::from(compressed);
+                if path.is_file() {
+                    result.push((id, path));
+                } else if compressed.is_file() {
+                    result.push((id, compressed));
+                }
             }
         }
     }
@@ -319,6 +336,15 @@ impl History {
     }
 }
 impl Index {
+    fn query(&self,query:&str,exact:bool,allowed:&HashSet<String>,control:&Control)->Result<(HashSet<String>,HashMap<String,String>)> {
+        let folded=query.trim().to_lowercase();let terms:Vec<&str>=if exact{vec![folded.as_str()]}else{folded.split_whitespace().collect()};
+        if terms.len()!=1 {let mut hits=self.search(query,exact,control)?;hits.retain(|id|allowed.contains(id));let previews=self.previews(query,exact,&hits,control)?;return Ok((hits,previews))}
+        let term=terms[0];if term.is_empty(){return Ok((HashSet::new(),HashMap::new()))}
+        let literal=term.chars().count()<3||term.contains(['%','_']);let sql=if literal{"SELECT chat,original,max(rowid) FROM messages WHERE instr(body,?)>0 GROUP BY chat"}else{"SELECT chat,original,max(rowid) FROM messages WHERE body LIKE ? GROUP BY chat"};
+        let pattern=if literal{term.to_string()}else{format!("%{term}%")};let mut stmt=self.db.prepare(sql)?;let mut rows=stmt.query([pattern])?;let mut hits=HashSet::new();let mut previews=HashMap::new();
+        while let Some(row)=rows.next()? {control.check()?;let id:String=row.get(0)?;if allowed.contains(&id){let text:String=row.get(1)?;previews.insert(id.clone(),preview(&text,term));hits.insert(id);}}
+        Ok((hits,previews))
+    }
     fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path)?;
         db.busy_timeout(Duration::from_millis(500))?;
@@ -483,6 +509,9 @@ impl Index {
         state: &mut Status,
         output: &Mutex<Status>,
     ) -> Result<()> {
+        if path.extension().is_some_and(|ext| ext == "zst") {
+            return self.update_compressed(id, path, control, state, output);
+        }
         let meta = fs::metadata(path)?;
         let size = meta.len();
         let identity = meta.creation_time();
@@ -596,6 +625,59 @@ impl Index {
         state.skipped += skipped;
         Ok(())
     }
+    fn update_compressed(&mut self, id: &str, path: &Path, control: &Control, state: &mut Status, output: &Mutex<Status>) -> Result<()> {
+        let meta = fs::metadata(path)?;
+        let size = meta.len();
+        let identity = meta.creation_time();
+        let modified = meta.modified()?.duration_since(UNIX_EPOCH)?.as_nanos() as i64;
+        let path_text = path.to_string_lossy();
+        let cached: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sources WHERE id=? AND path=? AND identity=? AND size=? AND modified=? AND offset=?)",
+            params![id, path_text.as_ref(), identity, size, modified, size], |r| r.get(0))?;
+        if cached { return Ok(()); }
+        // Compressed streams cannot be resumed by compressed-byte offset. Remove the
+        // old marker first so cancellation or a corrupt frame always forces a retry.
+        self.db.execute("DELETE FROM sources WHERE id=?", [id])?;
+        self.db.execute("DELETE FROM messages WHERE chat=?", [id])?;
+        self.db.execute("DELETE FROM history_items WHERE chat=?", [id])?;
+        self.db.execute("DELETE FROM history_sources WHERE id=?", [id])?;
+        let file = OpenOptions::new().read(true).custom_flags(0x08000000).open(path)?;
+        let decoder = zstd::stream::read::Decoder::new(file)?;
+        let mut reader = BufReader::with_capacity(64 * 1024, decoder);
+        let (mut offset, mut skipped, mut throttled) = (0u64, 0usize, 0u64);
+        loop {
+            control.check()?;
+            let start = offset;
+            let tx = self.db.transaction()?;
+            loop {
+                let (end, line, oversized) = next_message_line(&mut reader, offset, u64::MAX, control, state, &mut throttled)?;
+                if end == offset { break; }
+                skipped += usize::from(oversized);
+                if let Some(text) = line.as_deref().and_then(visible_text) {
+                    let mut at = 0;
+                    while at < text.len() {
+                        control.check()?;
+                        let mut end = (at + 16 * 1024).min(text.len());
+                        while !text.is_char_boundary(end) { end -= 1; }
+                        tx.execute("INSERT INTO messages(chat,body,original) VALUES(?,?,?)", params![id, text[at..end].to_lowercase(), &text[at..end]])?;
+                        if end == text.len() { break; }
+                        at = end - 1024;
+                        while !text.is_char_boundary(at) { at += 1; }
+                    }
+                }
+                offset = end;
+                if offset - start >= BATCH { break; }
+            }
+            tx.commit()?;
+            publish(output, state, control);
+            if offset == start { break; }
+        }
+        let after = fs::metadata(path)?;
+        anyhow::ensure!(after.len() == size && after.creation_time() == identity && after.modified()? == meta.modified()?, "Compressed session changed during indexing");
+        self.db.execute("INSERT OR REPLACE INTO sources VALUES(?,?,?,?,?,?,?)", params![id, path_text.as_ref(), identity, size, modified, size, skipped])?;
+        state.skipped += skipped;
+        Ok(())
+    }
     fn previews(
         &self,
         query: &str,
@@ -613,7 +695,7 @@ impl Index {
         if term.is_empty() || hits.is_empty() {
             return Ok(previews);
         }
-        let literal = term.contains(['%', '_']);
+        let literal = term.chars().count()<3 || term.contains(['%', '_']);
         // One indexed query, not one full-cache scan per matching chat. SQLite
         // associates original with the row selected by max(rowid) in each group.
         let sql = if literal {
@@ -650,7 +732,7 @@ impl Index {
             control.check()?;
             // LIKE uses the trigram index for >=3 characters. Short Chinese words
             // and literal wildcard symbols still work via the small text cache.
-            let literal = term.contains(['%', '_']);
+            let literal = term.chars().count()<3 || term.contains(['%', '_']);
             let mut stmt = self.db.prepare(if literal {
                 "SELECT DISTINCT chat FROM messages WHERE instr(body,?)>0"
             } else {
@@ -767,8 +849,8 @@ fn candidate(prefix: &[u8]) -> Option<bool> {
         None
     } // JSON field order is not fixed; preserve an unknown message prefix.
 }
-fn next_message_line(
-    reader: &mut BufReader<File>,
+fn next_message_line<R: std::io::Read>(
+    reader: &mut BufReader<R>,
     start: u64,
     limit: u64,
     control: &Control,
@@ -872,6 +954,7 @@ pub(crate) fn history_text(json: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use super::*;
     #[test]
     fn previews_keep_original_case_and_highlight_unicode_boundaries() {
@@ -976,6 +1059,54 @@ mod tests {
             "{}\n",
             serde_json::json!({"type":"response_item","payload":{"type":"message","role":role,"content":[{"type":"input_text","text":text}]}})
         )
+    }
+    #[test]
+    fn unified_query_matches_existing_search_for_unicode_and_literal_wildcards(){
+        let mut f=Fixture::new("unified-query");fs::write(&f.file,line("user","Camera 相机检测 100% Ready")).unwrap();f.update();
+        let ctl=Control{generation:&f.generation,expected:1,stop:&f.stop};let allowed=HashSet::from(["chat".to_string()]);
+        for q in ["camera","相机","相机检测","100%","CAMERA 相机"] {let mut expected=f.index.search(q,false,&ctl).unwrap();expected.retain(|id|allowed.contains(id));let (actual,previews)=f.index.query(q,false,&allowed,&ctl).unwrap();assert_eq!(actual,expected,"query {q}");assert!(actual.contains("chat"),"missing {q}");assert!(!previews["chat"].is_empty());}
+        let plan:String=f.index.db.query_row("EXPLAIN QUERY PLAN SELECT chat FROM messages WHERE body LIKE '%camera%'",[],|r|r.get(3)).unwrap();assert!(plan.contains("VIRTUAL TABLE INDEX"),"{plan}");
+    }
+    #[test]
+    fn compressed_session_is_searchable_cached_and_reindexed_after_change() {
+        let mut f = Fixture::new("compressed");
+        f.file.set_extension("jsonl.zst");
+        let bytes = zstd::stream::encode_all(line("user", "压缩会话 独特关键词").as_bytes(), 1).unwrap();
+        fs::write(&f.file, bytes).unwrap();
+        assert!(f.update().bytes_read > 0);
+        assert!(f.has("独特关键词", false));
+        assert_eq!(f.update().bytes_read, 0);
+        let bytes = zstd::stream::encode_all(line("user", "更新后的其他内容").as_bytes(), 1).unwrap();
+        fs::write(&f.file, bytes).unwrap();
+        f.update();
+        assert!(!f.has("独特关键词", false));
+        assert!(f.has("更新后", false));
+    }
+    #[test]
+    fn local_sources_include_compressed_rollouts_without_uncompressing() {
+        let f = Fixture::new("compressed-source");
+        let dir = f.file.parent().unwrap();
+        let db = Connection::open(dir.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT,rollout_path TEXT,archived INTEGER,agent_path TEXT)").unwrap();
+        db.execute("INSERT INTO threads VALUES('chat',?,0,NULL)", [f.file.to_string_lossy().as_ref()]).unwrap();
+        let compressed = PathBuf::from(format!("{}.zst", f.file.display()));
+        fs::write(&compressed, zstd::stream::encode_all(line("user", "example").as_bytes(), 1).unwrap()).unwrap();
+        let paths = Paths { home: dir.to_path_buf(), runtime: dir.to_path_buf(), app: dir.to_path_buf(), instance: String::new() };
+        let found = sources(&paths, &HashSet::from(["chat".to_string()])).unwrap();
+        assert_eq!(found, vec![("chat".to_string(), compressed)]);
+        assert!(!f.file.exists());
+    }
+    #[test]
+    fn broken_compressed_frame_is_not_cached_as_complete() {
+        let mut f = Fixture::new("compressed-broken");
+        f.file.set_extension("jsonl.zst");
+        let mut bytes = zstd::stream::encode_all(line("user", "compressed data").as_bytes(), 1).unwrap();
+        bytes.truncate(bytes.len() / 2);
+        fs::write(&f.file, bytes).unwrap();
+        let control = Control { generation: &f.generation, expected: 1, stop: &f.stop };
+        assert!(f.index.update("chat", &f.file, &control, &mut Status::default(), &Mutex::default()).is_err());
+        let markers: usize = f.index.db.query_row("SELECT count(*) FROM sources WHERE id='chat'", [], |r| r.get(0)).unwrap();
+        assert_eq!(markers, 0);
     }
     #[test]
     fn visible_only_chinese_literal_terms_and_incremental_append() {

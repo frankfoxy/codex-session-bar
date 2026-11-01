@@ -11,6 +11,7 @@ impl App {
                 p.line(x+10.,y+16.,x+20.,y+16.,MUTED,1.5);if delta>0{p.line(x+15.,y+11.,x+15.,y+21.,MUTED,1.5);}
             }
             let text=match field{0=>self.guard_limits.max_processes.to_string(),1=>format!("{} MiB",self.guard_limits.max_private_mib),_=>format!("{} s",self.guard_limits.interval_seconds)};
+            hits.push(Area{hit:Hit::Numeric(NumericTarget::Guard(field)),r:rect(width-128.,y+3.,74.,26.)});
             p.label(&text,rect(width-128.,y,81.,32.),11.,TEXT,false);
         }
         for (i,text) in ["After a trigger: 1s checks until 60s stable.","Alerts and recording cannot pause enforcement.","Only verified Codex read-only Git queries are ended."].iter().enumerate(){

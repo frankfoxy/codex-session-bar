@@ -162,6 +162,9 @@ impl Notice {
 }
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct DynamicEvent { pub id:String,pub kind:String,pub at:f64,pub author:String,pub text:String,pub translation:String,pub observed:bool }
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct View {
     pub source: Source,
     pub checked_at: f64,
@@ -170,6 +173,7 @@ pub struct View {
     pub error: String,
     pub current: Option<Notice>,
     pub history: Vec<Notice>,
+    pub events: Vec<DynamicEvent>,
 }
 impl View {
     pub fn badge(&self, at: f64, zh: bool) -> (Bell, String) {
@@ -550,7 +554,7 @@ fn keep_recent(mut notices: Vec<Notice>, current: Option<&Notice>) -> Vec<Notice
     notices.sort_by(|a, b| b.announced_at.total_cmp(&a.announced_at));
     let mut seen = HashSet::new();
     notices.retain(|notice| seen.insert((notice.id.clone(), notice.at.to_bits())));
-    notices.truncate(3);
+    notices.truncate(12);
     notices
 }
 pub(crate) fn parse_divin(bytes: &[u8], at: f64) -> Result<View> {
@@ -608,6 +612,7 @@ pub(crate) fn parse_divin(bytes: &[u8], at: f64) -> Result<View> {
         checked_at: at,
         error: String::new(),
         history: keep_recent(history, current.as_ref()),
+        events: Vec::new(),
         current,
         ..Default::default()
     })
@@ -645,11 +650,12 @@ fn enrich_codex(view: &mut View, bytes: &[u8]) -> Result<()> {
     }
     if let Some(events) = value["events"].as_array() {
         let mut history = view.history.clone();
+        let mut dynamic=Vec::new();
         for event in events.iter().take(100) {
-            if event["reset_type"] != "regular" {
-                continue;
-            }
             let observed = event["source"] == "observed";
+            let event_url=string(event,"tweet_url");
+            if observed || trusted(&event_url) {let at=timestamp(&event["announced_at"]).unwrap_or(0.);let text=string(event,"text");if at>0.&&!text.is_empty(){dynamic.push(DynamicEvent{id:string(event,"tweet_id"),kind:string(event,"reset_type"),at,author:if observed{"Codex Resets"}else{"Tibo (@thsottiaux)"}.into(),text,translation:string(event,"display_text"),observed});}}
+            if event["reset_type"] != "regular" {continue;}
             let url = string(event, "tweet_url");
             if !observed && !trusted(&url) {
                 continue;
@@ -682,6 +688,7 @@ fn enrich_codex(view: &mut View, bytes: &[u8]) -> Result<()> {
             });
         }
         view.history = keep_recent(history, view.current.as_ref());
+        dynamic.sort_by(|a,b|b.at.total_cmp(&a.at));dynamic.truncate(20);view.events=dynamic;
     }
     Ok(())
 }
@@ -785,6 +792,7 @@ fn copy_enrichment(next: &mut View, previous: &View) {
     }
     let mut history = next.history.clone();
     history.extend(previous.history.clone());
+    if next.events.is_empty(){next.events=previous.events.clone();}
     if let Some(old) = previous.current.as_ref().filter(|old| {
         next.current
             .as_ref()
@@ -946,7 +954,7 @@ impl Service {
     pub fn start(paths: &Paths, state: &State, stop: &Stop, mut settings: Settings) -> Self {
         settings.clamp();
         let mut initial: View =
-            serde_json::from_value(read_json(&paths.runtime.join(CACHE), 65536))
+            serde_json::from_value(read_json(&paths.runtime.join(CACHE), 262144))
                 .unwrap_or_default();
         if initial.source != settings.source || !settings.enabled {
             initial = View {
@@ -1271,6 +1279,10 @@ mod tests {
         }
     }
     #[test]
+    fn banked_events_are_preserved_as_announcements_without_becoming_forecasts(){
+        let status=json!({"data":{"scheduled_reset":null,"latest_reset":null}});let localized=json!({"events":[{"tweet_id":"123","tweet_url":"https://x.com/thsottiaux/status/123","reset_type":"banked","source":"webhook","announced_at":"2026-11-01T00:43:20Z","text":"Banked update","display_text":"额度动态"},{"tweet_id":"untrusted","tweet_url":"https://example.com/1","reset_type":"banked","source":"webhook","announced_at":"2026-11-01T00:40:00Z","text":"unknown"}]});let v=parse_codex(&serde_json::to_vec(&status).unwrap(),&serde_json::to_vec(&localized).unwrap(),at()).unwrap();assert_eq!(v.events.len(),1);assert_eq!(v.events[0].kind,"banked");assert!(!v.events[0].observed);assert_eq!(v.events[0].translation,"额度动态");assert!(v.current.is_none());assert!(v.history.is_empty());
+    }
+    #[test]
     fn history_is_bounded_and_legacy_settings_enable_the_default_source() {
         let mut events = vec![event()];
         for i in 2..9 {
@@ -1280,7 +1292,7 @@ mod tests {
             events.push(old);
         }
         let view = divin(events);
-        assert_eq!(view.history.len(), 3);
+        assert_eq!(view.history.len(), 7);
         assert!(view.history.iter().all(|notice| notice.id != "1"));
         let mut settings: Settings = serde_json::from_str("{}").unwrap();
         assert!(settings.enabled);

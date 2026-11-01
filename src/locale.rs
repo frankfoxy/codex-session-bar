@@ -17,6 +17,22 @@ pub fn translate(text:&str,zh:bool)->Cow<'_,str>{
     }
     if text.contains(" · ended "){return Cow::Owned(text.replace(" · ended "," · 已结束 "));}
     let translated=match text {
+        "Click to enter a value · Enter applies · Escape cancels"=>"点击输入数值 · 回车应用 · Esc 取消",
+        "Sort: recent use, disk space, total duration · click to change"=>"排序：最近使用、磁盘占用、总时长 · 点击切换",
+        "Session diagnostics and backed-up compatibility repair"=>"会话检查与备份修复",
+        "Session Manager · filter, clean and repair"=>"会话管理 · 筛选、清理和修复",
+        "Scan local session records without modifying conversations"=>"扫描本机会话记录，不修改会话",
+        "Filter session diagnostic results"=>"筛选会话检查结果",
+        "Sort diagnostic results · click again to reverse order"=>"按该列排序 · 再次点击切换升序或降序",
+        "Losslessly compress this idle session · verify before replacing the original"=>"无损压缩此空闲会话 · 校验成功后替换原文件",
+        "Decompress this inactive session · verify the restored content before removing the compressed copy"=>"无损解压此空闲会话 · 内容校验成功后移除压缩文件",
+        "Analyze generated-file diffs in this chat without modifying it"=>"只读分析此会话中生成文件的 diff，不修改任何数据",
+        "Clean this inactive chat after verified backup and preflight"=>"先备份并校验，再清理此空闲会话",
+        "Include command input and output in cleanup · default off"=>"清理时包含命令输入和输出，默认关闭",
+        "Losslessly compress all eligible sessions above the size threshold"=>"无损压缩超过阈值的会话 · 跳过正在使用或无法确认状态的会话",
+        "Adjust the minimum size for batch compression"=>"调整批量缩减的最小文件大小",
+        "Back up this session and apply the verified history-mode repair"=>"备份此会话并修复历史读取模式",
+        "Back up and repair all eligible sessions; skip unsupported problems"=>"备份并修复所有符合条件的会话，跳过无法自动处理的问题",
         "Settings"=>"设置","Refresh settings"=>"刷新设置","Recent chats"=>"最近会话","Session details"=>"会话详情",
         "Check for updates"=>"检查更新","Checking…"=>"正在检查…",
         "Reset announcements"=>"官方重置预告",

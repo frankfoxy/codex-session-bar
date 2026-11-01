@@ -69,6 +69,15 @@ impl ChatSearch {
             })
             .collect()
     }
+    pub fn highlight(&self,id:&str,title:&str,query:&str)->Vec<(usize,usize)> {
+        title_highlight(&self.entries,id,title,query)
+    }
+}
+
+fn title_highlight(entries:&HashMap<String,SearchText>,id:&str,title:&str,query:&str)->Vec<(usize,usize)> {
+        let Some(entry)=entries.get(id) else{return Vec::new()};let mut ranges=Vec::new();
+        for term in query.split_whitespace(){let literal=crate::body::match_ranges(title,term,true);if !literal.is_empty(){ranges.extend(literal);continue}let term=compact(&term.to_lowercase());if term.is_empty(){continue}if let Some((a,b))=phonetic_range(&entry.syllables,&term).or_else(||phonetic_range(&entry.initials,&term)){if let (Some(first),Some(last))=(entry.spans.get(a),entry.spans.get(b-1)){ranges.push((first.0,last.1));}}}
+        ranges.sort_unstable();let mut merged:Vec<(usize,usize)>=Vec::new();for (a,b) in ranges{if let Some(last)=merged.last_mut().filter(|v|a<=v.1){last.1=last.1.max(b)}else{merged.push((a,b));}}merged
 }
 
 struct SearchText {
@@ -77,6 +86,7 @@ struct SearchText {
     compact: String,
     syllables: Vec<Vec<String>>,
     initials: Vec<Vec<String>>,
+    spans: Vec<(usize,usize)>,
 }
 
 /// Shared name/pinyin matcher for tag names, cached independently of chat search.
@@ -93,6 +103,7 @@ impl LabelSearch {
         }
         self.entries.retain(|key,_|ids.contains(key));
     }
+    pub fn highlight(&self,key:&str,title:&str,query:&str)->Vec<(usize,usize)>{title_highlight(&self.entries,key,title,query)}
     pub fn matches(&self,key:&str,query:&str)->bool{
         let query=query.trim().to_lowercase();
         query.is_empty()||self.entries.get(key).is_some_and(|e|query.split_whitespace().all(|term|e.matches(term)))
@@ -107,7 +118,7 @@ mod label_tests {
         let mut index=LabelSearch::default();
         index.sync([("a","图像排查"),("b","IP-research"),("c","重庆采集")].into_iter());
         for query in ["排查","paicha","pc","TUXIANG pc"]{assert!(index.matches("a",query),"{query}");}
-        assert!(index.matches("b","ip"));assert!(index.matches("c","chongqing"));
+        assert!(index.matches("b","ip"));assert!(index.matches("c","chongqing"));let title="图像排查";for q in ["paicha","pc","排查"]{let ranges=index.highlight("a",title,q);assert_eq!(&title[ranges[0].0..ranges[0].1],"排查");}
         index.sync([("a","图像仿真")].into_iter());
         assert!(!index.matches("a","pc"));assert!(index.matches("a","fangzhen"));assert!(!index.matches("b","ip"));
     }
@@ -117,6 +128,7 @@ fn compact(text: &str) -> String {
 }
 impl SearchText {
     fn new(source: &str, title: &str) -> Self {
+        let mut spans=Vec::new();for (at,c) in title.char_indices(){for lower in c.to_lowercase(){if lower.is_alphanumeric(){spans.push((at,at+c.len_utf8()));}}}
         let title = title.trim().to_lowercase();
         let compact = compact(&title);
         let mut syllables = Vec::new();
@@ -143,6 +155,7 @@ impl SearchText {
             compact,
             syllables,
             initials,
+            spans,
         }
     }
     fn matches(&self, query: &str) -> bool {
@@ -155,6 +168,10 @@ impl SearchText {
                 || phonetic_match(&self.syllables, &query)
                 || phonetic_match(&self.initials, &query))
     }
+}
+fn phonetic_range(pieces:&[Vec<String>],query:&str)->Option<(usize,usize)> {
+    for start in 0..pieces.len(){let mut positions=vec![0usize];for (index,alternatives) in pieces.iter().enumerate().skip(start){let mut next=Vec::new();for at in positions {let remaining=&query[at..];for sound in alternatives {if sound.starts_with(remaining){return Some((start,index+1))}if remaining.starts_with(sound){let end=at+sound.len();if end==query.len(){return Some((start,index+1))}if !next.contains(&end){next.push(end);}}}}if next.is_empty(){break}positions=next;}}
+    None
 }
 
 // A small dynamic program handles every pronunciation without expanding an
@@ -239,6 +256,11 @@ mod tests {
         rows[0].label = "输出新报告".into();
         search.sync(&rows, &catalog);
         assert_eq!(search.filter(&rows, "shuchu", false), [0]);
+    }
+    #[test]
+    fn title_highlight_maps_literal_and_pinyin_to_original_unicode(){
+        let paths=crate::Paths::discover().unwrap();let catalog=Catalog::load(&paths).unwrap();let rows=vec![Row{id:"a".into(),label:"相机采集 SR".into(),..Default::default()}];let mut search=ChatSearch::default();search.sync(&rows,&catalog);let title=catalog.strip(&rows[0].label);
+        for (query,expected) in [("sr","SR"),("xiangji","相机"),("xjcj","相机采集"),("采集","采集")] {let range=search.highlight("a",title,query);assert!(!range.is_empty(),"{query}");assert_eq!(&title[range[0].0..range[0].1],expected);}
     }
     #[test]
     fn chinese_pinyin_initials_mixed_text_and_polyphones() {

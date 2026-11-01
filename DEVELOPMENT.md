@@ -1,5 +1,67 @@
 # Development and troubleshooting
 
+## Session Manager extension
+
+The settings extension starts an on-demand background scan; it does not add a timer.
+It lists active and archived local records, compressed rollout sizes, last-used time
+and accumulated turn duration. File presence is not a successful Codex open test;
+history-only and missing-source records are labeled explicitly. Guardian reviews
+remain excluded. Normal recent chats can also sort by disk size or duration.
+
+The supported automatic repair follows the previously verified compatibility fix:
+a legacy chat is eligible only when the projected byte offset equals the complete
+plain rollout size, turn records exist, and its latest turn is not running. It backs
+up the rollout as gzip and records the original mode/path in `repair-backups` beside
+the application. It rechecks the source and projection, then updates only that chat's
+`history_mode` from `legacy` to `paginated` with an optimistic row predicate. Source
+content is preserved. Missing source data without a verified backup is reported as
+unsupported rather than reconstructed. Batch repair reports each result separately.
+
+Explicit size reduction is lossless Zstandard compression; it never strips diffs,
+tool outputs or messages. A background worker accepts one idle rollout or an
+explicit batch above the saved MiB threshold. It requires a matching session ID,
+an unshared paginated local source, known idle status, an active Codex CLI advertising
+compressed-rollout support, and the existing Codex writer-coordination protocol.
+
+`--inspect-reduce-support` checks the active Codex executables without modifying sessions.
+The worker verifies a staged compressed stream and the published file using
+SHA-256; it rechecks the source under Codex's coordination lock before removing
+the plain file. Busy, changed, unknown, unsupported and already-compressed
+sessions are skipped. Codex can later materialize the `.jsonl` when resuming.
+Live busy state is shown in the list, disables the row action, and cancels ongoing
+staging or verification when a chat becomes active; the writer lock is still the
+final authority at publication.
+
+Compressed sessions carry a compressed badge and offer decompression in the same action
+column. Decompression verifies the session identity and complete content before
+atomically publishing the plain file; the compressed source is removed only after
+verification. An interrupted operation can leave two complete copies; a later
+decompression verifies that they match before removing the compressed copy. A
+session without a history projection requires a reliable activity check before decompression.
+
+The session repair view also offers a read-only diff analysis per chat. It scans
+plain or compressed rollouts and projected `fileChange` records, separately
+counting all file diffs and known waveform/log extensions. It reports logical
+text sizes rather than promising filesystem savings, groups diff bytes by file
+extension and rollout bytes by record type, and reports unclassified records
+over 8 MiB without buffering them.
+Analysis does not alter the session, its index, or project files. `--inspect-diff
+<id>` offers the same analysis without opening the UI. After analysis, Clean can
+replace supported generated-file diffs with placeholders; the optional command
+I/O cleanup is off by default. It retains a verified backup and coordinates the
+rollout and history index with the Codex writer lock. Interrupted publications
+are recovered on startup; conflicts retain the backup for manual recovery.
+Active, uncertain and compressed sessions are not eligible for cleanup.
+The compression panel shows a per-chat byte-work estimate across compression,
+verification and publication, alongside the current stage's measured bytes and
+percentage. Until the compressed size is known, the estimate assumes it equals
+the original size; it is not a time-remaining prediction. Batch status identifies
+the current chat and ordinal, and progress notifications are throttled.
+
+Compressed rollouts are recognized beside missing `.jsonl` paths and streamed into
+the cancellable body index. Unchanged compressed files reuse the cached index;
+invalid streams are not marked complete and cannot block indexing of other chats.
+
 The default runtime is the Rust executable in `bin/codex-session-bar.exe`.
 Only the Rust runtime is maintained. Launchers and the scheduled task do not
 start Python, Qt or a WebView. Status polling does not start an independent

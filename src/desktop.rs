@@ -22,6 +22,89 @@ pub enum Action {
     Icon(String, String),
     Refresh,
 }
+
+// A desktop list request can hang on a specific older chat. Keep the local
+// metadata list intact and temporarily reduce only the live status window.
+struct ListLimit {
+    limit: usize,
+    probe_at: Option<Instant>,
+}
+impl Default for ListLimit {
+    fn default() -> Self { Self { limit: 20, probe_at: None } }
+}
+impl ListLimit {
+    fn request(&self, now: Instant) -> usize {
+        if self.probe_at.is_some_and(|at| now >= at) { 20 } else { self.limit }
+    }
+    fn success(&mut self, requested: usize) {
+        if requested == 20 { *self = Self::default(); }
+    }
+    fn failed(&mut self, requested: usize, error: &str, now: Instant) {
+        if !error.contains("Desktop request timed out") { return; }
+        self.limit = match requested { 20.. => 10, 6..=19 => 5, 3..=5 => 2, _ => 1 };
+        self.probe_at = Some(now + Duration::from_secs(300));
+    }
+}
+
+// The recent sidebar snapshot is bounded; history mode provides all local
+// unarchived chat statuses through cursor pages. Never publish an incomplete
+// scan as fresh, because it could hide a running or capacity-failed chat.
+fn history_statuses(mut fetch:impl FnMut(Option<&str>,usize)->Result<Value>)->Result<Vec<Value>>{
+    let mut cursor:Option<String>=None;let mut seen=std::collections::HashSet::new();let mut rows=Vec::new();
+    loop {
+        let mut limit=20;
+        let page=loop{match fetch(cursor.as_deref(),limit){
+            Ok(page)=>break page,
+            Err(error) if format!("{error:#}").contains("Desktop request timed out") && limit>1=>{limit=match limit{20=>10,10=>5,5=>2,_=>1};},
+            Err(error)=>return Err(error.context("Could not read all local chat status pages")),
+        }};
+        let entries=page["threads"].as_array().context("Chat status page lacks threads")?;
+        anyhow::ensure!(entries.len()<=limit,"Chat status page exceeded its requested limit");
+        rows.extend(entries.iter().filter(|entry|entry["kind"]=="codex" && entry["hostId"]=="local").cloned());
+        match page.get("nextCursor"){
+            None|Some(Value::Null)=>break,
+            Some(Value::String(next)) if !next.is_empty()=>{
+                anyhow::ensure!(seen.insert(next.clone()) && seen.len()<=10000,"Chat status page cursor did not advance");cursor=Some(next.clone());
+            },
+            _=>bail!("Invalid chat status page cursor"),
+        }
+    }
+    Ok(rows)
+}
+fn merge_history(payload:&mut Value,history:Vec<Value>){
+    let mut positions:std::collections::HashMap<String,Vec<(&str,usize)>>=std::collections::HashMap::new();
+    for key in ["pinnedThreads","threads"] {
+        if let Some(rows)=payload[key].as_array(){for (index,row) in rows.iter().enumerate(){if let Some(id)=row["id"].as_str(){positions.entry(id.to_owned()).or_default().push((key,index));}}}
+    }
+    for entry in history {
+        let Some(id)=entry["id"].as_str() else{continue};
+        if let Some(matches)=positions.get(id) {
+            for (key,index) in matches {payload[*key][*index]["status"]=entry["status"].clone();}
+        } else if let Some(rows)=payload.get_mut("threads").and_then(Value::as_array_mut){
+            let key=id.to_owned();let index=rows.len();rows.push(entry);positions.insert(key,vec![("threads",index)]);
+        }
+    }
+}
+
+// Reuse recent snapshots for previously active chats; only query missing IDs.
+// Unavailable snapshots remain tracked and never authorize a continuation.
+fn priority_statuses(tracked:&mut Vec<String>,payload:&Value,mut fetch:impl FnMut(&str)->Result<Value>)->(Vec<Value>,bool){
+    let mut output=Vec::new();let mut finished=std::collections::HashSet::new();let mut incomplete=false;
+    for id in tracked.iter(){
+        let recent=["pinnedThreads","threads"].iter().flat_map(|key|payload[*key].as_array().into_iter().flatten()).find(|row|row["id"].as_str()==Some(id));
+        let status=if let Some(row)=recent {row["status"].as_str().map(str::to_owned)} else {
+            match fetch(id){Ok(value) if value["thread"]["id"].as_str()==Some(id)=>value["thread"]["status"]["type"].as_str().map(str::to_owned),_=>None}
+        };
+        if let Some(status)=status {
+            if !matches!(status.as_str(),"active"|"busy"|"running"|"inProgress"){finished.insert(id.clone());}
+            if recent.is_none(){output.push(json!({"kind":"codex","hostId":"local","id":id,"status":status}));}
+        } else {incomplete=true;}
+    }
+    tracked.retain(|id|!finished.contains(id));(output,incomplete)
+}
+fn merge_priority(payload:&mut Value,mut priority:Vec<Value>){
+    if let Some(rows)=payload.get_mut("threads").and_then(Value::as_array_mut){priority.append(rows);*rows=priority;}
+}
 pub struct Rpc {
     paths: Paths,
     stop: Stop,
@@ -328,9 +411,11 @@ impl Workers {
             let mut last_quota: Option<Instant> = None;
             let mut last_cache: Option<Instant> = None;
             let mut list_retry=crate::refresh::Retry::default();
+            let mut list_limit=ListLimit::default();
             let mut quota_retry=crate::refresh::Retry::default();
             let events=s.lock().unwrap().refresh_events.clone();let mut gate=crate::refresh::Gate::new();
             let mut capacity_fallback=crate::capacity_retry::NativeFallback::default();
+            let mut tracked:Vec<String>=s.lock().unwrap().recent.busy_metrics.iter().map(|row|row.id.clone()).collect();
             while !done.load(Ordering::Relaxed) {
                 let cfg=s.lock().unwrap().refresh_options.clone();
                 let forced=s.lock().unwrap().quota_at<0.;
@@ -346,19 +431,43 @@ impl Workers {
                 let ctx=context(&s.lock().unwrap());
                 if list_due {
                 gate.mark(events.generation());
-                match rpc.read_tool("list_threads",json!({"limit":50}),&ctx).and_then(|payload|store.recent(&payload)) {
-                    Ok(mut recent)=>{
+                let requested=list_limit.request(Instant::now());
+                match rpc.read_tool("list_threads",json!({"limit":requested}),&ctx).and_then(|mut payload|{
+                    let history=history_statuses(|cursor,limit|{
+                        let mut args=json!({"mode":"history","source":"codex","hostId":"local","limit":limit});
+                        if let Some(cursor)=cursor {args["cursor"]=json!(cursor);}
+                        rpc.read_tool("list_threads",args,&ctx)
+                    })?;
+                    merge_history(&mut payload,history);
+                    let mut next_tracked=tracked.clone();
+                    let (priority,priority_incomplete)=priority_statuses(&mut next_tracked,&payload,|id|rpc.read_tool("read_thread",json!({"threadId":id,"hostId":"local","turnLimit":1,"includeOutputs":false,"maxOutputCharsPerItem":64}),&ctx));
+                    merge_priority(&mut payload,priority);store.recent(&payload).map(|recent|(recent,priority_incomplete,next_tracked))
+                }) {
+                    Ok((mut recent,priority_incomplete,next_tracked))=>{
+                        list_limit.success(requested);
+                        tracked=next_tracked;
+                        if priority_incomplete {recent.error="Some live statuses are temporarily unavailable".into();}
                         let capacity_enabled=s.lock().unwrap().capacity_options.enabled;
                         capacity_fallback.resolve(&p,&mut recent,capacity_enabled,|id|rpc.read_tool("read_thread",json!({"threadId":id,"hostId":"local","turnLimit":1,"includeOutputs":false,"maxOutputCharsPerItem":256}),&ctx));
+                        for row in &recent.busy_metrics {if !tracked.contains(&row.id){tracked.push(row.id.clone());}}
                         list_retry.success();
-                        recent.carry_read_state(&s.lock().unwrap().recent);
+                        let mut live=s.lock().unwrap();
+                        recent.carry_read_state(&live.recent);
+                        recent.apply_opened(&mut live.opened_results);
                         if last_cache.is_none_or(|at| at.elapsed()>=Duration::from_secs(cfg.cache_secs)) {
                             p.write("recent-cache.json",&json!({"schema":1,"rows":recent.rows,"all_rows":recent.all_rows,"busy_count":recent.busy_count,"busy_metrics":recent.busy_metrics,"loaded_at":recent.loaded_at,"stale":false}));
                             last_cache=Some(Instant::now());
                         }
-                        s.lock().unwrap().recent=std::sync::Arc::new(recent);
+                        live.recent=std::sync::Arc::new(recent);
                     },
-                    Err(e)=>{list_retry.failed();let mut live=s.lock().unwrap();let recent=std::sync::Arc::make_mut(&mut live.recent);recent.stale=true;recent.error=format!("{e:#}");}
+                    Err(e)=>{let error=format!("{e:#}");list_limit.failed(requested,&error,Instant::now());list_retry.failed();
+                        // Without the desktop window, retain a useful current local
+                        // list from SQLite. It remains explicitly stale: local
+                        // metadata cannot prove that no Codex writer is active.
+                        let host=s.lock().unwrap().host;let offline=unsafe{crate::host::bounds(host).is_none()};
+                        let local=if offline{store.recent(&json!({})).ok()}else{None};
+                        let mut live=s.lock().unwrap();if let Some(mut local)=local{local.stale=true;local.error=error;local.carry_read_state(&live.recent);local.apply_opened(&mut live.opened_results);live.recent=std::sync::Arc::new(local);}else{let recent=std::sync::Arc::make_mut(&mut live.recent);recent.stale=true;recent.error=error;}
+                    }
                 }
                 }
                 if quota_due {
@@ -422,6 +531,10 @@ impl Workers {
                                 value["navigated"] == true,
                                 "Codex did not confirm navigation"
                             );
+                            let mut live=s.lock().unwrap();
+                            if let Some(at)=std::sync::Arc::make_mut(&mut live.recent).mark_opened(id) {
+                                live.opened_results.insert(id.clone(),at);
+                            }
                             Ok("Chat opened in Codex".into())
                         }
                         Action::Icon(ref id, ref icon) => {
@@ -568,8 +681,79 @@ pub fn default_context(paths: &Paths) -> String {
         .unwrap_or_default()
 }
 
+/// A missing local projection is not evidence of inactivity. Ask the live
+/// desktop and accept only an unloaded/idle thread with a terminal last turn.
+pub(crate) fn confirm_unloaded_terminal(paths:&Paths,id:&str,stop:&Stop)->Result<()> {
+    let mut rpc=Rpc::new(paths,stop.clone());let value=rpc.read_tool("read_thread",json!({"threadId":id,"hostId":"local","turnLimit":1,"includeOutputs":false,"maxOutputCharsPerItem":64}),&default_context(paths))?;
+    validate_unloaded_terminal(&value,id)
+}
+pub(crate) fn confirm_inactive_for_delete(paths:&Paths,id:&str,stop:&Stop)->Result<()> {
+    let mut rpc=Rpc::new(paths,stop.clone());let value=rpc.read_tool("read_thread",json!({"threadId":id,"hostId":"local","turnLimit":1,"includeOutputs":false,"maxOutputCharsPerItem":64}),&default_context(paths))?;
+    validate_inactive_for_delete(&value,id)
+}
+fn validate_inactive_for_delete(value:&Value,id:&str)->Result<()> {
+    if value.pointer("/thread/id").and_then(Value::as_str)==Some(id) && matches!(value.pointer("/thread/status/type").and_then(Value::as_str),Some("notLoaded"|"not_loaded"|"idle")) && value.get("turns").and_then(Value::as_array).is_some_and(|turns|turns.is_empty()){return Ok(())}
+    validate_unloaded_terminal(&value,id)
+}
+fn validate_unloaded_terminal(value:&Value,id:&str)->Result<()> {
+    anyhow::ensure!(value.pointer("/thread/id").and_then(Value::as_str)==Some(id),"Codex did not confirm the session identity");
+    let status=value.pointer("/thread/status/type").and_then(Value::as_str).unwrap_or("");
+    anyhow::ensure!(matches!(status,"notLoaded"|"not_loaded"|"idle"),"Codex cannot confirm the session is inactive");
+    let turn=value.pointer("/turns/0/status").and_then(Value::as_str).unwrap_or("");
+    anyhow::ensure!(matches!(turn,"completed"|"failed"|"interrupted"|"cancelled"|"canceled"),"Codex cannot confirm that the latest turn has finished");Ok(())
+}
+
 #[cfg(test)]mod tests {
     use super::*;
+    #[test]fn missing_projection_requires_confirmed_unloaded_terminal_turn(){
+        let mut value=json!({"thread":{"id":"a","status":{"type":"notLoaded"}},"turns":[{"status":"completed"}]});assert!(validate_unloaded_terminal(&value,"a").is_ok());assert!(validate_unloaded_terminal(&value,"b").is_err());value["thread"]["status"]["type"]=json!("active");assert!(validate_unloaded_terminal(&value,"a").is_err());value["thread"]["status"]["type"]=json!("notLoaded");value["turns"][0]["status"]=json!("inProgress");assert!(validate_unloaded_terminal(&value,"a").is_err());value["turns"]=json!([]);assert!(validate_unloaded_terminal(&value,"a").is_err());
+    }
+    #[test]fn deletion_accepts_empty_inactive_chat_but_refuses_active_or_wrong_identity(){let mut v=json!({"thread":{"id":"a","status":{"type":"notLoaded"}},"turns":[]});assert!(validate_inactive_for_delete(&v,"a").is_ok());assert!(validate_inactive_for_delete(&v,"b").is_err());v["thread"]["status"]["type"]=json!("active");assert!(validate_inactive_for_delete(&v,"a").is_err());}
+    #[test]fn timeout_reduces_only_status_window_and_periodically_retries_full_window(){
+        let now=Instant::now();let mut policy=ListLimit::default();assert_eq!(policy.request(now),20);
+        policy.failed(20,"Desktop request timed out",now);assert_eq!(policy.request(now),10);
+        policy.success(10);assert_eq!(policy.request(now+Duration::from_secs(299)),10);
+        assert_eq!(policy.request(now+Duration::from_secs(300)),20);
+        policy.failed(20,"Desktop request timed out",now+Duration::from_secs(300));assert_eq!(policy.request(now+Duration::from_secs(301)),10);
+        policy.failed(10,"Desktop request timed out",now);assert_eq!(policy.request(now),5);
+        policy.failed(5,"Desktop request timed out",now);assert_eq!(policy.request(now),2);
+        policy.failed(2,"Desktop request timed out",now);assert_eq!(policy.request(now),1);
+        policy.failed(1,"Desktop request timed out",now);assert_eq!(policy.request(now),1);
+        policy.success(20);assert_eq!(policy.request(now),20);
+        policy.failed(20,"permission denied",now);assert_eq!(policy.request(now),20);
+    }
+    #[test]fn history_pages_collect_all_statuses_and_preserve_sidebar_metadata(){
+        let mut calls=Vec::new();
+        let history=history_statuses(|cursor,limit|{calls.push((cursor.map(str::to_owned),limit));match cursor {
+            None=>Ok(json!({"threads":[{"kind":"codex","hostId":"local","id":"first","status":"active"}],"nextCursor":"next"})),
+            Some("next")=>Ok(json!({"threads":[{"kind":"codex","hostId":"local","id":"older","status":"active"}],"nextCursor":null})),
+            _=>panic!("unexpected cursor"),
+        }}).unwrap();
+        assert_eq!(calls,vec![(None,20),(Some("next".into()),20)]);assert_eq!(history.len(),2);
+        let mut recent=json!({"pinnedThreads":[],"threads":[{"id":"first","status":"idle","isUnread":true}]});
+        merge_history(&mut recent,history);assert_eq!(recent["threads"][0]["status"],"active");assert_eq!(recent["threads"][0]["isUnread"],true);assert_eq!(recent["threads"][1]["id"],"older");
+    }
+    #[test]fn history_reduces_timed_out_page_and_rejects_partial_or_looping_pages(){
+        let mut calls=Vec::new();let rows=history_statuses(|_,limit|{calls.push(limit);if limit==20{Err(anyhow::anyhow!("Desktop request timed out"))}else{Ok(json!({"threads":[],"nextCursor":null}))}}).unwrap();
+        assert!(rows.is_empty());assert_eq!(calls,vec![20,10]);
+        assert!(history_statuses(|_,_|Ok(json!({"threads":[],"nextCursor":"repeat"}))).is_err());
+        assert!(history_statuses(|cursor,_|if cursor.is_none(){Ok(json!({"threads":[],"nextCursor":"next"}))}else{Err(anyhow::anyhow!("connection closed"))}).is_err());
+    }
+    #[test]fn priority_snapshots_track_active_and_failed_chats_without_reusing_missing_status(){
+        let mut tracked=vec!["running".into(),"capacity".into(),"unavailable".into()];
+        let mut list=json!({"threads":[{"id":"running","status":"active"}]});
+        let (rows,incomplete)=priority_statuses(&mut tracked,&list,|id|{
+            assert_ne!(id,"running");
+            if id=="capacity"{Ok(json!({"thread":{"id":id,"status":{"type":"systemError"}}}))}else{Err(anyhow::anyhow!("timeout"))}
+        });
+        assert!(incomplete);assert_eq!(tracked,vec!["running","unavailable"]);
+        assert_eq!(rows.len(),1);assert_eq!(rows[0]["status"],"systemError");
+        merge_priority(&mut list,rows);assert_eq!(list["threads"][0]["id"],"capacity");assert_eq!(list["threads"][1]["id"],"running");
+        let (rows,incomplete)=priority_statuses(&mut tracked,&json!({"threads":[]}),|_|Err(anyhow::anyhow!("timeout")));
+        assert!(rows.is_empty()&&incomplete);assert_eq!(tracked,vec!["running","unavailable"]);
+        let (rows,incomplete)=priority_statuses(&mut tracked,&json!({"threads":[{"id":"running","status":"active"}]}),|id|Ok(json!({"thread":{"id":id,"status":{"type":"idle"}}})));
+        assert!(!incomplete);assert_eq!(rows.len(),1);assert_eq!(tracked,vec!["running"]);
+    }
     #[test]fn empty_startup_limits_are_retryable_until_real_data_arrives(){
         assert!(synced_quotas(&json!({"rateLimits":null})).is_err());
         assert!(synced_quotas(&json!({"rateLimitsByLimitId":{}})).is_err());

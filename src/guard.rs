@@ -1,6 +1,6 @@
 //! Integrated Codex Git protection, settings and status. No companion process.
 mod worker;
-mod collect;
+pub(crate) mod collect;
 mod attribution;
 mod archive;
 mod notice;

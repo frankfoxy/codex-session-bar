@@ -1,61 +1,58 @@
 # Codex Session Bar
 
-**用 Tag 整理 Codex 会话，给每个会话设置专属图标。**
+**用 Tag 管理 Codex 会话，给每个会话设置专属图标。**
 
-一个 Rust 原生 Windows 会话悬浮条，支持标签筛选、快速切换与实时状态查看，默认停靠在 Codex 标题栏中央。
+Windows 原生会话工具栏：在 Codex 标题栏查看状态、搜索和切换会话，也可以在 Codex 关闭后独立查看本地会话。
 
-**稳定版：[v0.3.10](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.3.10)** · 无需 Python 或 Qt
+**当前源码：v0.5.0** · [已发布版本下载](https://github.com/frankfoxy/codex-session-bar/releases) · 无需 Python 或 Qt
 
-## 用 Tag 管理会话
+![Codex Session Bar 悬浮条](assets/images/preview-bar.png)
 
-**把 Codex 原有的项目和分组，直接作为 Tag 使用。**
+## 主要功能
 
-- **项目名称 → Project Tag**：自动同步，使用蓝色标签。
-- **分组名称 → Group Tag**：自动同步，使用紫色标签。
-- **自定义 Tag**：为会话添加自己的标签与配色，例如“排查”“文档”“待验证”。
+- **Tag 管理**：自动把 Codex 的项目和分组作为只读标签，支持自定义标签、组合筛选，以及名称、拼音和拼音首字母搜索。
+- **会话图标**：为每个会话选择 Emoji，支持分类、全文搜索、随机选择和按标题推荐；图标会显示在 Codex 会话名称和工具栏中。
+- **搜索与切换**：按会话名称或正文搜索，匹配内容高亮；支持详细和紧凑列表、最近提问、会话预览和右键复制。
+- **状态一目了然**：显示运行状态、模型与推理强度、Token、速度和额度；新完成的会话使用蓝点标识。
+- **快捷操作与设置**：支持可配置快捷键、列表显示数量、列宽、刷新间隔和开机启动；界面语言跟随 Codex。
 
-项目、分组标签的名称跟随 Codex 同步，配色固定，在会话条中只读；自定义标签可自由管理。每个会话可以带多个 Tag，点选标签即可组合筛选，标签名称支持中文、英文、全拼和拼音首字母搜索。
+## 扩展功能
 
-左侧筛选面板默认收起，展开时会话列表保持原位；详细列表直接展示会话已有的标签，方便跨项目、跨分组查找。
+- **Session Manager**：搜索和筛选本地、归档、异常及孤立会话，查看磁盘占用、使用时长和记录构成，并支持多选分析、归档、修复或删除。
+- **清理与压缩**：分析会话记录后，可清理生成文件的 diff，并可选清理命令输入输出；也可单独或按阈值无损压缩、解压会话。
+- **容量不足自动继续**：可选开启；遇到模型容量不足时，在设定的延迟后向原会话追加继续消息，并提供计数与日志。
+- **重置公告**：可选择 Codex Resets 或 AI 哨兵作为第三方来源，查看明确的预告时间、近期动态以及公告原文和译文。
+- **自动更新**：定期检查 GitHub Release，有更新时显示提示；也可在设置中手动检查并查看结果。
 
-![项目、分组和自定义 Tag 筛选，以及带标签的详细会话列表](assets/images/preview-tags.png)
+清理与修复会保留备份；活动会话会跳过，删除需勾选并手动输入 `yes`。可用操作取决于会话状态和 Codex 的兼容性检查。
 
-## 给每个会话加一个图标
+## 重要界面截图
 
-**为每个会话设置容易辨认的 Emoji，让相似标题也能一眼区分。**
+**Tag 筛选与会话列表**
 
-点击会话列表中的图标即可修改，也可以点击悬浮条左端图标。支持完整 Emoji 图标库搜索、分类浏览、随机选择，以及根据会话标题推荐图标。
+![项目、分组、自定义 Tag 与会话列表](assets/images/preview-tags.png)
 
-图标会同步到 Codex 会话名称，并在悬浮条与会话列表中显示；选择图标后仍留在原列表，继续浏览或修改其他会话。
+![详细会话列表中的项目标签、最近提问与状态](assets/readme-session-list-project-tags.png)
 
-![会话图标选择：完整 Emoji 搜索、分类、随机与标题推荐](assets/images/preview-icons.png)
+**会话图标**
 
-## 还有这些实用功能
+![会话图标选择器](assets/images/preview-icons.png)
 
-- **快速找会话**：名称支持中文、英文和拼音搜索；可选正文搜索，显示并高亮匹配内容。
-- **两种列表模式**：详细模式展示最近提问、统计与标签；紧凑模式只保留一行。
-- **实时状态**：查看 Busy 会话数量、耗时、Token、生成速度和账户剩余额度；蓝点标记新完成、未查看的结果。
-- **快捷操作**：默认 `Ctrl + Alt + J` 打开会话列表，仅在 Codex 或会话条获得焦点时生效；右键可复制会话链接、Markdown 或工作目录。
-- **可配置**：齿轮中调整列表、快捷键与刷新策略；界面和提示跟随 Codex 的中文或英文设置。
-- **自动更新**：每半小时静默检查 GitHub 正式版，有更新时在悬浮条显示绿色更新图标；点击查看几条主要更新，再确认安装并重启，保留现有设置。设置中可手动检查并查看上次检查时间和结果。
-- **容量不足自动继续**：在设置 → 扩展中启用（默认关闭）；最新回合出现模型容量不足错误时，默认等待 5 秒，在原会话追加“继续上次任务”。延迟可调整，支持累计触发次数与日志查看；不指定新的模型或推理参数，跳过已恢复、已停止和旧错误。
-- **重置公告提醒**：默认使用 [Codex Resets](https://codex-resets.com/)，也可切换 [AI 哨兵](https://divin.cc/)，用独立开关启停。铃铛在预告前 3 小时内为橙色，来源报告复位后当天 3 小时内为绿色，其余灰色；新预告和新复位记录会发送桌面通知。悬停查看原文、译文和近期记录，点击返回来源网站。Banked Reset 用银行图标表示已有重置券的到期时间。
+**会话管理与重置公告**
 
-![详细模式下的会话名称、最近提问、统计和标签](assets/images/preview-chats.png)
+![Session Manager 会话管理](assets/images/preview-session-manager.png)
 
-![悬浮条中的会话状态、额度、重置券到期与重置预告](assets/images/preview-bar.png)
-
-![来源报告复位后的绿色铃铛，站点观测单独标注](assets/images/preview-reset-completed.png)
+![重置公告、近期动态与来源信息](assets/images/preview-reset-card.png)
 
 ## 快速开始
 
-1. 到 [v0.3.10 发布页](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.3.10) 下载 **codex-session-bar-0.3.10-windows-x64.zip**，解压到固定目录。
-2. 打开并登录 Codex Desktop，双击 **Launch.cmd**。
-3. 点击悬浮条的会话名称打开列表，点击标签按钮筛选，点击会话图标设置图标。
+1. 从 [GitHub Releases](https://github.com/frankfoxy/codex-session-bar/releases) 下载 Windows x64 压缩包并解压，运行 `Launch.cmd`。
+2. 点击工具栏中的会话名称打开列表；点击列表右上角齿轮进入 Session Manager。
+3. 在设置中配置快捷键、启动方式和扩展功能。
 
-运行需要 **Windows 10/11、Codex Desktop 的 App Tools 插件与可用的 Node.js 运行时**；程序会自动查找 Codex 附带的运行时。收起后可点击托盘图标恢复；需要登录后自动启动时，运行 **Enable-Autostart.ps1**。
+程序需要 Windows 10/11、Codex Desktop 的 App Tools 插件及可用的 Node.js 运行时，通常会自动使用 Codex 附带的运行时。Codex 未运行时仍可浏览和分析本地会话；部分修改操作需要 Codex 和可靠的状态确认。
 
-从源码构建需要 Rust MSVC 和 Visual Studio C++ Build Tools，在仓库目录运行：
+从源码构建需要 Rust MSVC 和 Visual Studio C++ Build Tools：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1
@@ -63,4 +60,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Build.ps1
 
 [更新说明](CHANGELOG.md) · [开发与故障排查](DEVELOPMENT.md) · [参与贡献](CONTRIBUTING.md) · [打包与发布](RELEASING.md)
 
-截图使用示例会话与数值。本项目是独立的 Codex 伴随工具。Emoji 数据来自 [Unicode](https://unicode.org/Public/emoji/latest/)，许可见 [UNICODE-LICENSE.txt](UNICODE-LICENSE.txt)。
+截图使用示例会话与数据。本项目是独立的 Codex 伴随工具；Emoji 数据来自 [Unicode](https://unicode.org/Public/emoji/latest/)，许可见 [UNICODE-LICENSE.txt](UNICODE-LICENSE.txt)。
