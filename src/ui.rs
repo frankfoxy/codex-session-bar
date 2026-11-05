@@ -231,6 +231,7 @@ enum Hit {
     ResetPreferences,
     Details,
     Recent(String),
+    ToggleAgents(String),
     ChatIcon(String),
     ChatCopy(usize),
     ChatMenuClose,
@@ -545,6 +546,24 @@ impl Painter {
                 if row.state == "Failed" { 0xf87171 } else if row.state == "Waiting" { ORANGE } else { MUTED }, false);
         }
     }
+    /// Paint all activity glyphs around the same centre as the adjacent text.
+    unsafe fn activity_icon(&self, label: &str, x: f32, y: f32, animate: bool) {
+        match label {
+            "Processing" => {
+                let phase=if animate {(now()*3.) as usize%8}else{0};
+                for i in 0..8 { let a=i as f32*std::f32::consts::TAU/8.-std::f32::consts::FRAC_PI_2;
+                    self.circle(x+a.cos()*5.,y+a.sin()*5.,1.1,if (i+8-phase)%8<5 {0xe7b873}else{0x596366}); }
+            },
+            "Output" => { let c=0x72c5ef;self.line(x-6.,y+4.,x-2.,y,c,1.5);self.line(x-2.,y,x+1.,y+2.,c,1.5);self.line(x+1.,y+2.,x+6.,y-5.,c,1.5);self.line(x+2.,y-5.,x+6.,y-5.,c,1.5);self.line(x+6.,y-5.,x+6.,y-1.,c,1.5); },
+            "Tool running" => { let c=0xe7b873;self.line(x-5.,y+5.,x+3.,y-3.,c,2.);self.circle(x-5.,y+5.,1.6,c);self.line(x+1.,y-6.,x+5.,y-6.,c,1.5);self.line(x+5.,y-6.,x+6.,y-2.,c,1.5);self.line(x+6.,y-2.,x+3.,y+1.,c,1.5); },
+            "Possibly stalled" => {let c=0xf2bf5f;self.line(x,y-7.,x-7.,y+6.,c,1.4);self.line(x-7.,y+6.,x+7.,y+6.,c,1.4);self.line(x+7.,y+6.,x,y-7.,c,1.4);self.line(x,y-3.,x,y+2.,c,1.5);self.circle(x,y+4.,0.8,c);},
+            "Waiting" => {let c=0xb9a9e2;if let Ok(b)=self.brush(c){self.target.DrawEllipse(&D2D1_ELLIPSE{point:D2D_POINT_2F{x,y},radiusX:6.,radiusY:6.},&b,1.4,None);}self.line(x,y-4.,x,y,c,1.4);self.line(x,y,x+3.,y+2.,c,1.4);},
+            "Done" => {self.line(x-5.,y,x-1.,y+4.,GREEN,1.6);self.line(x-1.,y+4.,x+6.,y-4.,GREEN,1.6);},
+            "Stopped" => {self.line(x-3.,y-5.,x-3.,y+5.,MUTED,2.);self.line(x+3.,y-5.,x+3.,y+5.,MUTED,2.);},
+            "Failed" => {let c=0xf18686;if let Ok(b)=self.brush(c){self.target.DrawEllipse(&D2D1_ELLIPSE{point:D2D_POINT_2F{x,y},radiusX:6.,radiusY:6.},&b,1.4,None);}self.line(x-3.,y-3.,x+3.,y+3.,c,1.4);self.line(x+3.,y-3.,x-3.,y+3.,c,1.4);},
+            _ => {},
+        }
+    }
     unsafe fn search_icon(&self, x: f32, y: f32, rgb: u32) {
         if let Ok(brush) = self.brush(rgb) {
             self.target.DrawEllipse(
@@ -798,6 +817,7 @@ struct App {
     guard_log_error: String,
     capacity_log: bool,
     rows: Vec<Row>,
+    expanded_agents: HashSet<String>,
     recent_rows_at: f64,
     hits: Vec<Area>,
     popup_hits: Vec<Area>,
@@ -964,6 +984,7 @@ fn tip_text(hit: &Hit, catalog: &Catalog) -> String {
         Hit::ResetPreferences => "Restore default list size and shortcut · apply to save",
         Hit::Details => "Session details",
         Hit::Recent(_) => "Open chat in Codex · blue dot = newly completed, unread result",
+        Hit::ToggleAgents(_) => "Expand or collapse child agents",
         Hit::Fixed(_) => "Use this fixed chat · blue dot = newly completed, unread result",
         Hit::ChooseFixed => "Choose a fixed chat",
         Hit::Back => "Back to session settings",
@@ -1130,6 +1151,7 @@ impl App {
             popup_layout: None,
             popup_layout_batch: false,
             rows: Vec::new(),
+            expanded_agents: HashSet::new(),
             recent_rows_at: -1.,
             hits: Vec::new(),
             popup_hits: Vec::new(),
@@ -1364,6 +1386,16 @@ impl App {
                 current.and_then(|s|s.rate()).or_else(||row.filter(|r|r.state=="Busy").and_then(|r|r.rate())),false)
         } else {live.recent.totals()}
     }
+    fn bar_activity(&self, live: &crate::Shared) -> Option<(String,String)> {
+        let row=self.current_row(live)?;
+        if !matches!(row.state.as_str(),"Busy"|"Waiting"|"Failed"|"Stopped"|"Done") { return None; }
+        let snap=self.current(live);
+        let activity=snap.map(|s|&s.activity).unwrap_or(&row.activity);
+        let start=snap.and_then(|s|s.turn.started_at).or(row.started_at);
+        let zh=crate::locale::chinese();
+        let threshold=self.settings.refresh.activity_stall_secs;
+        Some((activity.label(&row.state,start,now(),false,threshold).into(),activity.detail(&row.state,start,now(),zh,threshold)))
+    }
     unsafe fn bar_text(&self, live: &crate::Shared) -> (String, String, String, String, String) {
         let current = self.current(live);
         let visible = live
@@ -1485,6 +1517,10 @@ impl App {
                     let w = p.width(text, 11.) + 2.;
                     p.label(text, rect(x, 2., w, 30.), 11., MUTED, false);
                     x += w + 8.;
+                }
+                if let Some((label,detail))=self.bar_activity(&live) {
+                    area(Hit::Info(detail),rect(x,2.,20.,30.));
+                    p.activity_icon(&label,x+9.,17.,false);x+=24.;
                 }
                 if let Some(s) = current {
                     let model = s.execution.short();
@@ -2039,7 +2075,7 @@ impl App {
                     p.ui_label("Refresh settings",rect(54.,8.,width-70.,28.),14.,TEXT,false);
                     let watching=self.testing||live.refresh_events.watching.load(Ordering::Relaxed);
                     p.ui_label(if watching{"File-change events · debounced · slow fallback"}else{"File notifications unavailable · fallback active"},rect(20.,45.,width-40.,24.),11.,if watching{GREEN}else{ORANGE},false);
-                    for (field,label,step) in [(0,"Current chat minimum",1),(1,"Chat list minimum",1),(2,"Fallback refresh",15),(3,"Cache save interval",15),(4,"Diagnostic status",5),(5,"Window identity check",250)] {
+                    for (field,label,step) in [(0,"Current chat minimum",1),(1,"Chat list minimum",1),(2,"Fallback refresh",15),(3,"Cache save interval",15),(4,"Diagnostic status",5),(5,"Window identity check",250),(6,"Possible stall after",60)] {
                         let y=78.+field as f32*42.;p.ui_label(label,rect(20.,y,width-180.,30.),12.,TEXT,false);
                         p.fill(rect(width-150.,y,130.,30.),0x1c2125,6.);
                         for(delta,x)in[(-step,width-146.),(step,width-54.)]{
@@ -2048,10 +2084,10 @@ impl App {
                         }
                         area(Hit::Numeric(NumericTarget::Refresh(field)),rect(width-116.,y+3.,62.,24.));p.ui_label(&draft.refresh.value(field),rect(width-116.,y,62.,30.),11.,TEXT,false);
                     }
-                    p.ui_label("Minimums coalesce events; unchanged chats wait for fallback.",rect(20.,338.,width-40.,24.),11.,MUTED,false);
-                    p.ui_label("Window following and typing stay responsive.",rect(20.,361.,width-40.,24.),11.,MUTED,false);
-                    let button=rect(width-52.,390.,36.,32.);area(Hit::ApplyPreferences,button);p.fill(button,0x293f37,5.);p.action_icon(&Hit::ApplyPreferences,width-46.,396.);
-                    p.ui_label(&self.preferences_note,rect(20.,423.,width-40.,25.),11.,if self.preferences_note.starts_with("Saved"){GREEN}else{ORANGE},false);
+                    p.ui_label("Minimums coalesce events; unchanged chats wait for fallback.",rect(20.,380.,width-40.,24.),11.,MUTED,false);
+                    p.ui_label("Window following and typing stay responsive.",rect(20.,403.,width-40.,24.),11.,MUTED,false);
+                    let button=rect(width-52.,432.,36.,32.);area(Hit::ApplyPreferences,button);p.fill(button,0x293f37,5.);p.action_icon(&Hit::ApplyPreferences,width-46.,438.);
+                    p.ui_label(&self.preferences_note,rect(20.,465.,width-40.,25.),11.,if self.preferences_note.starts_with("Saved"){GREEN}else{ORANGE},false);
                     return hits;
                 }
                 p.ui_label("Settings", rect(16., 8., width - 120., 28.), 14., TEXT, false);
@@ -2409,6 +2445,7 @@ impl App {
             + 10.
             + p.width(&speed, 11.)
             + 10.
+            + if self.bar_activity(&live).is_some(){24.}else{0.}
             + 29.;
         if live.quota.is_empty() {
             width += p.width("Limit", 11.) + 5. + 42. + p.width("—", 11.) + 9.;
@@ -2466,7 +2503,7 @@ impl App {
         match target {
             NumericTarget::Rows=>(draft.recent_rows as u64,4,20),NumericTarget::TitleWidth=>(draft.recent_title_width as u64,140,280),
             NumericTarget::Guard(0)=>(self.guard_limits.max_processes,8,4096),NumericTarget::Guard(1)=>(self.guard_limits.max_private_mib,256,65536),NumericTarget::Guard(_)=>(self.guard_limits.interval_seconds,1,60),
-            NumericTarget::Refresh(i)=>{let r=&draft.refresh;match i{0=>(r.current_secs,1,10),1=>(r.list_secs,2,60),2=>(r.fallback_secs,15,300),3=>(r.cache_secs,15,600),4=>(r.diagnostic_secs,5,120),_=>(r.host_ms,250,2000)}},
+            NumericTarget::Refresh(i)=>{let r=&draft.refresh;match i{0=>(r.current_secs,1,10),1=>(r.list_secs,2,60),2=>(r.fallback_secs,15,300),3=>(r.cache_secs,15,600),4=>(r.diagnostic_secs,5,120),5=>(r.host_ms,250,2000),_=>(r.activity_stall_secs,60,3600)}},
             NumericTarget::ResetInterval=>(self.settings.reset_notice.check_minutes,1,60),NumericTarget::RetryInterval=>(self.settings.capacity_retry.delay_secs,1,300),NumericTarget::ReduceThreshold=>(self.settings.reduce_threshold_mib,10,102400),
         }
     }
@@ -2476,7 +2513,7 @@ impl App {
             NumericTarget::Rows=>self.preferences_draft.as_mut().context("Settings are not open")?.recent_rows=value as usize,
             NumericTarget::TitleWidth=>self.preferences_draft.as_mut().context("Settings are not open")?.recent_title_width=value as u32,
             NumericTarget::Guard(0)=>self.guard_limits.max_processes=value,NumericTarget::Guard(1)=>self.guard_limits.max_private_mib=value,NumericTarget::Guard(_)=>self.guard_limits.interval_seconds=value,
-            NumericTarget::Refresh(i)=>{let r=&mut self.preferences_draft.as_mut().context("Settings are not open")?.refresh;match i{0=>r.current_secs=value,1=>r.list_secs=value,2=>r.fallback_secs=value,3=>r.cache_secs=value,4=>r.diagnostic_secs=value,_=>r.host_ms=value}},
+            NumericTarget::Refresh(i)=>{let r=&mut self.preferences_draft.as_mut().context("Settings are not open")?.refresh;match i{0=>r.current_secs=value,1=>r.list_secs=value,2=>r.fallback_secs=value,3=>r.cache_secs=value,4=>r.diagnostic_secs=value,5=>r.host_ms=value,_=>r.activity_stall_secs=value}},
             NumericTarget::ResetInterval=>{let mut config=self.settings.reset_notice.clone();config.check_minutes=value;self.set_reset_notice(config)?;return Ok(())},
             NumericTarget::RetryInterval=>{let mut config=self.settings.capacity_retry.clone();config.delay_secs=value;self.set_capacity_retry(config)?;return Ok(())},
             NumericTarget::ReduceThreshold=>{let mut next=self.settings.clone();next.reduce_threshold_mib=value;self.write_settings(&next)?;self.settings=next;if let Some(draft)=self.preferences_draft.as_mut(){draft.reduce_threshold_mib=value;}return Ok(())},
@@ -2641,7 +2678,9 @@ impl App {
             }
         }
         if self.popup_kind == Some(Popup::Recent) && self.recent_rows_at!=live.recent.loaded_at {
-            self.rows = data::stable_rows(&self.rows, &live.recent.rows);
+            let roots:Vec<Row>=self.rows.iter().filter(|r|r.parent_id.is_none()).cloned().collect();
+            self.rows = data::stable_rows(&roots, &live.recent.rows);
+            self.rows.extend(live.recent.subagents.iter().cloned());
             self.recent_rows_at=live.recent.loaded_at;
             if self.hover_card.visible {let _=InvalidateRect(self.hover_card.window,None,false);}
         }
@@ -2659,6 +2698,11 @@ impl App {
             let selected = self.chat_filters.get(self.chat_cursor).copied();
             self.update_body_only();
             let next = self.filtered_chats();
+            if self.popup_kind==Some(Popup::Recent) && !self.expanded_agents.is_empty() {
+                self.chat_filters=next;
+                self.scroll=self.scroll.min(self.chat_filters.len().saturating_sub(self.list_page_rows()));
+                self.chat_cursor=self.chat_cursor.min(self.chat_filters.len().saturating_sub(1));
+            } else {
             let allowed: HashSet<_> = next.iter().copied().collect();
             let previous: HashSet<_> = self.chat_filters.iter().copied().collect();
             self.chat_filters.retain(|i| allowed.contains(i));
@@ -2672,6 +2716,7 @@ impl App {
                 .and_then(|i| self.chat_filters.iter().position(|&v| v == i))
                 .unwrap_or(self.chat_cursor)
                 .min(self.chat_filters.len().saturating_sub(1));
+            }
         }
         if self.index_pending || self.body_pending {
             if let Some(service) = &self.body_service {
@@ -3296,6 +3341,7 @@ impl App {
             Popup::Repair => [1190,700],
             Popup::Recent => {
                 self.rows = live.recent.rows.clone();
+                self.rows.extend(live.recent.subagents.iter().cloned());
                 [self.recent_width(), self.recent_panel_height()]
             }
             Popup::Icons => [384, 450],
@@ -3828,6 +3874,13 @@ impl App {
                 self.close_popup();
                 return Some(Action::Navigate(id));
             }
+            Hit::ToggleAgents(id) => {
+                if !self.expanded_agents.remove(&id) {self.expanded_agents.insert(id);}
+                self.chat_filters=self.filtered_chats();
+                self.scroll=self.scroll.min(self.chat_filters.len().saturating_sub(self.list_page_rows()));
+                self.chat_cursor=self.chat_cursor.min(self.chat_filters.len().saturating_sub(1));
+                let _=InvalidateRect(self.popup,None,false);
+            }
             Hit::Random | Hit::Auto | Hit::Clear | Hit::Emoji(_) => {
                 let live = self.snapshot();
                 let Some((id, label)) = self
@@ -4003,7 +4056,7 @@ impl App {
                 .body_service
                 .get_or_insert_with(|| body::Service::new(self.paths.clone(), self.stop.clone()));
             self.body_generation =
-                service.submit(&self.search, false, self.rows.iter().map(|r| r.id.clone()));
+                service.submit(&self.search, false, self.rows.iter().filter(|r|r.parent_id.is_none()).map(|r| r.id.clone()));
             self.body_pending = true;
             self.index_pending = true;
             self.body_state = service.status();
@@ -4020,14 +4073,16 @@ impl App {
             &titles,
             &self.body_hits,
             !self.search.trim().is_empty(),
-        ).into_iter().filter(|&i| self.popup_kind != Some(Popup::Recent) || self.custom_tags.matches(&self.rows[i], &self.tag_filters)).collect();
+        ).into_iter().filter(|&i| self.rows[i].parent_id.is_none() && (self.popup_kind != Some(Popup::Recent) || self.custom_tags.matches(&self.rows[i], &self.tag_filters))).collect();
         if self.recent_sort>0&&self.popup_kind==Some(Popup::Recent){
             matched.sort_by(|&a,&b|{
                 let rank=|i:usize|(self.rows[i].state!="Busy",!self.search.trim().is_empty()&&!title_ids.contains(&i));
                 rank(a).cmp(&rank(b)).then_with(||if self.recent_sort==1{self.rows[b].disk_bytes.cmp(&self.rows[a].disk_bytes)}else{self.rows[b].total_seconds.unwrap_or(0.).total_cmp(&self.rows[a].total_seconds.unwrap_or(0.))}).then_with(||self.rows[b].updated_at.total_cmp(&self.rows[a].updated_at))
             });
         }
-        matched
+        if self.popup_kind==Some(Popup::Recent) {
+            data::expanded_tree(matched,&self.rows,&self.expanded_agents)
+        } else {matched}
     }
     fn update_body_only(&mut self) {
         let titles: HashSet<_> = self
@@ -4087,7 +4142,10 @@ impl App {
             let slot=self.scroll+((y-top)/rh) as usize;
             let &i=self.chat_filters.get(slot)?;let row=&self.rows[i];
             let local_y=(y-top)%rh;let icon_top=if self.settings.compact_recent{4.}else{7.};
-            if (left+12. ..left+42.).contains(&x)&&(icon_top..icon_top+30.).contains(&local_y){return Some(Hit::ChatIcon(row.id.clone()));}
+            if row.parent_id.is_none() && self.rows.iter().any(|r|r.parent_id.as_deref()==Some(row.id.as_str())) && (width-75. ..width-51.).contains(&x) {return Some(Hit::ToggleAgents(row.id.clone()));}
+            let indent=if row.parent_id.is_some(){18.}else{0.};
+            if (left+12.+indent..left+42.+indent).contains(&x)&&(icon_top..icon_top+30.).contains(&local_y){return Some(Hit::ChatIcon(row.id.clone()));}
+            if row.parent_id.is_some(){return Some(Hit::Recent(row.id.clone()));}
             if let Some((tag,r))=unsafe{self.title_project_tag(row)}{if Self::contains_rect(r,x,local_y){return Some(Hit::TagFilter(tag.key));}}
             if !self.settings.compact_recent{
                 let layout=unsafe{self.tag_layout(row)};

@@ -18,6 +18,7 @@ pub struct Settings {
     pub cache_secs: u64,
     pub diagnostic_secs: u64,
     pub host_ms: u64,
+    pub activity_stall_secs: u64,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -28,6 +29,7 @@ impl Default for Settings {
             cache_secs: 30,
             diagnostic_secs: 5,
             host_ms: 500,
+            activity_stall_secs: 300,
         }
     }
 }
@@ -39,6 +41,7 @@ impl Settings {
         self.cache_secs = self.cache_secs.clamp(15, 600);
         self.diagnostic_secs = self.diagnostic_secs.clamp(5, 120);
         self.host_ms = self.host_ms.clamp(250, 2000);
+        self.activity_stall_secs = self.activity_stall_secs.clamp(60, 3600);
     }
     pub fn adjust(&mut self, field: usize, delta: i32) {
         let value = match field {
@@ -47,7 +50,8 @@ impl Settings {
             2 => &mut self.fallback_secs,
             3 => &mut self.cache_secs,
             4 => &mut self.diagnostic_secs,
-            _ => &mut self.host_ms,
+            5 => &mut self.host_ms,
+            _ => &mut self.activity_stall_secs,
         };
         *value = (*value as i64 + delta as i64).max(0) as u64;
         self.clamp();
@@ -59,7 +63,8 @@ impl Settings {
             2 => format!("{} s", self.fallback_secs),
             3 => format!("{} s", self.cache_secs),
             4 => format!("{} s", self.diagnostic_secs),
-            _ => format!("{} ms", self.host_ms),
+            5 => format!("{} ms", self.host_ms),
+            _ => format!("{} s", self.activity_stall_secs),
         }
     }
 }

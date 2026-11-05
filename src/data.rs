@@ -26,6 +26,71 @@ pub struct Rate {
     pub end: f64,
     pub output_tokens: u64,
 }
+/// Observations from the current rollout, not a claim about model liveness.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Activity {
+    pub last_at: Option<f64>,
+    pub last_kind: String,
+    pub tool_id: String,
+    pub tool_name: String,
+    pub tool_started: Option<f64>,
+}
+impl Activity {
+    fn observe(&mut self, event: &Value) {
+        let Some(at) = event["timestamp"].as_str().and_then(timestamp) else { return; };
+        let payload = &event["payload"];
+        let kind = payload["type"].as_str().unwrap_or("");
+        let typ = event["type"].as_str().unwrap_or("");
+        if typ == "event_msg" && kind == "task_started" { *self = Self::default(); }
+        let label = match (typ, kind) {
+            ("event_msg", "task_started") => "started",
+            ("event_msg", "token_count") if payload["info"].is_object() => "output",
+            ("event_msg", "task_complete") => { self.tool_id.clear(); self.tool_started=None; "completed" },
+            ("response_item", "function_call" | "custom_tool_call") => {
+                self.tool_id = payload["call_id"].as_str().unwrap_or("").to_string();
+                self.tool_name = payload["name"].as_str().unwrap_or("").chars().take(40).collect();
+                self.tool_started = Some(at); "tool_started"
+            },
+            ("response_item", "function_call_output" | "custom_tool_call_output") => {
+                if self.tool_id.is_empty() || payload["call_id"].as_str() == Some(self.tool_id.as_str()) {
+                    self.tool_id.clear(); self.tool_started=None;
+                }
+                "tool_finished"
+            },
+            ("response_item", "reasoning" | "message") => "response",
+            _ => return,
+        };
+        if self.last_at.is_none_or(|old| at >= old) { self.last_at=Some(at); self.last_kind=label.into(); }
+    }
+    pub fn label(&self, state: &str, start: Option<f64>, at: f64, zh: bool, stall_secs: u64) -> &'static str {
+        match state {
+            "Waiting" => if zh {"等待用户"} else {"Waiting"},
+            "Done" => if zh {"已完成"} else {"Done"},
+            "Failed" => if zh {"失败"} else {"Failed"},
+            "Stopped" => if zh {"已停止"} else {"Stopped"},
+            "Busy" => {
+                let age = at - self.last_at.or(start).unwrap_or(at);
+                if age >= stall_secs as f64 { if zh {"可能停滞"} else {"Possibly stalled"} }
+                else if self.tool_started.is_some_and(|t| start.is_none_or(|s| t >= s-2.)) { if zh {"执行工具"} else {"Tool running"} }
+                else if self.last_kind == "output" && age < 30. { if zh {"正在输出"} else {"Output"} }
+                else { if zh {"处理中"} else {"Processing"} }
+            },
+            _ => if zh {"未知"} else {"Unknown"},
+        }
+    }
+    pub fn detail(&self, state: &str, start: Option<f64>, at: f64, zh: bool, stall_secs: u64) -> String {
+        let label=self.label(state,start,at,zh,stall_secs);
+        let event=match self.last_kind.as_str() {
+            "started"=>if zh{"开始处理"}else{"Turn started"}, "output"=>if zh{"Token 已更新"}else{"Token count updated"},
+            "tool_started"=>if zh{"工具已启动"}else{"Tool started"}, "tool_finished"=>if zh{"工具已完成"}else{"Tool completed"},
+            "response"=>if zh{"模型内容已更新"}else{"Model response updated"}, "completed"=>if zh{"会话已完成"}else{"Turn completed"},
+            _=>if zh{"暂无活动记录"}else{"No activity recorded"},
+        };
+        let when=self.last_at.map(|t| format!("{} · {} {}",crate::telemetry::local_reset(t),if zh{"距今"}else{"ago"},duration((at-t).max(0.)))).unwrap_or_else(||"—".into());
+        let tool=if self.tool_started.is_some() && !self.tool_name.is_empty(){format!(" · {}",self.tool_name)}else{String::new()};
+        format!("{label}{tool}\n{}: {event} · {when}",if zh{"最近活动"}else{"Last activity"})
+    }
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     pub id: String,
@@ -39,6 +104,8 @@ pub struct Snapshot {
     pub usage: Value,
     pub token_at: Option<String>,
     pub output_rate: Option<Rate>,
+    #[serde(default)]
+    pub activity: Activity,
 }
 impl Snapshot {
     pub fn tokens(&self) -> Option<u64> {
@@ -55,6 +122,10 @@ impl Snapshot {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Row {
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub activity: Activity,
     #[serde(default)]
     pub disk_bytes: Option<u64>,
     pub id: String,
@@ -156,6 +227,9 @@ impl Row {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Recent {
+    // Child agents are rendered only under their parent; never counted as chats.
+    #[serde(skip)]
+    pub subagents: Vec<Row>,
     // Live projection only: cached errors must never start old conversations.
     #[serde(skip)]
     pub capacity_failures: Vec<crate::capacity_retry::Failure>,
@@ -377,6 +451,13 @@ pub fn stable_rows(previous: &[Row], incoming: &[Row]) -> Vec<Row> {
         })
         .collect()
 }
+pub fn expanded_tree(roots: Vec<usize>, rows: &[Row], expanded: &std::collections::HashSet<String>) -> Vec<usize> {
+    let mut children:HashMap<&str,Vec<usize>>=HashMap::new();
+    for (i,row) in rows.iter().enumerate() {if let Some(parent)=row.parent_id.as_deref(){children.entry(parent).or_default().push(i);}}
+    let mut result=Vec::with_capacity(roots.len());
+    for i in roots {result.push(i);if expanded.contains(&rows[i].id){if let Some(items)=children.get(rows[i].id.as_str()){result.extend(items.iter().copied());}}}
+    result
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Emoji {
@@ -499,6 +580,7 @@ struct TokenData {
     rate: Option<Rate>,
     execution: crate::telemetry::Execution,
     context_at: Option<f64>,
+    activity: Activity,
 }
 struct Cache {
     size: u64,
@@ -575,6 +657,22 @@ impl Store {
         rows.retain(|row| !internal.contains(&row.id));
         Ok(rows)
     }
+    fn subagents(&self, parents: &std::collections::HashSet<String>) -> Result<Vec<Row>> {
+        let db=self.db("state_5.sqlite")?;
+        // Older databases have no subagent source column.
+        let Ok(mut query)=db.prepare("SELECT id,title,name,updated_at,tokens_used,model,reasoning_effort,source,thread_source,agent_nickname FROM threads WHERE archived=0 AND (thread_source='subagent' OR source LIKE '%subagent%') ORDER BY updated_at DESC,id") else {return Ok(Vec::new());};
+        let rows=query.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,f64>(3)?,r.get::<_,Option<u64>>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?,r.get::<_,Option<String>>(7)?,r.get::<_,Option<String>>(8)?,r.get::<_,Option<String>>(9)?)))?;
+        let mut result=Vec::new();
+        for item in rows {
+            let (id,title,name,updated,tokens,model,effort,source,kind,nickname)=item?;
+            if kind.as_deref()==Some("guardian_review") {continue;}
+            let Some(source)=source.and_then(|s|serde_json::from_str::<Value>(&s).ok()) else {continue;};
+            let Some(parent)=source.pointer("/subagent/thread_spawn/parent_thread_id").and_then(Value::as_str).filter(|p|parents.contains(*p)) else {continue;};
+            let label=display_title(name.as_deref(),&title);
+            result.push(Row{id,parent_id:Some(parent.to_string()),label,prompt:nickname.unwrap_or_default(),updated_at:updated,tokens,execution:crate::telemetry::Execution{model:model.unwrap_or_default(),effort:effort.unwrap_or_default(),service_tier:None},..Row::default()});
+        }
+        Ok(result)
+    }
     pub fn resolve(&self, label: &str) -> Result<Option<String>> {
         if label.trim().is_empty() {
             return Ok(None);
@@ -614,6 +712,11 @@ impl Store {
                 ))
             })
             .context("Chat not found")
+    }
+    /// Return a project name only when it maps uniquely to a project ID.
+    pub fn unique_project_name(&self, id: &str) -> Option<String> {
+        let db=self.db("state_5.sqlite").ok()?;
+        db.query_row("SELECT p.name FROM threads t JOIN projects p ON p.id=t.project_id WHERE t.id=? AND t.archived=0 AND p.name<>'' AND (SELECT count(*) FROM projects p2 WHERE p2.name=p.name)=1",[id],|r|r.get::<_,String>(0)).ok()
     }
     pub fn directory(&self,id:&str)->Result<String> {
         Ok(self.db("state_5.sqlite")?.query_row("SELECT cwd FROM threads WHERE id=?",[id],|r|r.get::<_,Option<String>>(0))?.unwrap_or_default())
@@ -697,6 +800,10 @@ impl Store {
             snap.usage = tokens.usage;
             snap.token_at = tokens.at;
             snap.output_rate = tokens.rate;
+            snap.activity = tokens.activity;
+            if snap.activity.last_at.zip(snap.turn.started_at).is_some_and(|(at,start)| at < start - 2.) {
+                snap.activity = Activity::default();
+            }
         }
         Ok(snap)
     }
@@ -756,6 +863,7 @@ impl Store {
                 continue;
             };
             let payload = &event["payload"];
+            data.activity.observe(&event);
             if event["type"] == "turn_context" {
                 data.execution = crate::telemetry::Execution::from_context(payload);
                 data.context_at = event["timestamp"].as_str().and_then(timestamp);
@@ -831,7 +939,7 @@ impl Store {
         let local =
             crate::body::local_ids(&self.paths, rows.iter().map(|r| r.id.clone()).collect())?;
         rows.retain(|row| local.contains(&row.id));
-        let mut turns = history.prepare("SELECT status FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1")?;
+        let mut turns = history.prepare("SELECT status,started_at,completed_at FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal DESC LIMIT 1")?;
         let mut capacity_turns=history.prepare("SELECT turn_id,status,CASE WHEN length(CAST(error_json AS BLOB))<=8192 THEN error_json ELSE NULL END,completed_at FROM thread_turns WHERE thread_id=? ORDER BY COALESCE(started_at,completed_at,0) DESC,rollout_ordinal DESC LIMIT 1").ok();
         let mut capacity_failures=Vec::new();
         let mut capacity_unresolved=Vec::new();
@@ -851,10 +959,11 @@ impl Store {
                     row.label = display_title(None, title);
                 }
             }
-            let turn = turns
-                .query_row([&row.id], |r| r.get::<_, String>(0))
+            let (turn,turn_start,turn_end) = turns
+                .query_row([&row.id], |r| Ok((r.get::<_, String>(0)?,r.get::<_,Option<f64>>(1)?,r.get::<_,Option<f64>>(2)?)))
                 .optional()?
                 .unwrap_or_default();
+            row.started_at=turn_start;
             let state = match entry["status"].as_str().unwrap_or("") {
                 "active" | "busy" | "running" | "inProgress" => "Busy",
                 "needsAttention" | "needs_attention" | "waiting" | "blocked" => "Waiting",
@@ -872,6 +981,7 @@ impl Store {
                 },
             };
             row.state = state.into();
+            if let Some(end)=turn_end { row.activity.last_at=Some(end); row.activity.last_kind=if state=="Done"{"completed"}else{"response"}.into(); }
             if state=="Failed" || crate::capacity_retry::live_error(&entry["status"]) {
                 let before=capacity_failures.len();
                 if let Some(query)=capacity_turns.as_mut() {
@@ -894,14 +1004,24 @@ impl Store {
                 .or_else(|| entry["updatedAt"].as_str().and_then(timestamp))
                 .unwrap_or(0.);
             row.updated_at = row.updated_at.max(updated);
-            if state == "Busy" {
+            if state == "Busy" || state == "Waiting" {
                 if let Ok(snapshot) = self.read(&row.id) {
                     row.tokens = snapshot.tokens();
                     row.started_at = snapshot.turn.started_at;
                     row.tps = snapshot.rate();
                     row.rate_at = snapshot.output_rate.as_ref().map(|r| r.end);
                     row.execution = snapshot.execution;
+                    row.activity = snapshot.activity;
                 }
+            }
+        }
+        let parent_ids=rows.iter().map(|row|row.id.clone()).collect();
+        let mut subagents=self.subagents(&parent_ids)?;
+        for child in &mut subagents {
+            if let Ok(Some((status,start,end)))=turns.query_row([&child.id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<f64>>(1)?,r.get::<_,Option<f64>>(2)?))).optional() {
+                child.started_at=start;
+                child.state=match status.as_str(){"inProgress"=>"Busy","completed"=>"Done","failed"=>"Failed","interrupted"=>"Stopped",_=>"Unknown"}.into();
+                if let Some(end)=end {child.activity.last_at=Some(end);child.activity.last_kind="completed".into();}
             }
         }
         let busy_metrics: Vec<Row> = rows.iter().filter(|r| r.state == "Busy").cloned().collect();
@@ -909,6 +1029,7 @@ impl Store {
         let mut all_rows = rows.clone();
         all_rows.sort_by_key(|r| r.state != "Busy");
         Ok(Recent {
+            subagents,
             capacity_failures,
             capacity_available,
             capacity_unresolved,
@@ -966,6 +1087,61 @@ pub fn load_recent(paths: &Paths) -> Recent {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn project_expansion_requires_a_unique_project_and_unarchived_chat() {
+        let (paths,dir)=fixture("project-expansion");
+        let db=Connection::open(dir.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE projects(id TEXT,name TEXT);CREATE TABLE threads(id TEXT,project_id TEXT,archived INTEGER);
+          INSERT INTO projects VALUES('p','X12'),('dup1','Same'),('dup2','Same');
+          INSERT INTO threads VALUES('target','p',0),('archived','p',1),('ambiguous','dup1',0),('orphan',NULL,0);").unwrap();
+        let store=Store::new(&paths);
+        assert_eq!(store.unique_project_name("target").as_deref(),Some("X12"));
+        assert_eq!(store.unique_project_name("archived"),None);
+        assert_eq!(store.unique_project_name("ambiguous"),None);
+        assert_eq!(store.unique_project_name("orphan"),None);
+    }
+    #[test]
+    fn expanded_tree_keeps_children_under_their_own_parent() {
+        let rows=vec![Row{id:"a".into(),..Default::default()},Row{id:"b".into(),..Default::default()},Row{id:"child-b".into(),parent_id:Some("b".into()),..Default::default()},Row{id:"child-a".into(),parent_id:Some("a".into()),..Default::default()}];
+        assert_eq!(expanded_tree(vec![0,1],&rows,&Default::default()),vec![0,1]);
+        assert_eq!(expanded_tree(vec![0,1],&rows,&std::collections::HashSet::from(["a".into()])),vec![0,3,1]);
+        assert_eq!(expanded_tree(vec![1,0],&rows,&std::collections::HashSet::from(["a".into(),"b".into()])),vec![1,2,0,3]);
+    }
+    #[test]
+    fn spawned_agents_are_associated_only_with_their_actual_visible_parent() {
+        let (paths,dir)=fixture("subagent-parent");
+        let db=Connection::open(dir.join("state_5.sqlite")).unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT,title TEXT,name TEXT,updated_at REAL,tokens_used INTEGER,model TEXT,reasoning_effort TEXT,source TEXT,thread_source TEXT,agent_nickname TEXT,archived INTEGER);
+          INSERT INTO threads VALUES('a','Agent A',NULL,10,20,'model','high','{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"parent\",\"agent_path\":null}}}','subagent','Nash',0),
+          ('other','Other',NULL,9,0,NULL,NULL,'{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"absent\"}}}','subagent',NULL,0),
+          ('guardian','Guardian',NULL,8,0,NULL,NULL,'{\"subagent\":{\"other\":\"guardian\"}}','guardian_review',NULL,0),
+          ('fork','User fork',NULL,7,0,NULL,NULL,'vscode','agent_forked_thread',NULL,0);").unwrap();
+        let store=Store::new(&paths);
+        let children=store.subagents(&std::collections::HashSet::from(["parent".to_string()])).unwrap();
+        assert_eq!(children.len(),1);
+        assert_eq!(children[0].id,"a");
+        assert_eq!(children[0].parent_id.as_deref(),Some("parent"));
+        assert_eq!(children[0].prompt,"Nash");
+    }
+    #[test]
+    fn activity_tracks_tool_output_and_stale_without_assuming_completion() {
+        let mut activity=super::Activity::default();
+        let at=super::timestamp("2026-11-04T10:00:00Z").unwrap();
+        activity.observe(&serde_json::json!({"timestamp":"2026-11-04T10:00:00Z","type":"event_msg","payload":{"type":"task_started"}}));
+        activity.observe(&serde_json::json!({"timestamp":"2026-11-04T10:00:01Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"a"}}));
+        assert_eq!(activity.label("Busy",Some(at),at+10.,false,300),"Tool running");
+        assert_eq!(activity.label("Busy",Some(at),at+302.,false,300),"Possibly stalled");
+        activity.observe(&serde_json::json!({"timestamp":"2026-11-04T10:00:04Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"a"}}));
+        assert_eq!(activity.label("Busy",Some(at),at+10.,false,300),"Processing");
+        activity.observe(&serde_json::json!({"timestamp":"2026-11-04T10:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{}}}));
+        assert_eq!(activity.label("Busy",Some(at),at+10.,false,300),"Output");
+        assert_eq!(activity.label("Busy",Some(at),at+50.,false,300),"Processing");
+        assert_eq!(activity.label("Busy",Some(at),at+121.,false,120),"Processing");
+        assert_eq!(activity.label("Busy",Some(at),at+126.,false,120),"Possibly stalled");
+        assert_eq!(activity.label("Waiting",Some(at),at+500.,false,300),"Waiting");
+        assert_eq!(activity.label("Done",Some(at),at+500.,false,300),"Done");
+        assert!(activity.detail("Busy",Some(at),at+10.,false,300).contains("Token count updated"));
+    }
     use super::*;
     use serde_json::json;
     #[test]
@@ -1196,26 +1372,28 @@ mod tests {
     }
 
     #[test]
-    fn internal_approval_reviews_are_excluded_from_live_and_old_cached_lists() {
+    fn internal_reviews_and_spawned_agents_are_excluded_from_live_and_cached_lists() {
         let (mut paths, dir)=fixture("internal-reviews");
         paths.runtime=dir.clone();
         let db=Connection::open(dir.join("state_5.sqlite")).unwrap();
         db.execute_batch("CREATE TABLE threads(id TEXT,title TEXT,name TEXT,updated_at REAL,tokens_used INTEGER,archived INTEGER,agent_path TEXT,source TEXT,thread_source TEXT,rollout_path TEXT);
             INSERT INTO threads VALUES('review','Guardian review',NULL,20,100,0,NULL,'vscode','guardian_review',NULL),
+                ('child','Own ONLY test file',NULL,15,150,0,NULL,'vscode','subagent',NULL),
+                ('fork','Visible fork',NULL,12,180,0,NULL,'vscode','agent_forked_thread',NULL),
                 ('user','Guardian review',NULL,10,200,0,NULL,'vscode','user',NULL);").unwrap();
         let history=Connection::open(dir.join("thread_history_1.sqlite")).unwrap();
         history.execute_batch("CREATE TABLE thread_items(thread_id TEXT,item_id TEXT,item_type TEXT,updated_at_ordinal INTEGER,item_json TEXT);
-            INSERT INTO thread_items VALUES('review','r','userMessage',1,'{}'),('user','u','userMessage',1,'{}');").unwrap();
+            INSERT INTO thread_items VALUES('review','r','userMessage',1,'{}'),('child','c','userMessage',1,'{}'),('fork','f','userMessage',1,'{}'),('user','u','userMessage',1,'{}');").unwrap();
         let store=Store::new(&paths);
-        assert_eq!(store.sessions().unwrap().iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),vec!["user"]);
-        let local=crate::body::local_ids(&paths,std::collections::HashSet::from(["review".into(),"user".into()])).unwrap();
-        assert_eq!(local,std::collections::HashSet::from(["user".into()]));
-        paths.write("recent-cache.json",&json!({"rows":[{"id":"review","label":"Guardian review"},{"id":"user","label":"Guardian review"}],
-            "all_rows":[{"id":"review","label":"Guardian review"},{"id":"user","label":"Guardian review"}]}));
+        assert_eq!(store.sessions().unwrap().iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),vec!["fork","user"]);
+        let local=crate::body::local_ids(&paths,std::collections::HashSet::from(["review".into(),"child".into(),"fork".into(),"user".into()])).unwrap();
+        assert_eq!(local,std::collections::HashSet::from(["fork".into(),"user".into()]));
+        paths.write("recent-cache.json",&json!({"rows":[{"id":"review","label":"Guardian review"},{"id":"child","label":"Own ONLY test file"},{"id":"user","label":"Guardian review"}],
+            "all_rows":[{"id":"review","label":"Guardian review"},{"id":"child","label":"Own ONLY test file"},{"id":"user","label":"Guardian review"}]}));
         let cached=load_recent(&paths);
         assert_eq!(cached.rows.len(),1);assert_eq!(cached.rows[0].id,"user");
         assert_eq!(cached.all_rows.len(),1);
-        assert_eq!(db.query_row("SELECT count(*) FROM threads",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        assert_eq!(db.query_row("SELECT count(*) FROM threads",[],|r|r.get::<_,i64>(0)).unwrap(),4);
     }
 
     #[test]

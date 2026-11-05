@@ -1,4 +1,4 @@
-//! Internal approval reviews are persisted threads, but not user chats.
+//! Internal approval reviews and spawned agents are not user chats.
 use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashSet;
@@ -30,11 +30,11 @@ pub fn internal_reviews(db: &Connection) -> Result<HashSet<String>> {
     let mut hidden = HashSet::new();
     for row in rows {
         let (id, source, kind) = row?;
-        let guardian = source
+        let internal_source = source
             .as_deref()
             .and_then(|source| serde_json::from_str::<serde_json::Value>(source).ok())
-            .is_some_and(|source| source["subagent"]["other"].as_str() == Some("guardian"));
-        if kind.as_deref() == Some("guardian_review") || guardian {
+            .is_some_and(|source| source.get("subagent").is_some_and(|value| !value.is_null()));
+        if matches!(kind.as_deref(), Some("guardian_review" | "subagent")) || internal_source {
             hidden.insert(id);
         }
     }
@@ -45,19 +45,21 @@ pub fn internal_reviews(db: &Connection) -> Result<HashSet<String>> {
 mod tests {
     use super::*;
     #[test]
-    fn source_markers_hide_reviews_without_hiding_user_names_or_forks() {
+    fn source_markers_hide_reviews_and_spawned_agents_without_hiding_user_chats_or_forks() {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(
             "CREATE TABLE threads(id TEXT,source TEXT,thread_source TEXT);
             INSERT INTO threads VALUES('kind','vscode','guardian_review'),
                 ('legacy','{\"subagent\":{\"other\":\"guardian\"}}','subagent'),
+                ('spawn-kind','vscode','subagent'),
+                ('spawn-source','{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"parent\",\"agent_path\":null}}}',NULL),
                 ('ordinary','vscode','user'),('fork','vscode','agent_forked_thread'),
                 ('Guardian review','{broken','user');",
         )
         .unwrap();
         assert_eq!(
             internal_reviews(&db).unwrap(),
-            HashSet::from(["kind".into(), "legacy".into()])
+            HashSet::from(["kind".into(), "legacy".into(), "spawn-kind".into(), "spawn-source".into()])
         );
     }
     #[test]

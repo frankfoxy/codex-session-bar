@@ -6,7 +6,7 @@ mod markdown;
 
 const WIDTH:f32=620.;
 const HEIGHT:f32=260.;
-const REPLY_TOP:f32=53.;
+const REPLY_TOP:f32=77.;
 fn wheel_scroll(current:f32,delta:i16,maximum:f32)->f32{
     (current-delta as f32/120.*54.).clamp(0.,maximum.max(0.))
 }
@@ -96,6 +96,10 @@ impl App {
         p.line(x+2.,13.,x+2.,28.,0x40535a,1.);x+=6.;p.border(rect(x+1.,14.,10.,12.),0x75c7cf,2.);p.line(x+4.,18.,x+8.,18.,0x75c7cf,1.);p.line(x+4.,22.,x+8.,22.,0x75c7cf,1.);p.label(&size,rect(x+15.,7.,size_w-15.,28.),10.,TEXT,false);
         p.fill(rect(status_x,9.,status_w,24.),bg,12.);p.circle(status_x+10.,21.,3.,color);p.label(status,rect(status_x+17.,9.,status_w-20.,24.),10.,color,false);
         p.line(12.,43.,WIDTH-12.,43.,0x40535a,1.);
+        let detail=row.activity.detail(&row.state,row.started_at,now(),zh,self.settings.refresh.activity_stall_secs).replace('\n',"  ·  ");
+        let activity=row.activity.label(&row.state,row.started_at,now(),false,self.settings.refresh.activity_stall_secs);
+        p.activity_icon(activity,18.,58.,false);
+        p.label(&detail,rect(27.,47.,WIDTH-44.,22.),10.,MUTED,false);
         // The reply icon stays at the top right; the text uses the full pane.
         p.fill(rect(WIDTH-39.,REPLY_TOP,22.,22.),0x304e4a,5.);p.border(rect(WIDTH-35.,REPLY_TOP+4.,14.,10.),GREEN,3.);p.line(WIDTH-31.,REPLY_TOP+14.,WIDTH-33.,REPLY_TOP+17.,GREEN,1.);
         let reply=self.card_reply(id);

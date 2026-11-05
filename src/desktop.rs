@@ -525,6 +525,10 @@ impl Workers {
                             Ok("Refreshing account limits…".into())
                         }
                         Action::Navigate(ref id) => {
+                            if let Some(project)=store.unique_project_name(id) {
+                                let hwnd=s.lock().unwrap().host;
+                                let _=crate::host::expand_project(hwnd,&project);
+                            }
                             let value =
                                 rpc.tool("navigate_to_codex_page", json!({"threadId":id}), &ctx)?;
                             anyhow::ensure!(

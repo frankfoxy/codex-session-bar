@@ -259,7 +259,8 @@ impl App {
         }
     }
     fn refresh_tag_catalog(&mut self) {
-        let next = self.custom_tags.catalog(&self.rows);
+        let roots:Vec<Row>=self.rows.iter().filter(|r|r.parent_id.is_none()).cloned().collect();
+        let next = self.custom_tags.catalog(&roots);
         if next != self.tag_catalog || self.tag_regions.len() != 3 {
             self.tag_catalog = next;
             self.tag_search.sync(
@@ -564,7 +565,8 @@ impl App {
         let tags: Vec<_> = self.custom_tags.for_row(row).into_iter().filter(|tag| primary.as_ref().is_none_or(|p| p.key != tag.key)).collect();
         let c = self.recent_columns();
         let tag_left = c.tags_left + 26.;
-        let tag_width = c.tags_width - 26.;
+        let has_agents=row.parent_id.is_none() && self.rows.iter().any(|r|r.parent_id.as_deref()==Some(row.id.as_str()));
+        let tag_width = (c.tags_width - 26. - if has_agents {24.}else{0.}).max(28.);
         let (mut x, mut line) = (0., 0usize);
         let mut chips = Vec::new();
         for tag in &tags {
@@ -987,6 +989,8 @@ impl App {
         {
             let row = &self.rows[i];
             let y = RECENT_TOP as f32 + slot as f32 * self.recent_row_height() as f32;
+            let child=row.parent_id.is_some();
+            let has_agents=!child && self.rows.iter().any(|r|r.parent_id.as_deref()==Some(row.id.as_str()));
             let r = rect(
                 left,
                 y,
@@ -995,6 +999,8 @@ impl App {
             );
             let current = row.id == self.identity(&live);
             let busy = row.state == "Busy";
+            let activity = row.activity.label(&row.state,row.started_at,now(),false,self.settings.refresh.activity_stall_secs);
+            let activity_visible=matches!(row.state.as_str(),"Busy"|"Waiting"|"Stopped"|"Failed");
             let hovered = self.row_hovered(&row.id);
             p.fill(
                 r,
@@ -1030,12 +1036,19 @@ impl App {
             }
             area(Hit::Recent(row.id.clone()), r);
             let icon_y = y + if self.settings.compact_recent { 4. } else { 7. };
-            let icon_r = rect(left + 12., icon_y, 30., 30.);
+            let indent=if child {18.}else{0.};
+            if child {
+                let center=y+self.recent_row_height() as f32/2.-2.;
+                let next_child=self.chat_filters.get(self.scroll+slot+1).is_some_and(|j|self.rows[*j].parent_id==row.parent_id);
+                p.line(left+18.,y-4.,left+18.,if next_child{y+self.recent_row_height() as f32}else{center},0x6c9bad,1.2);
+                p.line(left+18.,center,left+28.,center,0x6c9bad,1.2);
+            }
+            let icon_r = rect(left + 12.+indent, icon_y, 30., 30.);
             area(Hit::ChatIcon(row.id.clone()), icon_r);
             if !self.catalog.icon(&row.label).is_empty() || self.hover==Some(Hit::ChatIcon(row.id.clone())) {p.fill(icon_r, 0x303b43, 7.);}
             p.label(
                 &self.catalog.icon(&row.label),
-                rect(left + 16., icon_y - 2., 25., 34.),
+                rect(left + 16.+indent, icon_y - 2., 25., 34.),
                 17.,
                 TEXT,
                 true,
@@ -1043,7 +1056,7 @@ impl App {
             let model = row.execution.short();
             let columns = self.recent_columns();
             let model_width = if model.is_empty() { 0. } else { (p.width(&model, 10.) + 10.).min(if self.settings.compact_recent { 170. } else { columns.meta_width - 52. }) };
-            let metric_width = (if busy { 225. } else { 165. }) + model_width;
+            let metric_width = (if busy { 225. + 20. } else { 165. + if activity_visible {20.} else {0.} }) + model_width;
             let metric_x = width - 52. - metric_width;
             let line_h = if self.settings.compact_recent {
                 34.
@@ -1057,18 +1070,11 @@ impl App {
                 area(Hit::TagFilter(tag.key), rect(r.left, y+r.top, r.right-r.left, r.bottom-r.top));
                 r.right-r.left+4.
             } else { 0. };
-            if self.settings.compact_recent {p.highlighted_title(title,rect(left + 50., y + 2., ((metric_x - left - 59.).max(40.) - shift).max(1.), line_h),&highlight,false);}
+            if self.settings.compact_recent {p.highlighted_title(title,rect(left + 50.+indent, y + 2., ((metric_x - left - 59.-indent).max(40.) - shift).max(1.), line_h),&highlight,false);}
             else if shift>0. {self.paint_title_with_project(title,&highlight,columns.title_left,y,columns.title_width,shift-4.);}
-            else {p.highlighted_title(title,rect(columns.title_left, y + 6., columns.title_width, 32.),&highlight,false);}
+            else {p.highlighted_title(title,rect(columns.title_left+indent, y + 6., (columns.title_width-indent).max(1.), 32.),&highlight,false);}
             let metrics = if busy {
-                format!(
-                    "{} t/s · {} TOK · {}",
-                    row.rate().map(|v| format!("{v:.1}")).unwrap_or("—".into()),
-                    data::compact(row.tokens),
-                    row.started_at
-                        .map(|t| data::duration(now() - t))
-                        .unwrap_or("—".into())
-                )
+                format!("{} TOK · {}", data::compact(row.tokens),row.started_at.map(|t| data::duration(now() - t)).unwrap_or("—".into()))
             } else {
                 format!(
                     "{} TOK · {}",
@@ -1080,9 +1086,12 @@ impl App {
                 if !model.is_empty() {
                     p.model_label(&model, rect(metric_x, y + 2., model_width - 8., line_h), 10.);
                 }
+                let mut mx=metric_x+model_width;
+                if busy {let rate=format!("{} t/s",row.rate().map(|v|format!("{v:.1}")).unwrap_or("—".into()));let rw=p.width(&rate,10.)+4.;p.label(&rate,rect(mx,y+2.,rw,line_h),10.,MUTED,false);mx+=rw;}
+                if activity_visible {p.activity_icon(activity,mx+9.,y+19.,true);mx+=22.;}
                 p.label(
                     &metrics,
-                    rect(metric_x + model_width, y + 2., metric_width - model_width, line_h),
+                    rect(mx, y + 2., (width-52.-mx).max(1.), line_h),
                     10.,
                     MUTED,
                     false,
@@ -1100,15 +1109,17 @@ impl App {
                 } else {
                     row.total_seconds.map(data::duration).unwrap_or("—".into())
                 };
+                let icon_width=if activity_visible {20.}else{0.};
                 let rate_width = if summary.is_empty() { 0. } else { p.width(&summary, 10.) + 2. };
+                if activity_visible {p.activity_icon(activity,columns.meta_right-9.,y+11.,true);}
                 p.right_label(
                     &summary,
-                    rect(columns.meta_right - rate_width, y + 1., rate_width, 20.),
+                    rect(columns.meta_right - icon_width - rate_width, y + 1., rate_width, 20.),
                     10.,
                     MUTED,
                 );
                 if !model.is_empty() {
-                    p.model_label(&model, rect(columns.meta_right - rate_width - model_width, y + 1., model_width - 8., 20.), 10.);
+                    p.model_label(&model, rect(columns.meta_right - icon_width - rate_width - model_width, y + 1., model_width - 8., 20.), 10.);
                 }
                 p.right_label(
                     &if self.recent_sort==1 {row.disk_bytes.map(|n|format!("{:.2} MiB · {elapsed}",n as f64/1048576.)).unwrap_or_else(||elapsed.clone())}else if busy || !model.is_empty() { format!("{} TOK · {elapsed}", data::compact(row.tokens)) } else { elapsed },
@@ -1118,13 +1129,18 @@ impl App {
                 );
             }
             p.status_icon(row, width - 35., y + if self.settings.compact_recent { 19. } else { 22. });
+            if has_agents {
+                let cx=width-63.;let cy=y+if self.settings.compact_recent {19.}else{22.};
+                area(Hit::ToggleAgents(row.id.clone()),rect(width-75.,y,24.,self.recent_row_height() as f32-4.));
+                if self.expanded_agents.contains(&row.id){p.line(cx-4.,cy-2.,cx,cy+2.,0x94b8c5,1.5);p.line(cx,cy+2.,cx+4.,cy-2.,0x94b8c5,1.5);}
+                else{p.line(cx-2.,cy-4.,cx+2.,cy,0x94b8c5,1.5);p.line(cx+2.,cy,cx-2.,cy+4.,0x94b8c5,1.5);}
+            }
             if row.newly_completed() {
                 p.circle(left + 5., icon_y + 15., 3., NEW_RESULT);
             }
             if self.settings.compact_recent {
                 continue;
             }
-            let tag_layout = self.tag_layout(row);
             let snippet = self.body_previews.get(&row.id).filter(|_| {
                 self.search_body
                     && !self.search.trim().is_empty()
@@ -1142,6 +1158,8 @@ impl App {
                     MUTED,
                 );
             }
+            if child {continue;}
+            let tag_layout = self.tag_layout(row);
             for (tag, r) in tag_layout.chips {
                 self.paint_tag(
                     &tag,
@@ -1234,8 +1252,8 @@ impl App {
         p.ui_label(
             &if !self.copy_note.is_empty(){self.copy_note.clone()}else{format!(
                 "{} / {} chats · Index {:.0}%{}",
-                self.chat_filters.len(),
-                self.rows.len(),
+                self.chat_filters.iter().filter(|&&i|self.rows[i].parent_id.is_none()).count(),
+                self.rows.iter().filter(|r|r.parent_id.is_none()).count(),
                 self.body_state.progress_percent(),
                 if self.body_state.error.is_empty() {
                     ""

@@ -87,7 +87,7 @@ pub fn translate(text:&str,zh:bool)->Cow<'_,str>{
         "View protection log · badge counts storm episodes, not processes · new tracking; recovered after 60 stable seconds"=>"查看防护日志 · 角标记录风暴次数 · 稳定 60 秒后视为恢复",
         "Visible rows"=>"显示行数","Title column width"=>"名称列最大宽度","Global shortcut"=>"会话列表快捷键","Open recent chats"=>"打开会话列表",
         "Extensions"=>"扩展功能","Current chat minimum"=>"当前会话最小间隔","Chat list minimum"=>"会话列表最小间隔",
-        "Fallback refresh"=>"低频兜底检查","Cache save interval"=>"缓存最小写入间隔","Diagnostic status"=>"诊断状态输出间隔","Window identity check"=>"窗口识别检查间隔",
+        "Fallback refresh"=>"低频兜底检查","Cache save interval"=>"缓存最小写入间隔","Diagnostic status"=>"诊断状态输出间隔","Window identity check"=>"窗口识别检查间隔","Possible stall after"=>"无活动多久后提示可能停滞","Expand or collapse child agents"=>"展开或收起子 Agent",
         "File-change events · debounced · slow fallback"=>"异步文件通知 · 合并事件 · 低频兜底",
         "File notifications unavailable · fallback active"=>"文件通知暂不可用 · 已使用低频兜底",
         "Minimums coalesce events; unchanged chats wait for fallback."=>"合并密集事件；无变化时只进行低频兜底检查。",

@@ -83,6 +83,50 @@ pub unsafe fn shown(hwnd: isize) -> bool {
     hwnd != 0 && IsWindow(h).as_bool() && IsWindowVisible(h).as_bool() && !IsIconic(h).as_bool()
 }
 
+/// Best-effort sidebar expansion before navigating. Never toggle an already
+/// expanded project, and never guess if the accessibility tree is ambiguous.
+pub fn expand_project(hwnd:isize,name:&str) -> Result<bool> {
+    unsafe {
+        if !shown(hwnd) || name.trim().is_empty() {return Ok(false);}
+        CoInitializeEx(None,COINIT_MULTITHREADED).ok()?;
+        let result=(|| -> Result<bool> {
+            let ui:IUIAutomation=CoCreateInstance(&CUIAutomation,None,CLSCTX_INPROC_SERVER)?;
+            let root=ui.ElementFromHandle(HWND(hwnd as *mut _))?;
+            let groups=ui.CreatePropertyCondition(UIA_ControlTypePropertyId,&VARIANT::from(UIA_GroupControlTypeId.0))?;
+            let all=root.FindAll(TreeScope_Descendants,&groups)?;
+            let buttons=ui.CreatePropertyCondition(UIA_ControlTypePropertyId,&VARIANT::from(UIA_ButtonControlTypeId.0))?;
+            let lists=ui.CreatePropertyCondition(UIA_ControlTypePropertyId,&VARIANT::from(UIA_ListControlTypeId.0))?;
+            let mut candidates=Vec::new();
+            for i in 0..all.Length()?.min(4096) {
+                let group=all.GetElement(i)?;
+                if group.CurrentName().ok().map(|s|s.to_string()).as_deref()!=Some(name) {continue;}
+                let matches=group.FindAll(TreeScope_Descendants,&buttons)?;
+                let mut exact=Vec::new();
+                for j in 0..matches.Length()?.min(512) {let b=matches.GetElement(j)?;if b.CurrentName().ok().map(|s|s.to_string()).as_deref()==Some(name){exact.push(b);}}
+                if exact.len()==1 {candidates.push((group,exact.remove(0)));}
+            }
+            if candidates.len()!=1 {return Ok(false);}
+            let (group,button)=candidates.remove(0);
+            // The project's nested chat list only exists while expanded.
+            if group.FindFirst(TreeScope_Descendants,&lists).is_ok(){return Ok(true);}
+            if let Ok(pattern)=button.GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(UIA_ExpandCollapsePatternId) {
+                if pattern.CurrentExpandCollapseState()? != ExpandCollapseState_Collapsed {return Ok(false);}
+                pattern.Expand()?;
+            } else {
+                // The current Codex version exposes its project header as a
+                // plain button. Only invoke after the exact unique project
+                // group was found and its chat list is confirmed absent.
+                let invoke:IUIAutomationInvokePattern=button.GetCurrentPatternAs(UIA_InvokePatternId)?;
+                invoke.Invoke()?;
+            }
+            for _ in 0..10 {thread::sleep(Duration::from_millis(50));if group.FindFirst(TreeScope_Descendants,&lists).is_ok(){return Ok(true);}}
+            Ok(false)
+        })();
+        CoUninitialize();
+        result
+    }
+}
+
 struct Tracker {
     ui: IUIAutomation,
     document: Option<IUIAutomationElement>,
