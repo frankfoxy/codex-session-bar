@@ -4,7 +4,7 @@
 
 Windows 原生会话工具栏：在 Codex 标题栏查看状态、搜索和切换会话，也可以在 Codex 关闭后独立查看本地会话。
 
-**当前源码：v0.5.3 开发版** · [稳定版 v0.5.1 下载](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.5.1) · 无需 Python 或 Qt
+**当前源码：v0.5.3 开发版** · [稳定版 v0.5.2 下载](https://github.com/frankfoxy/codex-session-bar/releases/tag/v0.5.2) · 无需 Python 或 Qt
 
 ![Codex Session Bar 悬浮条](assets/images/preview-bar.png)
 
