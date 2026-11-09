@@ -21,8 +21,21 @@ pub fn ranked_matches(
                 .then_with(|| rows[b].updated_at.total_cmp(&rows[a].updated_at))
                 .then(a.cmp(&b))
         });
+    } else {
+        matches.sort_by(|&a, &b| {
+            default_priority(&rows[a]).cmp(&default_priority(&rows[b]))
+                .then_with(|| rows[b].updated_at.total_cmp(&rows[a].updated_at))
+                .then_with(|| rows[a].id.cmp(&rows[b].id))
+        });
     }
     matches
+}
+
+fn default_priority(row: &Row) -> u8 {
+    if row.state == "Waiting" { 0 }
+    else if row.newly_completed() { 1 }
+    else if row.state == "Busy" { 2 }
+    else { 3 }
 }
 
 #[derive(Default)]
@@ -227,8 +240,25 @@ mod tests {
         );
         assert_eq!(
             ranked_matches(&rows, &[0, 1, 2, 3, 4], &HashSet::new(), false),
-            [0, 1, 2, 3, 4]
+            [4, 3, 1, 2, 0]
         );
+    }
+    #[test]
+    fn default_order_prioritizes_attention_then_unread_then_busy_then_time() {
+        let rows: Vec<Row> = [
+            ("older-wait", "Waiting", false, 2.),
+            ("new-wait", "Waiting", false, 4.),
+            ("unread", "Done", true, 1.),
+            ("busy", "Busy", false, 50.),
+            ("read-done", "Done", false, 100.),
+            ("failed", "Failed", true, 90.),
+        ].into_iter().map(|(id,state,unread,updated_at)| Row {
+            id:id.into(), state:state.into(), is_unread:Some(unread), updated_at, ..Row::default()
+        }).collect();
+        assert_eq!(ranked_matches(&rows, &[0,1,2,3,4,5], &HashSet::new(), false), [1,0,2,3,4,5]);
+        let mut cleared=rows.clone();
+        cleared[2].is_unread=Some(false);
+        assert_eq!(ranked_matches(&cleared, &[0,1,2,3,4,5], &HashSet::new(), false), [1,0,3,4,5,2]);
     }
     #[test]
     fn title_filters_remain_bound_to_ids_after_reorder_and_rename() {

@@ -105,6 +105,38 @@ fn priority_statuses(tracked:&mut Vec<String>,payload:&Value,mut fetch:impl FnMu
 fn merge_priority(payload:&mut Value,mut priority:Vec<Value>){
     if let Some(rows)=payload.get_mut("threads").and_then(Value::as_array_mut){priority.append(rows);*rows=priority;}
 }
+// The desktop list reports "active" for both working and waiting threads.
+// Read only active threads for the native flags, with a short cache so that
+// frequent list refreshes do not repeatedly query every session.
+fn mark_attention(payload: &mut Value, cache: &mut std::collections::HashMap<String,(Instant,bool)>, now: Instant, mut fetch: impl FnMut(&str)->Result<Value>) {
+    let ids: std::collections::HashSet<String> = ["pinnedThreads","threads"].iter()
+        .flat_map(|key| payload[*key].as_array().into_iter().flatten())
+        .filter(|row| row["kind"]=="codex" && row["hostId"]=="local" && matches!(row["status"].as_str(),Some("active"|"busy"|"running"|"inProgress")))
+        .filter_map(|row| row["id"].as_str().map(str::to_owned)).collect();
+    cache.retain(|id,_| ids.contains(id));
+    for id in &ids {
+        if cache.get(id).is_none_or(|(at,_)| now.saturating_duration_since(*at)>=Duration::from_secs(5)) {
+            if let Ok(value)=fetch(id) {
+                if value["thread"]["id"].as_str()==Some(id.as_str()) {
+                    let status=&value["thread"]["status"];
+                    if status["type"].as_str()==Some("active") {
+                        let waiting=status["activeFlags"].as_array().is_some_and(|flags| flags.iter().any(|v| matches!(v.as_str(),Some("waitingOnUserInput"|"waitingOnApproval"))));
+                        cache.insert(id.clone(),(now,waiting));
+                    }
+                }
+            }
+        }
+    }
+    for key in ["pinnedThreads","threads"] {
+        if let Some(rows)=payload[key].as_array_mut() {
+            for row in rows {
+                if let Some((at,true))=row["id"].as_str().and_then(|id|cache.get(id)) {
+                    if now.saturating_duration_since(*at)<Duration::from_secs(5) && matches!(row["status"].as_str(),Some("active"|"busy"|"running"|"inProgress")) {row["status"]=json!("needsAttention");}
+                }
+            }
+        }
+    }
+}
 pub struct Rpc {
     paths: Paths,
     stop: Stop,
@@ -416,6 +448,7 @@ impl Workers {
             let events=s.lock().unwrap().refresh_events.clone();let mut gate=crate::refresh::Gate::new();
             let mut capacity_fallback=crate::capacity_retry::NativeFallback::default();
             let mut tracked:Vec<String>=s.lock().unwrap().recent.busy_metrics.iter().map(|row|row.id.clone()).collect();
+            let mut attention_cache=std::collections::HashMap::new();
             while !done.load(Ordering::Relaxed) {
                 let cfg=s.lock().unwrap().refresh_options.clone();
                 let forced=s.lock().unwrap().quota_at<0.;
@@ -441,7 +474,9 @@ impl Workers {
                     merge_history(&mut payload,history);
                     let mut next_tracked=tracked.clone();
                     let (priority,priority_incomplete)=priority_statuses(&mut next_tracked,&payload,|id|rpc.read_tool("read_thread",json!({"threadId":id,"hostId":"local","turnLimit":1,"includeOutputs":false,"maxOutputCharsPerItem":64}),&ctx));
-                    merge_priority(&mut payload,priority);store.recent(&payload).map(|recent|(recent,priority_incomplete,next_tracked))
+                    merge_priority(&mut payload,priority);
+                    mark_attention(&mut payload,&mut attention_cache,Instant::now(),|id|rpc.read_tool("read_thread",json!({"threadId":id,"hostId":"local","turnLimit":1,"includeOutputs":false,"maxOutputCharsPerItem":64}),&ctx));
+                    store.recent(&payload).map(|recent|(recent,priority_incomplete,next_tracked))
                 }) {
                     Ok((mut recent,priority_incomplete,next_tracked))=>{
                         list_limit.success(requested);
@@ -757,6 +792,16 @@ fn validate_unloaded_terminal(value:&Value,id:&str)->Result<()> {
         assert!(rows.is_empty()&&incomplete);assert_eq!(tracked,vec!["running","unavailable"]);
         let (rows,incomplete)=priority_statuses(&mut tracked,&json!({"threads":[{"id":"running","status":"active"}]}),|id|Ok(json!({"thread":{"id":id,"status":{"type":"idle"}}})));
         assert!(!incomplete);assert_eq!(rows.len(),1);assert_eq!(tracked,vec!["running"]);
+    }
+    #[test]fn attention_flags_are_polled_only_for_active_local_chats_and_expire() {
+        let at=Instant::now(); let mut cache=std::collections::HashMap::new();
+        let input=json!({"threads":[{"id":"a","kind":"codex","hostId":"local","status":"active"},{"id":"b","kind":"codex","hostId":"local","status":"idle"}]});
+        let mut payload=input.clone(); let mut calls=0;
+        mark_attention(&mut payload,&mut cache,at,|id|{calls+=1;assert_eq!(id,"a");Ok(json!({"thread":{"id":"a","status":{"type":"active","activeFlags":["waitingOnUserInput"]}}}))});
+        assert_eq!(calls,1);assert_eq!(payload["threads"][0]["status"],"needsAttention");assert_eq!(payload["threads"][1]["status"],"idle");
+        let mut payload=input.clone();mark_attention(&mut payload,&mut cache,at+Duration::from_secs(1),|_|panic!("cached"));assert_eq!(payload["threads"][0]["status"],"needsAttention");
+        let mut payload=input.clone();mark_attention(&mut payload,&mut cache,at+Duration::from_secs(6),|_|Err(anyhow::anyhow!("unavailable")));assert_eq!(payload["threads"][0]["status"],"active");
+        let mut payload=input;mark_attention(&mut payload,&mut cache,at+Duration::from_secs(7),|_|Ok(json!({"thread":{"id":"a","status":{"type":"active","activeFlags":["waitingOnApproval"]}}})));assert_eq!(payload["threads"][0]["status"],"needsAttention");
     }
     #[test]fn empty_startup_limits_are_retryable_until_real_data_arrives(){
         assert!(synced_quotas(&json!({"rateLimits":null})).is_err());

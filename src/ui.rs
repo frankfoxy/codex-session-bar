@@ -56,6 +56,14 @@ const MUTED: u32 = 0xa8b8c4;
 const ORANGE: u32 = 0xf5a34b;
 const MODEL: u32 = 0xffdc91;
 const GREEN: u32 = 0x65d69b;
+const BANKED_NORMAL: u32 = 0x8addb0;
+fn banked_color(reset: Option<f64>, at: f64) -> u32 {
+    match reset {
+        Some(t) if t > at && t - at <= 86_400. => ORANGE,
+        Some(t) if t > at => BANKED_NORMAL,
+        _ => MUTED,
+    }
+}
 const NEW_RESULT: u32 = 0x70b7ff;
 const DETAILS_HEIGHT: i32 = 310;
 const PREFERENCES_HEIGHT: i32 = 720;
@@ -1611,10 +1619,11 @@ impl App {
                         .unwrap_or_else(|| if zh { "额度数据暂不可用".into() } else { "Quota data unavailable".into() });
                     area(Hit::Info(tooltip), rect(quota_left, 2., x - quota_left, 30.));
                     if let Some(q) = quota.filter(|q| q.banked_available.unwrap_or(q.banked_expiries.len() as u64)>0) {
-                        let reset=q.banked_reset.filter(|r| *r > now());
-                        let text = reset.map(|r|crate::telemetry::countdown(r, now())).unwrap_or_default();
+                        let at=now();
+                        let reset=q.banked_reset.filter(|r| *r > at);
+                        let text = reset.map(|r|crate::telemetry::countdown(r, at)).unwrap_or_default();
                         let w = p.width(&text, 11.) + 19.;
-                        let color = if reset.is_some_and(|r|r-now() <= 86400.) { ORANGE } else { 0xe8c574 };
+                        let color = banked_color(reset,at);
                         p.banked_icon(x,17.,color,q.banked_available.unwrap_or(q.banked_expiries.len() as u64));
                         p.label(&text, rect(x+18., 2., w-18., 30.), 11., color, false);
                         area(Hit::Info(quota.map(|q| q.banked_tooltip(now())).unwrap_or_default()), rect(x, 2., w, 30.));
@@ -2677,21 +2686,24 @@ impl App {
                 self.close_popup();
             }
         }
-        if self.popup_kind == Some(Popup::Recent) && self.recent_rows_at!=live.recent.loaded_at {
+        let rows_refreshed = (self.popup_kind == Some(Popup::Recent)
+            || (self.popup_kind == Some(Popup::Fixed) && !live.recent.all_rows.is_empty()))
+            && self.recent_rows_at != live.recent.loaded_at;
+        if self.popup_kind == Some(Popup::Recent) && rows_refreshed {
             let roots:Vec<Row>=self.rows.iter().filter(|r|r.parent_id.is_none()).cloned().collect();
             self.rows = data::stable_rows(&roots, &live.recent.rows);
             self.rows.extend(live.recent.subagents.iter().cloned());
             self.recent_rows_at=live.recent.loaded_at;
             if self.hover_card.visible {let _=InvalidateRect(self.hover_card.window,None,false);}
         }
-        if self.popup_kind == Some(Popup::Fixed) && !live.recent.all_rows.is_empty() && self.recent_rows_at!=live.recent.loaded_at {
+        if self.popup_kind == Some(Popup::Fixed) && !live.recent.all_rows.is_empty() && rows_refreshed {
             self.rows = data::stable_rows(&self.rows, &live.recent.all_rows);
             self.recent_rows_at=live.recent.loaded_at;
             if self.hover_card.visible {let _=InvalidateRect(self.hover_card.window,None,false);}
         }
-        if matches!(self.popup_kind, Some(Popup::Recent | Popup::Fixed))
-            && self.chat_search.sync(&self.rows, &self.catalog)
-        {
+        let search_changed = matches!(self.popup_kind, Some(Popup::Recent | Popup::Fixed))
+            && self.chat_search.sync(&self.rows, &self.catalog);
+        if search_changed || rows_refreshed {
             // A renamed title may change a filter match; keep the visible anchor
             // and selection rather than resetting the user's scroll position.
             let top = self.chat_filters.get(self.scroll).copied();
@@ -2703,15 +2715,11 @@ impl App {
                 self.scroll=self.scroll.min(self.chat_filters.len().saturating_sub(self.list_page_rows()));
                 self.chat_cursor=self.chat_cursor.min(self.chat_filters.len().saturating_sub(1));
             } else {
-            let allowed: HashSet<_> = next.iter().copied().collect();
-            let previous: HashSet<_> = self.chat_filters.iter().copied().collect();
-            self.chat_filters.retain(|i| allowed.contains(i));
-            self.chat_filters
-                .extend(next.into_iter().filter(|i| !previous.contains(i)));
-            self.scroll = top
+            self.chat_filters = next;
+            self.scroll = if rows_refreshed && self.scroll == 0 { 0 } else { top
                 .and_then(|i| self.chat_filters.iter().position(|&v| v == i))
                 .unwrap_or(self.scroll)
-                .min(self.chat_filters.len().saturating_sub(self.list_page_rows()));
+                .min(self.chat_filters.len().saturating_sub(self.list_page_rows())) };
             self.chat_cursor = selected
                 .and_then(|i| self.chat_filters.iter().position(|&v| v == i))
                 .unwrap_or(self.chat_cursor)
@@ -4074,6 +4082,11 @@ impl App {
             &self.body_hits,
             !self.search.trim().is_empty(),
         ).into_iter().filter(|&i| self.rows[i].parent_id.is_none() && (self.popup_kind != Some(Popup::Recent) || self.custom_tags.matches(&self.rows[i], &self.tag_filters))).collect();
+        if self.popup_kind==Some(Popup::Fixed) && self.search.trim().is_empty() {
+            matched.sort_by(|&a,&b| (self.rows[a].state!="Busy").cmp(&(self.rows[b].state!="Busy"))
+                .then_with(||self.rows[b].updated_at.total_cmp(&self.rows[a].updated_at))
+                .then_with(||self.rows[a].id.cmp(&self.rows[b].id)));
+        }
         if self.recent_sort>0&&self.popup_kind==Some(Popup::Recent){
             matched.sort_by(|&a,&b|{
                 let rank=|i:usize|(self.rows[i].state!="Busy",!self.search.trim().is_empty()&&!title_ids.contains(&i));
@@ -4601,6 +4614,19 @@ unsafe extern "system" fn wndproc(
                 }
                 Some(LRESULT(0))
             }
+            WM_QUERYENDSESSION if is_bar => {
+                // Save applied preferences before Windows starts ending the session;
+                // a forced termination does not guarantee normal teardown.
+                app.settings();
+                Some(LRESULT(1))
+            }
+            WM_ENDSESSION if is_bar => {
+                if wparam.0 != 0 {
+                    app.settings();
+                    app.paths.write("lifecycle.json", &json!({"pid":std::process::id(),"time":now(),"state":"system_end_session"}));
+                }
+                Some(LRESULT(0))
+            }
             WM_CLOSE if is_bar => {
                 let _ = app.hit(Hit::Hide);
                 Some(LRESULT(0))
@@ -4715,6 +4741,11 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
             let _ = CloseHandle(mutex);
             return Ok(());
         }
+        let previous = crate::read_json(&paths.runtime.join("lifecycle.json"), 4096);
+        if !previous.is_null() {
+            paths.write("previous-lifecycle.json", &previous);
+        }
+        paths.write("lifecycle.json", &json!({"pid":std::process::id(),"time":now(),"state":"running"}));
         register()?;
         let mut app = App::new(paths.clone(), settings, state.clone(), stop.clone(), false)?;
         let workers = Workers::start(&paths, &state, &stop, &app.catalog);
@@ -4793,6 +4824,12 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
             DispatchMessageW(&msg);
         }
         if !focus_hook.is_invalid(){let _=UnhookWinEvent(focus_hook);}
+        APP.with(|a| {
+            if let Some(app) = a.borrow().as_ref() {
+                app.settings();
+                app.paths.write("lifecycle.json", &json!({"pid":std::process::id(),"time":now(),"state":"stopping"}));
+            }
+        });
         stop.store(true, Ordering::Relaxed);
         drop(updates);
         drop(notices);
@@ -4815,6 +4852,7 @@ pub fn run(paths: Paths, settings: Settings, state: State, stop: Stop) -> Result
                 let _ = CloseHandle(app.event);
             }
         });
+        paths.write("lifecycle.json", &json!({"pid":std::process::id(),"time":now(),"state":"exited"}));
         let _ = CloseHandle(mutex);
         Ok(())
     }
@@ -5331,13 +5369,14 @@ pub fn self_test(paths: &Paths) -> Result<()> {
             (RECENT_FRAME + 8 * RECENT_ROW) as u32,
             &paths.runtime.join("rust-recent-verification.png"),
         )?;
+        assert_eq!(app.rows[app.chat_filters[0]].id, rows[3].id, "Unread completed chats precede busy chats");
         assert_eq!(
             app.fixed_hit_at(TAG_SIDEBAR + 30., 81.),
-            Some(Hit::ChatIcon(rows[0].id.clone()))
+            Some(Hit::ChatIcon(rows[3].id.clone()))
         );
         assert_eq!(
             app.fixed_hit_at(TAG_SIDEBAR + 80., 81.),
-            Some(Hit::Recent(rows[0].id.clone()))
+            Some(Hit::Recent(rows[3].id.clone()))
         );
         let identity_before_icon = app.identity(&app.snapshot());
         let follow_before_icon = app.snapshot().auto_thread;
@@ -5960,7 +5999,15 @@ include!("guard_preferences.rs");
 
 #[cfg(test)]
 mod standalone_lifecycle_tests {
- use super::{host_presentation,HostPresentation};
+ use super::{host_presentation,HostPresentation,banked_color,BANKED_NORMAL,ORANGE,MUTED};
+ #[test] fn banked_color_changes_only_in_last_day(){
+  let now=1_000_000.;
+  assert_eq!(banked_color(Some(now+86_401.),now),BANKED_NORMAL);
+  assert_eq!(banked_color(Some(now+86_400.),now),ORANGE);
+  assert_eq!(banked_color(Some(now+1.),now),ORANGE);
+  assert_eq!(banked_color(Some(now),now),MUTED);
+  assert_eq!(banked_color(None,now),MUTED);
+ }
  #[test] fn absent_host_stays_visible_and_minimized_host_stays_hidden(){
   assert_eq!(host_presentation(false,false,false),HostPresentation::Standalone);
   assert_eq!(host_presentation(false,true,false),HostPresentation::HostHidden);

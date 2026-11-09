@@ -19,22 +19,28 @@ pub fn internal_reviews(db: &Connection) -> Result<HashSet<String>> {
     } else {
         "NULL"
     };
-    let mut query = db.prepare(&format!("SELECT id,{source},{kind} FROM threads"))?;
+    // Codex can create an attached side-chat shell before it has a real turn.
+    // It inherits its parent's name but is not a second populated chat.
+    let attached = if columns.contains("attached_thread_parent_id") && columns.contains("has_user_event") && columns.contains("tokens_used") && columns.contains("title") {
+        "CASE WHEN NULLIF(TRIM(attached_thread_parent_id),'') IS NOT NULL AND COALESCE(has_user_event,0)=0 AND COALESCE(tokens_used,0)=0 AND COALESCE(TRIM(title),'')='' THEN 1 ELSE 0 END"
+    } else { "0" };
+    let mut query = db.prepare(&format!("SELECT id,{source},{kind},{attached} FROM threads"))?;
     let rows = query.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
             row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)? != 0,
         ))
     })?;
     let mut hidden = HashSet::new();
     for row in rows {
-        let (id, source, kind) = row?;
+        let (id, source, kind, empty_attached) = row?;
         let internal_source = source
             .as_deref()
             .and_then(|source| serde_json::from_str::<serde_json::Value>(source).ok())
             .is_some_and(|source| source.get("subagent").is_some_and(|value| !value.is_null()));
-        if matches!(kind.as_deref(), Some("guardian_review" | "subagent")) || internal_source {
+        if matches!(kind.as_deref(), Some("guardian_review" | "subagent")) || internal_source || empty_attached {
             hidden.insert(id);
         }
     }
@@ -74,5 +80,16 @@ mod tests {
         )
         .unwrap();
         assert!(internal_reviews(&db).unwrap().contains("ordinary"));
+    }
+    #[test]
+    fn hides_only_empty_attached_shells() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE threads(id TEXT, source TEXT, thread_source TEXT, attached_thread_parent_id TEXT, has_user_event INTEGER, tokens_used INTEGER, title TEXT);
+            INSERT INTO threads VALUES ('shell','vscode','user','parent',0,0,''),
+                ('real','vscode','user','parent',1,0,''),
+                ('used','vscode','user','parent',0,10,''),
+                ('titled','vscode','user','parent',0,0,'Named'),
+                ('ordinary','vscode','user',NULL,0,0,'');").unwrap();
+        assert_eq!(internal_reviews(&db).unwrap(), HashSet::from(["shell".into()]));
     }
 }
